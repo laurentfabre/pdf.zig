@@ -256,6 +256,29 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                 .creation_date = meta.creation_date,
                 .mod_date = meta.mod_date,
             });
+            // Form fields (v1.0.1): one kind:"form" record per document.
+            if (doc.getFormFields(allocator)) |fields| {
+                defer zpdf.Document.freeFormFields(allocator, fields);
+                if (fields.len > 0) {
+                    var items: std.ArrayList(stream.FormFieldItem) = .empty;
+                    defer items.deinit(allocator);
+                    for (fields) |f| {
+                        try items.append(allocator, .{
+                            .name = f.name,
+                            .value = f.value,
+                            .field_type = switch (f.field_type) {
+                                .text => .text,
+                                .button => .button,
+                                .choice => .choice,
+                                .signature => .signature,
+                                .unknown => .unknown,
+                            },
+                            .rect = f.rect,
+                        });
+                    }
+                    try env.emitForm(items.items);
+                }
+            } else |_| {}
             if (!args.no_toc) {
                 const items: []zpdf.Document.OutlineItem = doc.getOutline(allocator) catch &.{};
                 defer if (items.len > 0) zpdf.outline.freeOutline(allocator, items);
@@ -338,11 +361,24 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                     allocator.free(md);
                     return mapWriteErr(e);
                 };
-                writer.flush() catch |e| {
-                    allocator.free(md);
-                    return mapWriteErr(e);
-                };
                 allocator.free(md);
+                // Hyperlinks (v1.0.1): emit a kind:"links" record per page that has any.
+                if (doc.getPageLinks(page_idx, allocator)) |links| {
+                    defer zpdf.Document.freeLinks(allocator, links);
+                    if (links.len > 0) {
+                        var items: std.ArrayList(stream.LinkItem) = .empty;
+                        defer items.deinit(allocator);
+                        for (links) |lk| {
+                            try items.append(allocator, .{
+                                .rect = lk.rect,
+                                .uri = lk.uri,
+                                .dest_page = if (lk.dest_page) |p| @intCast(p + 1) else null,
+                            });
+                        }
+                        env.emitLinks(@intCast(page_idx + 1), items.items) catch |e| return mapWriteErr(e);
+                    }
+                } else |_| {}
+                writer.flush() catch |e| return mapWriteErr(e);
             },
             .md => {
                 if (page_idx != want_pages[0]) writer.writeAll("\n\n---\n\n") catch |e| {

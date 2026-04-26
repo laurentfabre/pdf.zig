@@ -1,0 +1,97 @@
+{
+  "doc": "anantara-the-palm-dubai-resort/anantara-the-palm-dubai-resort_spa_price_list.pdf",
+  "stratum": "ruled_price",
+  "page_count": 8,
+  "size_bytes": 1984710,
+  "annotation_status": "done",
+  "annotator": "seed-example",
+  "annotated_at": "2026-04-26T19:00:00Z",
+  "notes": "Seed annotation for the v1.2 gold set. Cells text intentionally null in 'cells' field; the v1.2 evaluator auto-derives text from pdf.zig extract output and only the (rows, cols, header structure, row_labels) gates pass/fail. One of ~120 manually verified tables we are building toward.",
+  "tables": [
+    {
+      "id": 0,
+      "page": 1,
+      "stratum": "ruled_price",
+      "n_rows": 3,
+      "n_cols": 3,
+      "header_rows": 1,
+      "header_cols": 0,
+      "bbox": null,
+      "header_cells": [
+        {"r": 0, "c": 0, "text": "Treatment"},
+        {"r": 0, "c": 1, "text": "Minutes"},
+        {"r": 0, "c": 2, "text": "Price (AED)"}
+      ],
+      "row_labels": [
+        "HydraCool Radiance Facial",
+        "HydraCool Anti-Ageing Facial"
+      ],
+      "notes": "HydraCool facials sub-table"
+    },
+    {
+      "id": 1,
+      "page": 1,
+      "stratum": "ruled_price",
+      "n_rows": 4,
+      "n_cols": 3,
+      "header_rows": 1,
+      "header_cols": 0,
+      "bbox": null,
+      "header_cells": [
+        {"r": 0, "c": 0, "text": "Anantara spa journey"},
+        {"r": 0, "c": 1, "text": "Minutes"},
+        {"r": 0, "c": 2, "text": "Price (AED)"}
+      ],
+      "row_labels": [
+        "Anantara Royal Ritual (hammam & massage)",
+        "Dubai Romance (scrub, jaccuzzi & massage)",
+        "Palm Retreat (scrub, jaccuzzi, wrap, massage & facial)"
+      ],
+      "notes": "Anantara spa journeys sub-table"
+    },
+    {
+      "id": 2,
+      "page": 1,
+      "stratum": "ruled_price",
+      "n_rows": 4,
+      "n_cols": 3,
+      "header_rows": 1,
+      "header_cols": 0,
+      "bbox": null,
+      "header_cells": [
+        {"r": 0, "c": 0, "text": "Package"},
+        {"r": 0, "c": 1, "text": "Minutes"},
+        {"r": 0, "c": 2, "text": "Price (AED)"}
+      ],
+      "row_labels": [
+        "Nham Jai Relaxing Experience (scrub, wrap & massage)",
+        "Destress & Uplifting Experience (massage & facial)",
+        "Rejuvenating & Hydrating Experience (wrap & facial)"
+      ],
+      "notes": "Packages sub-table"
+    },
+    {
+      "id": 3,
+      "page": 1,
+      "stratum": "ruled_price",
+      "n_rows": 6,
+      "n_cols": 3,
+      "header_rows": 1,
+      "header_cols": 0,
+      "bbox": null,
+      "header_cells": [
+        {"r": 0, "c": 0, "text": "Ayurvedic treatment"},
+        {"r": 0, "c": 1, "text": "Minutes"},
+        {"r": 0, "c": 2, "text": "Price (AED)"}
+      ],
+      "row_labels": [
+        "Abhyanga",
+        "Desert Escape Massage",
+        "Shirodhara (hot oil therapy)",
+        "At The Doors of The Desert Body Ritual (scrub & massage)",
+        "Herbal Poultice"
+      ],
+      "notes": "Ayurvedic treatments sub-table; rows 1+5 have 75/90 minute variants; cell may render as '75/90' literal or as two rows depending on extractor"
+    }
+  ]
+}

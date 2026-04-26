@@ -1,0 +1,99 @@
+name: Brew tap bump
+
+# After release.yml has produced GA artifacts on a v*.*.* tag, this workflow
+# downloads the SHA256SUMS, runs scripts/update-formula.sh to bump the
+# canonical scripts/Formula/pdf-zig.rb, and either (a) commits the bump back
+# to the source repo or (b) opens a PR against the homebrew tap repo.
+#
+# Mode is controlled by the `tap_repo` input. When empty (default), only the
+# in-source formula is bumped. When set to e.g. `laurentfabre/homebrew-pdf.zig`,
+# a PR is opened against that repo.
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to bump the formula to (e.g. v1.0)'
+        required: true
+      tap_repo:
+        description: 'Optional homebrew tap repo (owner/name); leave empty for in-source-only bump'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    if: github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            # workflow_run gives us the tag from the triggering workflow's head_branch.
+            echo "tag=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download SHA256SUMS from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release
+          gh release download "${{ steps.tag.outputs.tag }}" -p SHA256SUMS -D release/
+
+      - name: Bump formula
+        run: |
+          chmod +x scripts/update-formula.sh
+          scripts/update-formula.sh "${{ steps.tag.outputs.tag }}" release/SHA256SUMS
+
+      - name: Commit bump back to source repo
+        run: |
+          git config user.name "pdf.zig release bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add scripts/Formula/pdf-zig.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date for ${{ steps.tag.outputs.tag }}; skipping commit."
+          else
+            git commit -m "release: bump brew formula to ${{ steps.tag.outputs.tag }}"
+            git push
+          fi
+
+      - name: Open PR against tap repo
+        if: github.event.inputs.tap_repo != ''
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          TAP="${{ github.event.inputs.tap_repo }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          BRANCH="release/$TAG"
+          # Clone the tap repo, copy the bumped formula, push the branch, open PR.
+          gh repo clone "$TAP" tap-clone -- --depth=1
+          mkdir -p tap-clone/Formula
+          cp scripts/Formula/pdf-zig.rb tap-clone/Formula/pdf-zig.rb
+          cd tap-clone
+          git config user.name "pdf.zig release bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Formula/pdf-zig.rb
+          if git diff --cached --quiet; then
+            echo "Tap formula already up to date for $TAG."
+            exit 0
+          fi
+          git commit -m "pdf.zig $TAG"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "pdf.zig $TAG" \
+            --body "Auto-bump from upstream release ${{ steps.tag.outputs.tag }}. SHA256SUMS verified in release.yml." \
+            --base main \
+            --head "$BRANCH"

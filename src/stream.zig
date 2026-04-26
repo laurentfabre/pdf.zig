@@ -24,6 +24,8 @@ pub const RecordKind = enum {
     fatal,
     chunk,
     interrupted,
+    links,
+    form,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -34,6 +36,8 @@ pub const RecordKind = enum {
             .fatal => "fatal",
             .chunk => "chunk",
             .interrupted => "interrupted",
+            .links => "links",
+            .form => "form",
         };
     }
 };
@@ -76,6 +80,24 @@ pub const TocItem = struct {
     title: []const u8,
     page: u32,
     depth: u8,
+};
+
+pub const LinkItem = struct {
+    /// PDF page rect: [x0, y0, x1, y1] in PDF user-space points (bottom-left origin).
+    rect: [4]f64,
+    /// External URI if present, or null for an internal/dest link.
+    uri: ?[]const u8 = null,
+    /// 1-based destination page if this is an internal link.
+    dest_page: ?u32 = null,
+};
+
+pub const FormFieldType = enum { text, button, choice, signature, unknown };
+
+pub const FormFieldItem = struct {
+    name: []const u8,
+    value: ?[]const u8 = null,
+    field_type: FormFieldType = .unknown,
+    rect: ?[4]f64 = null,
 };
 
 pub const DocumentInfo = struct {
@@ -179,6 +201,51 @@ pub const Envelope = struct {
             try self.writer.writeAll("{\"title\":");
             try writeJsonString(self.writer, item.title);
             try self.writer.print(",\"page\":{d},\"depth\":{d}}}", .{ item.page, item.depth });
+        }
+        try self.writer.writeAll("]");
+        try self.endRecord();
+    }
+
+    pub fn emitLinks(self: *Envelope, page_number: u32, items: []const LinkItem) !void {
+        try self.beginRecord(.links);
+        try self.writer.print(",\"page\":{d},\"items\":[", .{page_number});
+        for (items, 0..) |item, i| {
+            if (i > 0) try self.writer.writeAll(",");
+            try self.writer.print(
+                "{{\"rect\":[{d:.2},{d:.2},{d:.2},{d:.2}]",
+                .{ item.rect[0], item.rect[1], item.rect[2], item.rect[3] },
+            );
+            if (item.uri) |u| {
+                try self.writer.writeAll(",\"uri\":");
+                try writeJsonString(self.writer, u);
+            }
+            if (item.dest_page) |p| try self.writer.print(",\"dest_page\":{d}", .{p});
+            try self.writer.writeAll("}");
+        }
+        try self.writer.writeAll("]");
+        try self.endRecord();
+    }
+
+    pub fn emitForm(self: *Envelope, fields: []const FormFieldItem) !void {
+        try self.beginRecord(.form);
+        try self.writer.writeAll(",\"fields\":[");
+        for (fields, 0..) |f, i| {
+            if (i > 0) try self.writer.writeAll(",");
+            try self.writer.writeAll("{\"name\":");
+            try writeJsonString(self.writer, f.name);
+            try self.writer.writeAll(",\"type\":");
+            try writeJsonString(self.writer, @tagName(f.field_type));
+            if (f.value) |v| {
+                try self.writer.writeAll(",\"value\":");
+                try writeJsonString(self.writer, v);
+            }
+            if (f.rect) |r| {
+                try self.writer.print(
+                    ",\"rect\":[{d:.2},{d:.2},{d:.2},{d:.2}]",
+                    .{ r[0], r[1], r[2], r[3] },
+                );
+            }
+            try self.writer.writeAll("}");
         }
         try self.writer.writeAll("]");
         try self.endRecord();
@@ -487,6 +554,40 @@ test "chunk record emits pages array + tokens_est + break" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\"pages\":[0,1,2]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"tokens_est\":12") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"break\":\"section_heading\"") != null);
+}
+
+test "form record emits fields array with name, type, value, rect" {
+    var buf: [2048]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "form.pdf", FIXED_DOC_ID);
+    try env.emitForm(&.{
+        .{ .name = "guest_name", .value = "L. Fabre", .field_type = .text, .rect = .{ 100, 700, 300, 720 } },
+        .{ .name = "agree_terms", .value = "Yes", .field_type = .button },
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"form\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"name\":\"guest_name\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"value\":\"L. Fabre\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"rect\":[100.00,700.00,300.00,720.00]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "}\n"));
+}
+
+test "links record emits per-page items with rect + uri/dest_page" {
+    var buf: [2048]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitLinks(3, &.{
+        .{ .rect = .{ 12.0, 200.0, 88.5, 215.5 }, .uri = "https://example.com/" },
+        .{ .rect = .{ 100.0, 100.0, 200.0, 120.0 }, .dest_page = 7 },
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"links\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"page\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"uri\":\"https://example.com/\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"dest_page\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "[12.00,200.00,88.50,215.50]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "}\n"));
 }
 
 test "interrupted record carries signal number" {
