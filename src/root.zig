@@ -28,6 +28,7 @@ pub const layout = @import("layout.zig");
 pub const structtree = @import("structtree.zig");
 pub const markdown = @import("markdown.zig");
 pub const outline = @import("outline.zig");
+pub const tables = @import("tables.zig");
 
 // Re-exports
 pub const Object = parser.Object;
@@ -1016,6 +1017,29 @@ pub const Document = struct {
             &self.object_cache,
             self.pages.items,
         );
+    }
+
+    /// v1.2 — Pass A tagged-path table extraction. Returns one `tables.Table`
+    /// per `/Table` element in the document's structure tree. Returns an
+    /// empty slice for PDFs without `/StructTreeRoot`. Caller frees via
+    /// `tables.freeTables(allocator, result)`.
+    pub fn getTables(self: *Document, allocator: std.mem.Allocator) ![]tables.Table {
+        const arena = self.parsing_arena.allocator();
+        var tree = structtree.parseStructTree(arena, self.data, &self.xref_table, &self.object_cache) catch
+            return allocator.alloc(tables.Table, 0);
+        defer tree.deinit();
+        const ctx = self;
+        return tables.extractTaggedTables(allocator, &tree, @ptrCast(ctx), pageRefToZeroBased);
+    }
+
+    fn pageRefToZeroBased(ctx: *const anyopaque, page_ref: ?ObjRef) ?u32 {
+        const ref = page_ref orelse return null;
+        const self: *const Document = @ptrCast(@alignCast(ctx));
+        // Match the page-tree's stable refs to the 0-based page index.
+        for (self.pages.items, 0..) |pg, i| {
+            if (pg.ref.eql(ref)) return @intCast(i);
+        }
+        return null;
     }
 
     // =========================================================================

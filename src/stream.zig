@@ -26,6 +26,7 @@ pub const RecordKind = enum {
     interrupted,
     links,
     form,
+    table,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -38,6 +39,7 @@ pub const RecordKind = enum {
             .interrupted => "interrupted",
             .links => "links",
             .form => "form",
+            .table => "table",
         };
     }
 };
@@ -98,6 +100,29 @@ pub const FormFieldItem = struct {
     value: ?[]const u8 = null,
     field_type: FormFieldType = .unknown,
     rect: ?[4]f64 = null,
+};
+
+pub const TableEngine = enum { tagged, lattice, stream };
+
+pub const TableCell = struct {
+    r: u32,
+    c: u32,
+    rowspan: u32 = 1,
+    colspan: u32 = 1,
+    is_header: bool = false,
+};
+
+pub const TableRecord = struct {
+    /// 1-based page number.
+    page: u32,
+    /// Per-page table id (0-based).
+    table_id: u32,
+    n_rows: u32,
+    n_cols: u32,
+    header_rows: u32,
+    cells: []const TableCell,
+    engine: TableEngine,
+    confidence: f32,
 };
 
 pub const DocumentInfo = struct {
@@ -246,6 +271,32 @@ pub const Envelope = struct {
                 );
             }
             try self.writer.writeAll("}");
+        }
+        try self.writer.writeAll("]");
+        try self.endRecord();
+    }
+
+    pub fn emitTable(self: *Envelope, t: TableRecord) !void {
+        try self.beginRecord(.table);
+        try self.writer.print(
+            ",\"page\":{d},\"table_id\":{d},\"engine\":",
+            .{ t.page, t.table_id },
+        );
+        try writeJsonString(self.writer, switch (t.engine) {
+            .tagged => "native_tagged",
+            .lattice => "native_lattice",
+            .stream => "native_stream",
+        });
+        try self.writer.print(
+            ",\"confidence\":{d:.2},\"n_rows\":{d},\"n_cols\":{d},\"header_rows\":{d},\"cells\":[",
+            .{ t.confidence, t.n_rows, t.n_cols, t.header_rows },
+        );
+        for (t.cells, 0..) |cell, i| {
+            if (i > 0) try self.writer.writeAll(",");
+            try self.writer.print(
+                "{{\"r\":{d},\"c\":{d},\"rowspan\":{d},\"colspan\":{d},\"is_header\":{}}}",
+                .{ cell.r, cell.c, cell.rowspan, cell.colspan, cell.is_header },
+            );
         }
         try self.writer.writeAll("]");
         try self.endRecord();
@@ -554,6 +605,35 @@ test "chunk record emits pages array + tokens_est + break" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\"pages\":[0,1,2]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"tokens_est\":12") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"break\":\"section_heading\"") != null);
+}
+
+test "table record emits page + engine + cell grid + confidence" {
+    var buf: [4096]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "menu.pdf", FIXED_DOC_ID);
+    try env.emitTable(.{
+        .page = 3,
+        .table_id = 0,
+        .n_rows = 2,
+        .n_cols = 2,
+        .header_rows = 1,
+        .engine = .tagged,
+        .confidence = 1.0,
+        .cells = &.{
+            .{ .r = 0, .c = 0, .is_header = true },
+            .{ .r = 0, .c = 1, .is_header = true },
+            .{ .r = 1, .c = 0 },
+            .{ .r = 1, .c = 1 },
+        },
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"table\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"page\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"engine\":\"native_tagged\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"n_rows\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"header_rows\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"is_header\":true") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "}\n"));
 }
 
 test "form record emits fields array with name, type, value, rect" {

@@ -3,8 +3,28 @@
   "stratum": "unruled_menu",
   "page_count": 2,
   "size_bytes": 6583819,
-  "annotation_status": "pending",
-  "annotator": null,
-  "annotated_at": null,
-  "tables": []
+  "annotation_status": "done",
+  "annotator": "seed-example",
+  "annotated_at": "2026-04-27T00:00:00Z",
+  "notes": "Airelles Versailles déjeuner menu. Page 2 has an unruled price table 'Du Jardin aux Prairies' (5 starters). Stream-layout 2-col (dish + price). Target for v1.2 Pass C.",
+  "tables": [
+    {
+      "id": 0,
+      "page": 2,
+      "stratum": "unruled_menu",
+      "n_rows": 5,
+      "n_cols": 2,
+      "header_rows": 0,
+      "header_cols": 0,
+      "bbox": null,
+      "row_labels": [
+        "Soupe à l'oignon",
+        "Terrine de campagne au foie gras",
+        "Poireau servi tiède, vinaigrette",
+        "Œufs de poule bio mimosa aux truffes",
+        "Salade des jardiniers"
+      ],
+      "notes": "DU JARDIN AUX PRAIRIES — starters; prices 20/18/14/28/14 €"
+    }
+  ]
 }

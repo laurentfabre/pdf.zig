@@ -279,6 +279,40 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                     try env.emitForm(items.items);
                 }
             } else |_| {}
+            // v1.2 Pass A: tagged-path tables (Document.getTables walks
+            // /StructTreeRoot for /Table → /TR → /TH/TD). Returns empty
+            // for PDFs without a structure tree.
+            if (doc.getTables(allocator)) |found| {
+                defer zpdf.tables.freeTables(allocator, found);
+                for (found) |t| {
+                    if (t.page == 0) continue; // unresolved page → skip
+                    var cells: std.ArrayList(stream.TableCell) = .empty;
+                    defer cells.deinit(allocator);
+                    for (t.cells) |c| {
+                        try cells.append(allocator, .{
+                            .r = c.r,
+                            .c = c.c,
+                            .rowspan = c.rowspan,
+                            .colspan = c.colspan,
+                            .is_header = c.is_header,
+                        });
+                    }
+                    try env.emitTable(.{
+                        .page = t.page,
+                        .table_id = t.id,
+                        .n_rows = t.n_rows,
+                        .n_cols = t.n_cols,
+                        .header_rows = t.header_rows,
+                        .cells = cells.items,
+                        .engine = switch (t.engine) {
+                            .tagged => .tagged,
+                            .lattice => .lattice,
+                            .stream => .stream,
+                        },
+                        .confidence = t.confidence,
+                    });
+                }
+            } else |_| {}
             if (!args.no_toc) {
                 const items: []zpdf.Document.OutlineItem = doc.getOutline(allocator) catch &.{};
                 defer if (items.len > 0) zpdf.outline.freeOutline(allocator, items);
