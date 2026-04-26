@@ -211,6 +211,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_stream_unit_tests.step);
 
+    // Allocation-failure tests — Week 4 of architecture.md §11.
+    // Asserts the documented shape of upstream OOM behaviour (Findings 001–003
+    // in audit/fuzz_findings.md). Run separately from `test` so upstream-test
+    // leak detection on this harness's transitively-imported tests doesn't
+    // pollute the main test suite.
+    const alloc_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/alloc_failure_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_alloc_test = b.addRunArtifact(alloc_test);
+    const alloc_test_step = b.step("alloc-failure-test", "Run checkAllAllocationFailures coverage on parse paths");
+    alloc_test_step.dependOn(&run_alloc_test.step);
+
+    // Fuzz harness — Week 4 of architecture.md §11.
+    // 11 targets at 1M iters by default; PDFZIG_FUZZ_ITERS / PDFZIG_FUZZ_TARGET
+    // / PDFZIG_FUZZ_SEED env vars override at run time.
+    const fuzz_exe = b.addExecutable(.{
+        .name = "fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    if (b.args) |args| run_fuzz.addArgs(args);
+    const fuzz_step = b.step("fuzz", "Run the Week-4 fuzz harness (PDFZIG_FUZZ_ITERS overrides 1M default)");
+    fuzz_step.dependOn(&run_fuzz.step);
+
     // Benchmark
     const bench = b.addExecutable(.{
         .name = "bench",

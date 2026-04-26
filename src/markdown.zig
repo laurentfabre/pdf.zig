@@ -181,7 +181,7 @@ pub const MarkdownRenderer = struct {
         defer size_counts.deinit();
 
         for (spans) |span| {
-            const size_key: i32 = @intFromFloat(span.font_size * 10); // 0.1pt precision
+            const size_key: i32 = std.math.lossyCast(i32, span.font_size * 10); // 0.1pt precision; saturates on inf/NaN
             const entry = size_counts.getOrPut(size_key) catch continue;
             if (!entry.found_existing) {
                 entry.value_ptr.* = 0;
@@ -222,8 +222,8 @@ pub const MarkdownRenderer = struct {
         const line_threshold: f64 = 3.0;
         std.mem.sort(TextSpan, sorted, line_threshold, struct {
             fn cmp(threshold: f64, a: TextSpan, b: TextSpan) bool {
-                const a_row = @as(i64, @intFromFloat(a.y0 / threshold));
-                const b_row = @as(i64, @intFromFloat(b.y0 / threshold));
+                const a_row = std.math.lossyCast(i64, a.y0 / threshold);
+                const b_row = std.math.lossyCast(i64, b.y0 / threshold);
                 if (a_row != b_row) return a_row > b_row; // Higher Y first (top of page)
                 return a.x0 < b.x0; // Left to right within row
             }
@@ -452,7 +452,7 @@ pub const MarkdownRenderer = struct {
     fn indentLevel(self: *MarkdownRenderer, x: f64) u8 {
         _ = self;
         const indent_unit: f64 = 36; // ~0.5 inch
-        const level = @as(u8, @intFromFloat(@max(0, x / indent_unit)));
+        const level = std.math.lossyCast(u8, @max(0, x / indent_unit));
         return @min(level, 6);
     }
 

@@ -426,7 +426,7 @@ fn pageWarningFromError(err: anyerror) stream.Warning {
 
 /// Parse a page-range spec ("1-10", "1,3,5", "1-3,7,9-11") into 0-indexed
 /// page numbers. Returns an owned slice. `null` spec → all pages.
-fn resolvePageRange(allocator: std.mem.Allocator, spec: ?[]const u8, total: u32) ![]usize {
+pub fn resolvePageRange(allocator: std.mem.Allocator, spec: ?[]const u8, total: u32) ![]usize {
     if (spec == null or spec.?.len == 0) {
         const out = try allocator.alloc(usize, total);
         for (0..total) |i| out[i] = i;

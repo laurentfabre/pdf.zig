@@ -1,5 +1,15 @@
 const std = @import("std");
 
+/// Bucket a Y-coordinate into a row index without panicking on PDFs that
+/// emit `inf`, `NaN`, or saturating-large coordinates. Without this guard,
+/// `@intFromFloat(y / threshold)` panics in ReleaseSafe when y is non-finite
+/// (observed on `banyan-tree-mayakoba/mice-bt-mayakoba.pdf` during the
+/// Week-4 audit corpus run). `std.math.lossyCast` saturates on overflow and
+/// returns 0 for NaN.
+inline fn safeRowFromY(y: f64, threshold: f64) i64 {
+    return std.math.lossyCast(i64, y / threshold);
+}
+
 pub const TextSpan = struct {
     x0: f64,
     y0: f64,
@@ -143,8 +153,8 @@ pub fn sortGeometric(allocator: std.mem.Allocator, spans: []const TextSpan) ![]u
     std.mem.sort(TextSpan, sorted, line_threshold, struct {
         fn cmp(threshold: f64, a: TextSpan, b: TextSpan) bool {
             // Group into rows by Y coordinate
-            const a_row = @as(i64, @intFromFloat(a.y0 / threshold));
-            const b_row = @as(i64, @intFromFloat(b.y0 / threshold));
+            const a_row = safeRowFromY(a.y0, threshold);
+            const b_row = safeRowFromY(b.y0, threshold);
             if (a_row != b_row) return a_row > b_row; // Higher Y first (top of page)
             return a.x0 < b.x0; // Left to right within row
         }
@@ -227,8 +237,8 @@ pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page
 
     std.mem.sort(TextSpan, sorted, line_threshold, struct {
         fn cmp(threshold: f64, a: TextSpan, b: TextSpan) bool {
-            const a_row = @as(i64, @intFromFloat(a.y0 / threshold));
-            const b_row = @as(i64, @intFromFloat(b.y0 / threshold));
+            const a_row = safeRowFromY(a.y0, threshold);
+            const b_row = safeRowFromY(b.y0, threshold);
             if (a_row != b_row) return a_row > b_row;
             return a.x0 < b.x0;
         }
