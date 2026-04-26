@@ -116,7 +116,11 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             out.no_toc = true;
         } else if (std.mem.eql(u8, a, "--no-warnings")) {
             out.no_warnings = true;
-        } else if (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-")) {
+        } else if (std.mem.eql(u8, a, "-")) {
+            // Bare `-` is the stdin sentinel, not a flag.
+            if (out.input.len != 0) return error.UnknownFlag;
+            out.input = a;
+        } else if (a.len > 1 and (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-"))) {
             return error.UnknownFlag;
         } else if (out.input.len == 0) {
             out.input = a;
@@ -133,7 +137,11 @@ fn parseInfo(args: []const []const u8) ArgError!InfoArgs {
     for (args) |a| {
         if (std.mem.eql(u8, a, "--json")) {
             out.as_json = true;
-        } else if (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-")) {
+        } else if (std.mem.eql(u8, a, "-")) {
+            // Bare `-` is the stdin sentinel, not a flag.
+            if (out.input.len != 0) return error.UnknownFlag;
+            out.input = a;
+        } else if (a.len > 1 and (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-"))) {
             return error.UnknownFlag;
         } else if (out.input.len == 0) {
             out.input = a;
@@ -179,8 +187,21 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !ExitCode {
 fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     try stream.registerSignalHandlers();
 
-    var stdout_buf: [8192]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var out_buf: [8192]u8 = undefined;
+    const out_file = if (args.output_path) |path|
+        std.fs.cwd().createFile(path, .{}) catch |err| {
+            var serr_buf: [256]u8 = undefined;
+            var sbw = std.fs.File.stderr().writer(&serr_buf);
+            const sw = &sbw.interface;
+            sw.print("pdf.zig: cannot open output {s}: {s}\n", .{ path, @errorName(err) }) catch {};
+            sw.flush() catch {};
+            return .io_error;
+        }
+    else
+        std.fs.File.stdout();
+    defer if (args.output_path != null) out_file.close();
+
+    var bw = out_file.writer(&out_buf);
     const writer = &bw.interface;
     defer writer.flush() catch {};
 
@@ -189,7 +210,18 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
     const t_start = std.time.milliTimestamp();
 
-    const doc = zpdf.Document.open(allocator, args.input) catch |err| {
+    const stdin_data: ?[]u8 = if (std.mem.eql(u8, args.input, "-"))
+        readStdinAlloc(allocator) catch |err| {
+            return try fatalFromOpenError(&env, writer, err);
+        }
+    else
+        null;
+    defer if (stdin_data) |d| allocator.free(d);
+
+    const doc = (if (stdin_data) |data|
+        zpdf.Document.openFromMemory(allocator, data, zpdf.ErrorConfig.default())
+    else
+        zpdf.Document.open(allocator, args.input)) catch |err| {
         return try fatalFromOpenError(&env, writer, err);
     };
     defer doc.close();
@@ -217,8 +249,29 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                 .encrypted = false,
                 .title = meta.title,
                 .author = meta.author,
+                .subject = meta.subject,
+                .keywords = meta.keywords,
+                .creator = meta.creator,
                 .producer = meta.producer,
+                .creation_date = meta.creation_date,
+                .mod_date = meta.mod_date,
             });
+            if (!args.no_toc) {
+                const items: []zpdf.Document.OutlineItem = doc.getOutline(allocator) catch &.{};
+                defer if (items.len > 0) zpdf.outline.freeOutline(allocator, items);
+                if (items.len > 0) {
+                    var toc_items: std.ArrayList(stream.TocItem) = .empty;
+                    defer toc_items.deinit(allocator);
+                    for (items) |item| {
+                        try toc_items.append(allocator, .{
+                            .title = item.title,
+                            .page = if (item.page) |p| @intCast(p) else 0,
+                            .depth = std.math.lossyCast(u8, item.level),
+                        });
+                    }
+                    try env.emitToc(toc_items.items);
+                }
+            }
             try writer.flush();
         },
         .md, .text, .chunks => {},
@@ -241,6 +294,19 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
             return if (sig == std.posix.SIG.TERM) .interrupted_term else .interrupted_int;
         }
 
+        // .text mode streams plain text via the upstream extractor — no
+        // markdown rendering, no per-page allocation. The other modes share
+        // the extractMarkdown path below.
+        if (args.output_mode == .text) {
+            doc.extractText(page_idx, writer) catch |err| {
+                writer.print("\n<!-- pdf.zig: page {d} extraction failed: {s} -->\n", .{ page_idx + 1, @errorName(err) }) catch |e| return mapWriteErr(e);
+            };
+            writer.writeAll("\n") catch |e| return mapWriteErr(e);
+            writer.flush() catch |e| return mapWriteErr(e);
+            pages_emitted += 1;
+            continue;
+        }
+
         const md = doc.extractMarkdown(page_idx, allocator) catch |err| {
             // Non-fatal per-page failure: emit the page record with empty md
             // and a warnings entry, continue to next page.
@@ -249,7 +315,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
             switch (args.output_mode) {
                 .ndjson => {
                     const warns = if (args.no_warnings) &.{} else &[_]stream.Warning{w};
-                    env.emitPage(@intCast(page_idx), "", warns) catch |e| return mapWriteErr(e);
+                    env.emitPage(@intCast(page_idx + 1), "", warns) catch |e| return mapWriteErr(e);
                     writer.flush() catch |e| return mapWriteErr(e);
                 },
                 .md, .text => {
@@ -257,7 +323,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                     writer.flush() catch |e| return mapWriteErr(e);
                 },
                 .chunks => {
-                    try collected.append(allocator, .{ .index = @intCast(page_idx), .markdown = try allocator.dupe(u8, "") });
+                    try collected.append(allocator, .{ .index = @intCast(page_idx + 1), .markdown = try allocator.dupe(u8, "") });
                 },
             }
             continue;
@@ -268,7 +334,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
         switch (args.output_mode) {
             .ndjson => {
-                env.emitPage(@intCast(page_idx), md, &.{}) catch |e| {
+                env.emitPage(@intCast(page_idx + 1), md, &.{}) catch |e| {
                     allocator.free(md);
                     return mapWriteErr(e);
                 };
@@ -293,21 +359,10 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                 };
                 allocator.free(md);
             },
-            .text => {
-                writer.writeAll(md) catch |e| {
-                    allocator.free(md);
-                    return mapWriteErr(e);
-                };
-                writer.writeAll("\n") catch {};
-                writer.flush() catch |e| {
-                    allocator.free(md);
-                    return mapWriteErr(e);
-                };
-                allocator.free(md);
-            },
+            .text => unreachable, // handled at top of loop via doc.extractText
             .chunks => {
                 try collected.append(allocator, .{
-                    .index = @intCast(page_idx),
+                    .index = @intCast(page_idx + 1),
                     .markdown = md, // ownership transferred to `collected`
                 });
             },
@@ -346,9 +401,21 @@ fn runInfo(allocator: std.mem.Allocator, args: InfoArgs) !ExitCode {
 
     const source = sourceBasename(args.input);
 
+    const stdin_data: ?[]u8 = if (std.mem.eql(u8, args.input, "-"))
+        readStdinAlloc(allocator) catch |err| {
+            try writer.print("error: reading stdin: {s}\n", .{@errorName(err)});
+            return .io_error;
+        }
+    else
+        null;
+    defer if (stdin_data) |d| allocator.free(d);
+
     if (args.as_json) {
         var env = stream.Envelope.init(writer, source);
-        const doc = zpdf.Document.open(allocator, args.input) catch |err| {
+        const doc = (if (stdin_data) |data|
+            zpdf.Document.openFromMemory(allocator, data, zpdf.ErrorConfig.default())
+        else
+            zpdf.Document.open(allocator, args.input)) catch |err| {
             return try fatalFromOpenError(&env, writer, err);
         };
         defer doc.close();
@@ -358,12 +425,20 @@ fn runInfo(allocator: std.mem.Allocator, args: InfoArgs) !ExitCode {
             .encrypted = doc.isEncrypted(),
             .title = meta.title,
             .author = meta.author,
+            .subject = meta.subject,
+            .keywords = meta.keywords,
+            .creator = meta.creator,
             .producer = meta.producer,
+            .creation_date = meta.creation_date,
+            .mod_date = meta.mod_date,
         });
         return .ok;
     }
 
-    const doc = zpdf.Document.open(allocator, args.input) catch |err| {
+    const doc = (if (stdin_data) |data|
+        zpdf.Document.openFromMemory(allocator, data, zpdf.ErrorConfig.default())
+    else
+        zpdf.Document.open(allocator, args.input)) catch |err| {
         try writer.print("error: failed to open {s}: {s}\n", .{ args.input, @errorName(err) });
         return mapOpenErrorToExit(err);
     };
@@ -381,8 +456,32 @@ fn runInfo(allocator: std.mem.Allocator, args: InfoArgs) !ExitCode {
 // ---- Helpers ----
 
 fn sourceBasename(path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, "-")) return "<stdin>";
     const idx = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
     return path[idx + 1 ..];
+}
+
+/// Read all of stdin into an owned slice. Cap at 256 MiB so a runaway
+/// producer doesn't OOM us; that ceiling sits safely above the largest
+/// expected hotel PDF (~50 MiB) and below the practical 32-bit limit.
+const STDIN_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+fn readStdinAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    const stdin = std.fs.File.stdin();
+    var chunk_buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = stdin.read(&chunk_buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 0) break;
+        if (buf.items.len + n > STDIN_MAX_BYTES) return error.StdinTooLarge;
+        try buf.appendSlice(allocator, chunk_buf[0..n]);
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 fn mapWriteErr(err: anyerror) ExitCode {
@@ -573,4 +672,29 @@ test "page range: range + list" {
 test "sourceBasename strips directory" {
     try std.testing.expectEqualStrings("foo.pdf", sourceBasename("/var/tmp/foo.pdf"));
     try std.testing.expectEqualStrings("foo.pdf", sourceBasename("foo.pdf"));
+    try std.testing.expectEqualStrings("<stdin>", sourceBasename("-"));
+}
+
+test "parse extract: bare `-` is the stdin sentinel" {
+    const cmd = try parseArgs(&.{ "extract", "-" });
+    try std.testing.expect(cmd == .extract);
+    try std.testing.expectEqualStrings("-", cmd.extract.input);
+}
+
+test "parse extract: `-` with --output md still works" {
+    const cmd = try parseArgs(&.{ "extract", "--output", "md", "-" });
+    try std.testing.expectEqualStrings("-", cmd.extract.input);
+    try std.testing.expectEqual(OutputMode.md, cmd.extract.output_mode);
+}
+
+test "parse info: bare `-` is the stdin sentinel" {
+    const cmd = try parseArgs(&.{ "info", "-" });
+    try std.testing.expect(cmd == .info);
+    try std.testing.expectEqualStrings("-", cmd.info.input);
+}
+
+test "parse info: `--json -` works" {
+    const cmd = try parseArgs(&.{ "info", "--json", "-" });
+    try std.testing.expect(cmd.info.as_json);
+    try std.testing.expectEqualStrings("-", cmd.info.input);
 }

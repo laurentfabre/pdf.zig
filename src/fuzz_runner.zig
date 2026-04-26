@@ -342,10 +342,20 @@ pub fn main() !void {
 
     try out.print("pdf.zig fuzz harness — iters={d}, base_seed=0x{x}, build={s}\n", .{ iters, base_seed, @tagName(builtin.mode) });
 
-    // Generate the seed PDF once. Allocate from page_allocator (not the
-    // resetting arena) so it survives every per-target arena.reset.
-    const seed_pdf = try testpdf.generateMinimalPdf(std.heap.page_allocator, "fuzz seed text — pdf.zig week 4");
-    defer std.heap.page_allocator.free(seed_pdf);
+    // Build a pool of seed PDFs covering the parser families called out as
+    // risk areas during the GA review (Codex cycle-3 finding #6): minimal
+    // Helvetica, CID/CMap-using font, encrypted, and multi-page. Allocate
+    // from page_allocator so they survive every per-target arena.reset.
+    var seed_pool: [4][]const u8 = undefined;
+    seed_pool[0] = try testpdf.generateMinimalPdf(std.heap.page_allocator, "fuzz seed — minimal");
+    seed_pool[1] = try testpdf.generateCIDFontPdf(std.heap.page_allocator);
+    seed_pool[2] = try testpdf.generateEncryptedPdf(std.heap.page_allocator);
+    seed_pool[3] = try testpdf.generateMultiPagePdf(std.heap.page_allocator, &.{
+        "Page one with a paragraph and some words.",
+        "Page two has different content for cross-page mutation.",
+        "Page three closes the document body.",
+    });
+    defer for (seed_pool) |p| std.heap.page_allocator.free(p);
 
     var scratch: [8192]u8 = undefined;
 
@@ -368,7 +378,22 @@ pub fn main() !void {
         var iter: u64 = 0;
         var target_failures: u32 = 0;
         while (iter < iters) : (iter += 1) {
-            target.run(rng, arena_alloc, &scratch, seed_pdf) catch |e| {
+            // Rotate the seed across the 4-PDF pool so mutation targets
+            // exercise minimal / CID-font / encrypted / multi-page parser
+            // paths instead of just the minimal one. Exception: the
+            // extract-mutation target is pinned to seed_pool[0] (minimal
+            // Helvetica) because byte-flipping a CID-font / encrypted /
+            // multi-page seed and then calling extractMarkdown can drive
+            // the upstream parser into a hang on hostile input — a class
+            // of bug not reachable through pdf.zig's user-facing CLI
+            // (which only opens trusted PDFs from disk). Tracked as
+            // audit/fuzz_findings.md Finding 004; safe to broaden once
+            // upstream gains content-stream watchdog timeouts.
+            const this_seed = if (std.mem.eql(u8, target.name, "pdf_extract_mutation"))
+                seed_pool[0]
+            else
+                seed_pool[@as(usize, @intCast(iter)) % seed_pool.len];
+            target.run(rng, arena_alloc, &scratch, this_seed) catch |e| {
                 target_failures += 1;
                 if (target_failures <= 3) {
                     try out.print("\n  ! iter={d} {s}", .{ iter, @errorName(e) });

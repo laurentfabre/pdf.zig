@@ -37,37 +37,45 @@ pub const Tokenizer = struct {
 /// pure-whitespace runs (which BPE merges aggressively) and inflates for
 /// multibyte UTF-8 leading bytes (one code point ≈ one BPE token for CJK).
 pub fn heuristicCount(text: []const u8) u32 {
-    if (text.len == 0) return 0;
-
     var byte_weight: usize = 0;
-    var in_whitespace_run = false;
-
-    for (text) |b| {
-        if (b == ' ' or b == '\t') {
-            if (!in_whitespace_run) {
-                byte_weight += 1;
-                in_whitespace_run = true;
-            }
-            continue;
-        }
-        in_whitespace_run = false;
-
-        if (b == '\n' or b == '\r') {
-            byte_weight += 1;
-            continue;
-        }
-
-        // UTF-8 leading bytes for non-ASCII code points: each multibyte
-        // sequence contributes ≥1 token (CJK is dense; Latin-1 accents are
-        // typically merged but still break BPE alignment).
-        if (b < 0x80) {
-            byte_weight += 1;
-        } else if ((b & 0xC0) == 0xC0) {
-            byte_weight += 4;
-        }
-    }
-
+    var in_ws = false;
+    for (text) |b| byte_weight += byteWeight(b, &in_ws);
+    if (byte_weight == 0) return 0;
     return @intCast((byte_weight + 3) / 4);
+}
+
+/// Largest byte length whose `heuristicCount` is ≤ `max_tokens`. Walks once
+/// and stops the moment adding the next byte would exceed the budget. The
+/// chunk module uses this so `--max-tokens N` is a hard ceiling, not an
+/// estimate (CJK over-counts and emoji-heavy text trips the prior
+/// estimate-then-correct path).
+pub fn maxBytesForTokens(text: []const u8, max_tokens: u32) usize {
+    if (max_tokens == 0 or text.len == 0) return 0;
+    const target = @as(usize, max_tokens) * 4;
+    var byte_weight: usize = 0;
+    var in_ws = false;
+    for (text, 0..) |b, i| {
+        const w = byteWeight(b, &in_ws);
+        if (byte_weight + w > target) return i;
+        byte_weight += w;
+    }
+    return text.len;
+}
+
+/// Per-byte weight contribution; mutates `in_ws` to collapse whitespace runs.
+inline fn byteWeight(b: u8, in_ws: *bool) usize {
+    if (b == ' ' or b == '\t') {
+        if (!in_ws.*) {
+            in_ws.* = true;
+            return 1;
+        }
+        return 0;
+    }
+    in_ws.* = false;
+    if (b == '\n' or b == '\r') return 1;
+    if (b < 0x80) return 1;
+    if ((b & 0xC0) == 0xC0) return 4; // UTF-8 leading byte
+    return 0; // UTF-8 continuation byte
 }
 
 // ---- tests ----

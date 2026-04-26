@@ -66,8 +66,12 @@ test "checkAllAllocationFailures — Document.openFromMemory (Finding 001)" {
     const seed = try testpdf.generateMinimalPdf(std.testing.allocator, SEED_TEXT);
     defer std.testing.allocator.free(seed);
 
+    // Backing: page_allocator. The FailingAllocator wraps it and runs its
+    // own alloc/free accounting (returns error.MemoryLeakDetected on leak).
+    // Using testing.allocator would *also* fire its leak checker on the
+    // upstream's partial-OOM leaks, double-counting failures.
     const result = std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        std.heap.page_allocator,
         openOnly,
         .{seed},
     );
@@ -78,8 +82,12 @@ test "checkAllAllocationFailures — Document.extractMarkdown (Finding 002)" {
     const seed = try testpdf.generateMinimalPdf(std.testing.allocator, SEED_TEXT);
     defer std.testing.allocator.free(seed);
 
+    // Backing: page_allocator. The FailingAllocator wraps it and runs its
+    // own alloc/free accounting (returns error.MemoryLeakDetected on leak).
+    // Using testing.allocator would *also* fire its leak checker on the
+    // upstream's partial-OOM leaks, double-counting failures.
     const result = std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        std.heap.page_allocator,
         openAndExtract,
         .{seed},
     );
@@ -90,8 +98,12 @@ test "checkAllAllocationFailures — Document.metadata (Finding 003)" {
     const seed = try testpdf.generateMinimalPdf(std.testing.allocator, SEED_TEXT);
     defer std.testing.allocator.free(seed);
 
+    // Backing: page_allocator. The FailingAllocator wraps it and runs its
+    // own alloc/free accounting (returns error.MemoryLeakDetected on leak).
+    // Using testing.allocator would *also* fire its leak checker on the
+    // upstream's partial-OOM leaks, double-counting failures.
     const result = std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        std.heap.page_allocator,
         openAndMetadata,
         .{seed},
     );

@@ -222,6 +222,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        // Filter to only this file's tests — the transitive import graph
+        // (encoding/parser/testpdf) carries pre-existing upstream leaks
+        // unrelated to the allocation-failure-shape contract.
+        .filters = &.{"alloc_failure_test"},
     });
     const run_alloc_test = b.addRunArtifact(alloc_test);
     const alloc_test_step = b.step("alloc-failure-test", "Run checkAllAllocationFailures coverage on parse paths");

@@ -109,10 +109,15 @@ fn splitGiantPage(
             break;
         }
 
-        const target_bytes = estimateBytesForTokens(opts.max_tokens, rest);
-        const cut = findBreakBefore(rest, target_bytes);
+        // `maxBytesForTokens` returns the largest prefix whose heuristic
+        // token count is ≤ max_tokens (exact, not estimated). The break
+        // finder then trims the cut to the nearest preferred boundary
+        // ≤ that budget — never above it.
+        const budget_bytes = tokenizer.maxBytesForTokens(rest, opts.max_tokens);
+        const cut = findBreakBefore(rest, budget_bytes);
         const slice = rest[0..cut.byte_offset];
         const slice_tokens = try opts.tokenizer.count(slice);
+        std.debug.assert(slice_tokens <= opts.max_tokens);
 
         try env.emitChunk(chunk_id, &.{page.index}, slice, slice_tokens, cut.kind);
         chunk_id += 1;
@@ -165,13 +170,6 @@ fn lastIndexOfHeading(text: []const u8) ?usize {
     return null;
 }
 
-/// Inverse of the tokenizer's chars/4 estimate: ~4 bytes per token, with a
-/// safety margin so we don't overshoot after re-counting on the slice.
-fn estimateBytesForTokens(max_tokens: u32, text: []const u8) usize {
-    const naive = @as(usize, max_tokens) * 4;
-    const safety = naive - (naive / 8); // 87.5% of naive
-    return @min(safety, text.len);
-}
 
 // ---- tests ----
 
@@ -237,6 +235,38 @@ test "giant page is split on heading preference" {
     try std.testing.expect(n >= 2);
     // At least one chunk must report a section_heading break.
     try std.testing.expect(std.mem.indexOf(u8, aw.buffered(), "\"break\":\"section_heading\"") != null);
+}
+
+test "chunk respects max_tokens contract on CJK-heavy pages" {
+    // 200 CJK chars (600 bytes UTF-8) — heuristicCount ≈ 200 tokens.
+    var rep: [600]u8 = undefined;
+    var i: usize = 0;
+    while (i + 3 <= rep.len) : (i += 3) {
+        rep[i] = 0xe4; rep[i + 1] = 0xbd; rep[i + 2] = 0xa0; // 你
+    }
+    var aw = std.io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    var env = stream.Envelope.initWithId(&aw.writer, "fuzz.pdf", FIXED_DOC_ID2);
+    const t = tokenizer.Tokenizer.init(.heuristic);
+    const pages = [_]Page{.{ .index = 1, .markdown = &rep }};
+    const max: u32 = 50;
+    const n = try chunkPages(std.testing.allocator, &pages, .{
+        .max_tokens = max,
+        .tokenizer = t,
+    }, &env);
+    try std.testing.expect(n >= 4); // 200 tokens / 50 budget => ≥4 chunks
+    // Every emitted chunk's tokens_est must be ≤ max_tokens.
+    var pos: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, aw.written(), pos, "\"tokens_est\":")) |idx| {
+        const tail = aw.written()[idx + "\"tokens_est\":".len ..];
+        const end = std.mem.indexOfAnyPos(u8, tail, 0, ",}").?;
+        const v = try std.fmt.parseInt(u32, tail[0..end], 10);
+        try std.testing.expect(v <= max);
+        seen += 1;
+        pos = idx + 1;
+    }
+    try std.testing.expect(seen >= 4);
 }
 
 test "max_tokens = 0 is rejected" {

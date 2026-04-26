@@ -83,7 +83,12 @@ pub const DocumentInfo = struct {
     encrypted: bool,
     title: ?[]const u8 = null,
     author: ?[]const u8 = null,
+    subject: ?[]const u8 = null,
+    keywords: ?[]const u8 = null,
+    creator: ?[]const u8 = null,
     producer: ?[]const u8 = null,
+    creation_date: ?[]const u8 = null,
+    mod_date: ?[]const u8 = null,
 };
 
 pub const Totals = struct {
@@ -132,18 +137,26 @@ pub const Envelope = struct {
         try self.writer.print(",\"pages\":{d},\"encrypted\":{}", .{ info.pages, info.encrypted });
         if (info.title) |t| try self.writeStringField("title", t);
         if (info.author) |a| try self.writeStringField("author", a);
+        if (info.subject) |s| try self.writeStringField("subject", s);
+        if (info.keywords) |k| try self.writeStringField("keywords", k);
+        if (info.creator) |c| try self.writeStringField("creator", c);
         if (info.producer) |p| try self.writeStringField("producer", p);
+        if (info.creation_date) |d| try self.writeStringField("creation_date", d);
+        if (info.mod_date) |d| try self.writeStringField("mod_date", d);
         try self.endRecord();
     }
 
+    /// `page_number` is 1-based (PDF page numbering convention used by every
+    /// LLM citation and human-facing tool). The caller must convert from
+    /// 0-based internal indices.
     pub fn emitPage(
         self: *Envelope,
-        page_idx: u32,
+        page_number: u32,
         markdown: []const u8,
         warnings: []const Warning,
     ) !void {
         try self.beginRecord(.page);
-        try self.writer.print(",\"page\":{d}", .{page_idx});
+        try self.writer.print(",\"page\":{d}", .{page_number});
         try self.writeStringField("markdown", markdown);
         try self.writer.writeAll(",\"warnings\":[");
         for (warnings, 0..) |w, i| {
@@ -294,12 +307,22 @@ pub fn writeJsonString(writer: *std.io.Writer, s: []const u8) !void {
                         i += 1;
                         continue;
                     }
-                    _ = std.unicode.utf8Decode(s[i .. i + seq_len]) catch {
+                    const cp = std.unicode.utf8Decode(s[i .. i + seq_len]) catch {
                         try writer.writeAll("\\ufffd");
                         i += 1;
                         continue;
                     };
-                    try writer.writeAll(s[i .. i + seq_len]);
+                    // U+0085 NEL, U+2028 LINE SEPARATOR, U+2029 PARAGRAPH
+                    // SEPARATOR are valid in JSON strings per RFC 8259, but
+                    // Python's `str.splitlines()`, jq, awk, and many other
+                    // line-buffered readers treat them as record separators
+                    // — which silently breaks the NDJSON contract. Escape.
+                    switch (cp) {
+                        0x0085 => try writer.writeAll("\\u0085"),
+                        0x2028 => try writer.writeAll("\\u2028"),
+                        0x2029 => try writer.writeAll("\\u2029"),
+                        else => try writer.writeAll(s[i .. i + seq_len]),
+                    }
                     i += seq_len;
                 }
             },
@@ -390,6 +413,18 @@ test "string escape: invalid UTF-8 → U+FFFD replacement" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\\ufffd") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\\u0000") != null);
     try std.testing.expectEqual(@as(u8, '"'), written[written.len - 1]);
+}
+
+test "string escape: Unicode line separators (U+0085 / U+2028 / U+2029) are escaped" {
+    var buf: [256]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    // U+0085 = C2 85, U+2028 = E2 80 A8, U+2029 = E2 80 A9 in UTF-8.
+    try writeJsonString(&aw, "a\xc2\x85b\xe2\x80\xa8c\xe2\x80\xa9d");
+    const written = aw.buffered();
+    try std.testing.expectEqualStrings(
+        "\"a\\u0085b\\u2028c\\u2029d\"",
+        written,
+    );
 }
 
 test "string escape: truncated UTF-8 sequence → U+FFFD" {

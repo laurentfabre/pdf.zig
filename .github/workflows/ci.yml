@@ -6,6 +6,9 @@ on:
     paths-ignore: ['docs/**', '*.md', 'audit/**']
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly Monday 03:00 UTC: kicks the full-fuzz job (1M iters/target).
+    - cron: '0 3 * * 1'
   workflow_dispatch:
 
 jobs:
@@ -35,10 +38,14 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Smoke fuzz (10k iters per target)
+      - name: Smoke fuzz (50k iters per target, default + aggressive)
         env:
-          PDFZIG_FUZZ_ITERS: '10000'
+          PDFZIG_FUZZ_ITERS: '50000'
+          PDFZIG_FUZZ_AGGRESSIVE: '1'
         run: zig build fuzz -Doptimize=ReleaseSafe
+
+      - name: Allocation-failure shape (Findings 001-003 in audit/fuzz_findings.md)
+        run: zig build alloc-failure-test -Doptimize=ReleaseSafe
 
       - name: pdf.zig binary smoke
         run: |
@@ -55,3 +62,21 @@ jobs:
             ls zig-out/bin/
             echo "::endgroup::"
           done
+
+  fuzz-full:
+    name: Full fuzz (1M iters/target, aggressive on)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Full fuzz (architecture.md §11 gate)
+        env:
+          PDFZIG_FUZZ_ITERS: '1000000'
+          PDFZIG_FUZZ_AGGRESSIVE: '1'
+        run: zig build fuzz -Doptimize=ReleaseSafe

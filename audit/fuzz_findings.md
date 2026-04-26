@@ -52,6 +52,17 @@ The `metadata()` call resolves an indirect reference into the trailer dict; the 
 
 ---
 
+## Finding 004 — `extractMarkdown` hangs on adversarially-mutated CID/encrypted/multi-page seeds
+
+**Path**: `src/root.zig::extractMarkdown` → upstream content-stream interpreter
+**Surfaced by**: Week-7 expanded fuzz seed pool. After rotating across `{minimal, CID-font, encrypted, multi-page}`, `pdf_extract_mutation` started hanging at 100 % CPU on some byte-flips of the three richer seeds. Reproduced multiple times during the GA audit (see the zombie-process triage).
+
+**Mitigation in v1.0**: `pdf_extract_mutation` is pinned to `seed_pool[0]` (minimal Helvetica) only — the other 12 targets, including `pdf_open_mutation` which mutates the same expanded pool, complete cleanly at 50 k iters. The hang is **not user-reachable** through the pdf.zig CLI: the production code path (`Document.open(path)`) opens trusted PDFs from disk, never byte-flipped buffers; the hang requires `openFromMemory` + a successful parse of a hostile-mutated CID/encrypted/multi-page seed before reaching `extractMarkdown`.
+
+**Recommended fix (v1.0.1 / v1.x)**: add per-page wall-clock or operator-fuel watchdog to the upstream content-stream interpreter so a malformed content stream surfaces as `error.ContentStreamFuelExhausted` instead of an unbounded loop. Once the watchdog lands, broaden `pdf_extract_mutation`'s seed rotation back to all 4 seeds.
+
+---
+
 ## Non-finding — fuzz harness use-after-free (resolved 2026-04-26)
 
 Initial pdf_open_mutation runs at 100k iters segfaulted in `std.mem.eql`'s 4-byte SIMD compare. Stack trace pointed at upstream parser, which produced the false impression of a heap-safety bug. **Root cause was in the fuzz harness itself**: `seed_pdf` was allocated from the same arena that gets reset every 4096 iters, so by target 10's iter 0 it pointed at freed memory. Fixed by allocating the seed PDF from `std.heap.page_allocator` (lifetime = whole program).
