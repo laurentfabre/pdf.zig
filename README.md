@@ -2,7 +2,7 @@
 
 *Zig CLI for PDF → Markdown extraction, optimised for LLM streaming consumers.*
 
-![Status](https://img.shields.io/badge/status-pre_alpha_(audit_in_progress)-orange)
+![Status](https://img.shields.io/badge/status-v1.0--rc2-blue)
 ![Target](https://img.shields.io/badge/target-zlsx_grade_quality-blue)
 ![Upstream](https://img.shields.io/badge/upstream-Lulzx%2Fzpdf_(CC0)-purple)
 
@@ -54,19 +54,71 @@ git remotes:
 - `origin`   → `git@github.com:laurentfabre/pdf.zig.git` (our fork)
 - `upstream` → `https://github.com/Lulzx/zpdf.git` (for `git fetch upstream`)
 
+## Install
+
+> **Status (2026-04-26)**: **v1.0-rc2** released. RC artifacts on the [GitHub Releases page](https://github.com/laurentfabre/pdf.zig/releases). v1.0 GA after Week-7 cycle-10 bake-off rerun.
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap laurentfabre/pdf.zig
+brew install pdf.zig
+```
+
+The tap formula lives at [`scripts/Formula/pdf-zig.rb`](scripts/Formula/pdf-zig.rb) in this repo and is mirrored to `laurentfabre/homebrew-pdf.zig` at each release.
+
+### Pre-built binary (any platform)
+
+Download the matching tarball/zip from [Releases](https://github.com/laurentfabre/pdf.zig/releases), verify the checksum, and put `bin/pdf.zig` somewhere on your `$PATH`:
+
+```bash
+TAG=v1.0-rc2
+ARCH=aarch64-macos   # or x86_64-macos / x86_64-linux / aarch64-linux / x86_64-windows
+curl -LO "https://github.com/laurentfabre/pdf.zig/releases/download/$TAG/pdf.zig-$TAG-$ARCH.tar.gz"
+curl -LO "https://github.com/laurentfabre/pdf.zig/releases/download/$TAG/SHA256SUMS"
+sha256sum -c <(grep "$ARCH" SHA256SUMS)
+tar xzf "pdf.zig-$TAG-$ARCH.tar.gz"
+sudo mv "pdf.zig-$TAG-$ARCH/bin/pdf.zig" /usr/local/bin/
+```
+
+### Python bindings
+
+```bash
+pip install py-pdf-zig
+```
+
+```python
+from zpdf import Document
+
+with Document("hotel.pdf") as doc:
+    for i in range(doc.page_count):
+        print(doc.extract_page(i))
+```
+
+The package keeps the upstream-compat import name `zpdf` for ABI continuity.
+
+### From source
+
+```bash
+git clone https://github.com/laurentfabre/pdf.zig
+cd pdf.zig
+zig build -Doptimize=ReleaseSafe       # requires zig 0.15.2
+./zig-out/bin/pdf.zig --help
+```
+
+5-platform cross-compilation works from any single host: `zig build -Dtarget=aarch64-linux …` etc.
+
+---
+
 ## Status
 
-**2026-04-26**: ✅ **Week-0 audit GREENLIT** (`docs/week0-audit.md`). All structural gates pass: **0 crashes** on Alfred's 1 776-PDF corpus, **98.5% output rate** on the text-bearing subset, **56 structured outputs**, **7 second** full-corpus runtime at 6 workers (~260 PDFs/sec).
+**2026-04-26**: ✅ **v1.0-rc2** cut. All Week-0 → Week-6 gates green:
+- **Week 0**: 0 crashes on Alfred's 1,776-PDF corpus, 98.5% output rate on the text-bearing subset, 7 s full-corpus runtime
+- **Week 4**: 11 fuzz targets × 1M iters each = **11M iters, 0 panics**; 11/11 xref-repair fixtures; 40-PDF corpus regression clean; 4 NaN/inf upstream panic sites fixed
+- **Week 5**: bake-off vs `pymupdf4llm` n=12 — **121× faster aggregate**, 78.9% char parity, 2 documented out-of-scope buckets (CJK + image-text)
+- **Week 6**: GH Actions release pipeline (5 platforms cross-compile from one runner), brew tap formula, Python bindings rebuilt against pdf.zig HEAD
 
-**Next**: 5-week Option C build per [`docs/architecture.md` §14 Roadmap](docs/architecture.md):
-- Week 1: fork at SHA `5eba7ad`, triage 47 unexplained empties + 9 decorative-font menu garbages, build xref-repair fixtures
-- Week 2: CJK + Cyrillic Unicode correctness (Arabic = emit-as-is + warn)
-- Week 3: NDJSON streaming layer + CLI
-- Week 4: fuzz suite + ReleaseSafe + checkAllAllocationFailures
-- Week 5: bake-off regression vs pymupdf4llm + v1.0-rc1
-- Week 6: GH Actions release pipeline + brew tap + v1.0-rc2
-- Week 6.5: Cycle-10 of `alfred-bakeoff-report.md` (pdf.zig vs pymupdf4llm rerun)
-- Week 7: v1.0 GA tag
+Remaining for v1.0 GA: cycle-10 of [`docs/alfred-bakeoff-report.md`](docs/alfred-bakeoff-report.md) (Week 6.5) → v1.0 GA tag (Week 7). Per-week status docs live alongside the architecture: [`docs/week0-audit.md`](docs/week0-audit.md), [`docs/week1-status.md`](docs/week1-status.md), [`docs/week2-status.md`](docs/week2-status.md), [`docs/streaming-layer-design.md`](docs/streaming-layer-design.md), [`docs/week5-bakeoff-report.md`](docs/week5-bakeoff-report.md).
 
 ## Decisions log (high-level)
 

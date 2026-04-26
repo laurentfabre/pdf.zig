@@ -3,17 +3,20 @@ requires = ["setuptools>=61.0", "cffi>=1.15", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "zpdf"
-version = "0.1.0"
-description = "High-performance PDF text extraction powered by Zig"
+name = "py-pdf-zig"
+version = "1.0.0rc2"
+description = "PDF -> Markdown extraction CLI + library, NDJSON-streaming, optimized for LLM consumers (Zig)"
 readme = "README.md"
 license = "CC0-1.0"
 requires-python = ">=3.8"
 dependencies = ["cffi>=1.15"]
-authors = [{name = "Lulzx"}]
-keywords = ["pdf", "text-extraction", "parser", "zig"]
+authors = [
+    {name = "Laurent Fabre"},
+    {name = "Lulzx (upstream zpdf author)"},
+]
+keywords = ["pdf", "text-extraction", "parser", "zig", "llm", "ndjson", "markdown"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Text Processing",
     "Programming Language :: Python :: 3",
@@ -26,9 +29,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Lulzx/zpdf"
-Repository = "https://github.com/Lulzx/zpdf"
-Issues = "https://github.com/Lulzx/zpdf/issues"
+Homepage = "https://github.com/laurentfabre/pdf.zig"
+Repository = "https://github.com/laurentfabre/pdf.zig"
+Issues = "https://github.com/laurentfabre/pdf.zig/issues"
+Upstream = "https://github.com/Lulzx/zpdf"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]

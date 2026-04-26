@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '*.md', 'audit/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: Build + test (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: zig build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: zig build test
+        run: zig build test
+
+      - name: Streaming-layer module tests
+        run: |
+          set -e
+          for f in uuid tokenizer stream chunk cli_pdfzig; do
+            echo "::group::$f"
+            zig test src/$f.zig
+            echo "::endgroup::"
+          done
+
+      - name: Smoke fuzz (10k iters per target)
+        env:
+          PDFZIG_FUZZ_ITERS: '10000'
+        run: zig build fuzz -Doptimize=ReleaseSafe
+
+      - name: pdf.zig binary smoke
+        run: |
+          ./zig-out/bin/pdf.zig --version
+          ./zig-out/bin/pdf.zig --help | head -5
+
+      - name: Cross-compile sanity (all 5 release targets)
+        run: |
+          set -e
+          for target in aarch64-macos x86_64-macos x86_64-linux aarch64-linux x86_64-windows; do
+            echo "::group::cross $target"
+            rm -rf zig-out
+            zig build -Doptimize=ReleaseSafe -Dtarget=$target
+            ls zig-out/bin/
+            echo "::endgroup::"
+          done

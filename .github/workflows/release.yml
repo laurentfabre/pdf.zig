@@ -1,0 +1,98 @@
+name: Release
+
+# Triggered by `v*.*.*` tag push (`v1.0-rc2`, `v1.0`, `v1.1`, …).
+# Cross-compiles to 5 platform triples from a single ubuntu-latest runner
+# — Zig's killer feature: `zig build -Dtarget=<triple>` works for every
+# target without per-runner setup, so 5 platforms cost ~one runner-minute.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-*'   # pre-release tags like v1.0-rc2
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (must already exist)'
+        required: true
+
+permissions:
+  contents: write   # required to create the release + upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cross-compile 5 platforms (ReleaseSafe)
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for target in \
+            aarch64-macos \
+            x86_64-macos  \
+            x86_64-linux  \
+            aarch64-linux \
+            x86_64-windows; do
+            echo "::group::build $target"
+            rm -rf zig-out
+            zig build -Doptimize=ReleaseSafe -Dtarget="$target"
+            ls -R zig-out/
+
+            STAGE="pdf.zig-${{ steps.tag.outputs.tag }}-$target"
+            mkdir -p "$STAGE/bin" "$STAGE/lib"
+
+            if [[ "$target" == *windows ]]; then
+              cp zig-out/bin/pdf.zig.exe "$STAGE/bin/"
+              cp zig-out/bin/zpdf.exe    "$STAGE/bin/"
+              cp zig-out/bin/zpdf.dll    "$STAGE/lib/" 2>/dev/null || true
+            else
+              cp zig-out/bin/pdf.zig "$STAGE/bin/"
+              cp zig-out/bin/zpdf    "$STAGE/bin/"
+              cp zig-out/lib/libzpdf.a "$STAGE/lib/" 2>/dev/null || true
+              cp zig-out/lib/libzpdf.dylib "$STAGE/lib/" 2>/dev/null || true
+              cp zig-out/lib/libzpdf.so    "$STAGE/lib/" 2>/dev/null || true
+            fi
+            cp README.md LICENSE "$STAGE/"
+
+            if [[ "$target" == *windows ]]; then
+              (cd "$(dirname $STAGE)" && zip -r "release/$STAGE.zip" "$(basename $STAGE)")
+            else
+              tar -C "$(dirname $STAGE)" -czf "release/$STAGE.tar.gz" "$(basename $STAGE)"
+            fi
+            rm -rf "$STAGE"
+            echo "::endgroup::"
+          done
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-rc') || contains(steps.tag.outputs.tag, '-beta') || contains(steps.tag.outputs.tag, '-alpha') }}
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/SHA256SUMS
