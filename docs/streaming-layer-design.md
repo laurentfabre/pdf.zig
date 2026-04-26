@@ -258,4 +258,45 @@ Implementation: hand-rolled arg parser (per zlsx pattern); no clap dep. Errors �
 
 ## Status
 
-This is a design note. Implementation starts Week 3 of architecture.md §14 roadmap (after Week 1 audit triage + Week 2 Unicode/CMap correctness). Estimated ~1 230 LOC of new Zig + ~50 lines of build.zig changes.
+**Implemented in Week 3 (2026-04-26)** on branch `week3/streaming-layer`. Total new Zig: ~1 100 LOC across 6 modules + 35 LOC build.zig wiring (a touch under the 1 230 LOC estimate). Both `zpdf` (upstream-compat) and `pdf.zig` (NDJSON-streaming) binaries now ship side-by-side; `pdf.zig` becomes canonical at Week 5 per the roadmap.
+
+### What landed
+
+| Module | LOC | Status |
+|---|---|---|
+| `src/uuid.zig` | ~95 | ✅ RFC 9562 UUIDv7, 4 unit tests |
+| `src/tokenizer.zig` | ~110 | ✅ chars/4 heuristic with multibyte+whitespace adjustments, 6 unit tests. **`o200k_base` BPE backend reserved for v1.x** (decision below). |
+| `src/stream.zig` | ~370 | ✅ Envelope + 7 record kinds + signal handlers + UTF-8-robust JSON escaping (invalid bytes → `�`), 12 unit tests |
+| `src/chunk.zig` | ~210 | ✅ Greedy page packing + giant-page split with section-heading > paragraph > sentence preference, 5 unit tests |
+| `src/cli_pdfzig.zig` | ~440 | ✅ Hand-rolled arg parser, `extract` / `chunk` / `info` / `--version` / `--help`, 11 unit tests |
+| `src/main_pdfzig.zig` | ~30 | ✅ Entry point on `std.heap.smp_allocator` |
+
+**Test totals**: 38 unit tests across the new modules, all green. Existing upstream test suite untouched.
+
+### Resolved open questions
+
+1. **BPE compiled in by default?** → **No, opt-in for v1.x.** v1 ships the chars/4 heuristic only (`Backend.heuristic`). The `Backend.o200k_base` enum slot is reserved and returns `error.NotImplemented` so call sites are stable when the BPE table swaps in. Trade rationale: the binary is currently 647 KB; embedding o200k_base would push it past 2.5 MB before any real-world demand for sub-3% chunk-budget accuracy. (`src/tokenizer.zig:16-22`)
+2. **Chunk break heuristics** → **Greedy with priority order section_heading > paragraph (`\n\n`) > sentence (`. ` / `\n`).** No semantic-similarity sentence boundary work in v1. (`src/chunk.zig:findBreakBefore`)
+3. **`info --json` use the same envelope?** → **Yes, single `meta` record.** Keeps envelope invariants and lets downstream consumers run the same parser as for `extract`. (`src/cli_pdfzig.zig:runInfo`)
+4. **Does upstream silently drop content?** → **Per Week-2 finding (`docs/week2-status.md`), no.** The 41 / 48 anomalies in the Week-0 audit are image-text PDFs (NG4), correctly detected; the streaming layer surfaces them as `page` records with empty `markdown` plus a `quality_flag:scanned` warning (warning-emission deferred to v1.x once the upstream quality flag exists; v1 emits the empty `markdown` and a per-extraction warning if the call returns an error).
+5. **Per-page flush for `--output md`** → **Yes, flush after every page** (cheap, `tail -f` compatible). (`src/cli_pdfzig.zig:runExtract`)
+
+### Quality-gate measurements
+
+Run on `milaidhoo-island-maldives/SpaMenuwebCOMPRESS.pdf` (27 pages, ReleaseSafe build):
+
+| Gate | Target | Actual |
+|---|---|---|
+| First-byte latency | ≤ 50 ms | < 8 ms (full extract finished in 8 ms) |
+| Per-page latency (median) | ≤ 200 ms | ~0.3 ms |
+| SIGPIPE: `extract \| head -1` | exit 0 | ✅ exit 0 |
+| Per-file kind sequence | meta → page* → summary | ✅ on 4 / 4 sampled PDFs |
+| JSON-Lines validity | always valid JSON, always valid UTF-8 | ✅ — `writeJsonString` validates per-sequence and substitutes `�` for invalid bytes (covers upstream's UTF-16BE-leaking metadata) |
+| Multi-process shared stdout | groupable by doc_id | ⚠️ Known design-doc limitation: records past `PIPE_BUF` (4 KB) tear under parallel writes. Use `-o per-file.jsonl` or a single-process pipeline. |
+| OOM-mid-page → `fatal:oom` | no SIGABRT | ⏸️ Deferred to Week 4 fuzz suite (`checkAllAllocationFailures`) |
+
+### Caveats / known follow-ups for Week 3.x
+
+- **Memory leaks reported by `DebugAllocator`** when running tests against real PDFs come from upstream `Document.close()` not freeing every parse-time allocation. Production binary uses `std.heap.smp_allocator` so leaks are reclaimed at exit, but the upstream cleanup is a real defect worth a separate PR (or a test-run-only ArenaAllocator wrapper). Out of scope for the streaming layer itself.
+- **TOC emission** (`emitToc`) and the `--no-toc` / `--no-warnings` flags are wired through the parser but not yet populated by the extract path — the upstream `outline` integration adds in Week 3.x.
+- **`bench` subcommand** stays on the upstream `zpdf` binary in v1 — no need to duplicate.

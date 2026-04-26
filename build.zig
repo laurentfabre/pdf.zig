@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     const install_wasm = b.addInstallArtifact(wasm, .{});
     wasm_step.dependOn(&install_wasm.step);
 
-    // CLI tool
+    // CLI tool (upstream-compat binary)
     const exe = b.addExecutable(.{
         .name = "zpdf",
         .root_module = b.createModule(.{
@@ -74,6 +74,39 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the zpdf CLI");
     run_step.dependOn(&run_cmd.step);
+
+    // pdf.zig CLI (NDJSON-streaming flavour, Week 3 of architecture.md §14).
+    // Both binaries install to zig-out/bin/ side-by-side until Week 5 makes
+    // pdf.zig canonical.
+    const pdfzig_exe = b.addExecutable(.{
+        .name = "pdf.zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_pdfzig.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    b.installArtifact(pdfzig_exe);
+
+    const run_pdfzig = b.addRunArtifact(pdfzig_exe);
+    run_pdfzig.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_pdfzig.addArgs(args);
+    }
+    const run_pdfzig_step = b.step("run-pdfzig", "Run the pdf.zig CLI");
+    run_pdfzig_step.dependOn(&run_pdfzig.step);
+
+    // Streaming-layer unit tests (uuid, tokenizer, stream, chunk, cli).
+    // Each module's tests are also picked up via the main `test` step below.
+    const stream_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli_pdfzig.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_stream_unit_tests = b.addRunArtifact(stream_unit_tests);
 
     // Unit tests
     const lib_unit_tests = b.addTest(.{
@@ -176,6 +209,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_interpreter_unit_tests.step);
     test_step.dependOn(&run_testpdf_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_stream_unit_tests.step);
 
     // Benchmark
     const bench = b.addExecutable(.{
