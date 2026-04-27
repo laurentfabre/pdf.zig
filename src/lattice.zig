@@ -89,6 +89,8 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
 
     var path_x: f64 = 0;
     var path_y: f64 = 0;
+    var subpath_start_x: f64 = 0;
+    var subpath_start_y: f64 = 0;
     var path_segments: std.ArrayList(Stroke) = .empty;
     defer path_segments.deinit(allocator);
 
@@ -116,10 +118,17 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
                 } else if (std.mem.eql(u8, op, "m") and operands.items.len >= 2) {
                     const p = ctm.apply(operands.items[0], operands.items[1]);
                     path_x = p.x; path_y = p.y;
+                    subpath_start_x = p.x; subpath_start_y = p.y;
                 } else if (std.mem.eql(u8, op, "l") and operands.items.len >= 2) {
                     const p = ctm.apply(operands.items[0], operands.items[1]);
                     try path_segments.append(allocator, .{ .x0 = path_x, .y0 = path_y, .x1 = p.x, .y1 = p.y });
                     path_x = p.x; path_y = p.y;
+                } else if (std.mem.eql(u8, op, "h")) {
+                    // close path: implicit line from current to subpath start
+                    if (path_x != subpath_start_x or path_y != subpath_start_y) {
+                        try path_segments.append(allocator, .{ .x0 = path_x, .y0 = path_y, .x1 = subpath_start_x, .y1 = subpath_start_y });
+                    }
+                    path_x = subpath_start_x; path_y = subpath_start_y;
                 } else if (std.mem.eql(u8, op, "re") and operands.items.len >= 4) {
                     const x = operands.items[0];
                     const y = operands.items[1];
@@ -137,7 +146,20 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
                     std.mem.eql(u8, op, "B") or std.mem.eql(u8, op, "B*") or
                     std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*"))
                 {
-                    // Path closed/stroked — keep horizontal+vertical segments only.
+                    // s, b, b* implicitly close the current subpath before
+                    // stroking. Add the close-path segment if the cursor
+                    // hasn't already returned to the subpath start.
+                    const implicit_close =
+                        std.mem.eql(u8, op, "s") or
+                        std.mem.eql(u8, op, "b") or
+                        std.mem.eql(u8, op, "b*");
+                    if (implicit_close) {
+                        if (path_x != subpath_start_x or path_y != subpath_start_y) {
+                            try path_segments.append(allocator, .{ .x0 = path_x, .y0 = path_y, .x1 = subpath_start_x, .y1 = subpath_start_y });
+                        }
+                        path_x = subpath_start_x; path_y = subpath_start_y;
+                    }
+                    // Path stroked — keep horizontal+vertical segments only.
                     for (path_segments.items) |seg| {
                         if (seg.isHorizontal() or seg.isVertical()) {
                             try strokes.append(allocator, seg);
@@ -163,32 +185,45 @@ const Cluster = struct { coord: f64, members: std.ArrayList(Stroke) };
 /// arrays of clusters sorted by coord ascending. Each cluster's
 /// `members.items` are the strokes that share that coord (within
 /// COORD_TOLERANCE).
+///
+/// Codex review v1.2-rc1 [P1]: clustering walks a coord-sorted copy of
+/// the strokes, not the original stream-order list. Without the sort
+/// step, strokes painted in interleaved order (e.g. cell-by-cell rule
+/// drawing where y=100 strokes appear before, after, and between y=200
+/// strokes) start a new cluster on each occurrence and the row-count
+/// blows up.
 fn clusterByCoord(
     allocator: std.mem.Allocator,
     strokes: []const Stroke,
     horizontal: bool,
 ) ![]Cluster {
-    var coords: std.ArrayList(f64) = .empty;
-    defer coords.deinit(allocator);
+    var filtered: std.ArrayList(Stroke) = .empty;
+    defer filtered.deinit(allocator);
     for (strokes) |s| {
         if (horizontal != s.isHorizontal()) continue;
-        const c = if (horizontal) s.y0 else s.x0;
-        coords.append(allocator, c) catch continue;
+        try filtered.append(allocator, s);
     }
-    if (coords.items.len == 0) return &.{};
-    std.mem.sort(f64, coords.items, {}, comptime std.sort.asc(f64));
+    if (filtered.items.len == 0) return &.{};
+
+    const coordLessThan = struct {
+        fn lt(_: void, a: Stroke, b: Stroke) bool {
+            const ca = if (a.isHorizontal()) a.y0 else a.x0;
+            const cb = if (b.isHorizontal()) b.y0 else b.x0;
+            return ca < cb;
+        }
+    }.lt;
+    std.mem.sort(Stroke, filtered.items, {}, coordLessThan);
 
     var out: std.ArrayList(Cluster) = .empty;
     errdefer {
         for (out.items) |*c| c.members.deinit(allocator);
         out.deinit(allocator);
     }
-
-    var current_coord = coords.items[0];
+    const first_c = if (filtered.items[0].isHorizontal()) filtered.items[0].y0 else filtered.items[0].x0;
+    var current_coord = first_c;
     var current = Cluster{ .coord = current_coord, .members = .empty };
-    for (strokes) |s| {
-        if (horizontal != s.isHorizontal()) continue;
-        const c = if (horizontal) s.y0 else s.x0;
+    for (filtered.items) |s| {
+        const c = if (s.isHorizontal()) s.y0 else s.x0;
         if (@abs(c - current_coord) > COORD_TOLERANCE) {
             try out.append(allocator, current);
             current_coord = c;
@@ -304,6 +339,7 @@ pub fn extractFromStrokes(
         .cells = cells,
         .engine = .lattice,
         .confidence = 0.85, // baseline; refined by Pass D heuristics
+        .bbox = .{ left, bottom, right, top },
     });
 
     return out.toOwnedSlice(allocator);

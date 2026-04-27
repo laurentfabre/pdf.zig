@@ -41,6 +41,9 @@ pub const Table = struct {
     engine: Engine,
     /// 0..1; 1.0 for tagged, lower for lattice/stream.
     confidence: f32,
+    /// Bounding box in user-space PDF points: [x0, y0, x1, y1].
+    /// Origin is bottom-left. Optional — Pass A doesn't compute it yet.
+    bbox: ?[4]f64 = null,
 };
 
 /// Free a slice returned by `extractDocumentTables`.

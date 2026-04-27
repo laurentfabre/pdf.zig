@@ -1095,19 +1095,43 @@ pub const Document = struct {
         return combined.toOwnedSlice(allocator);
     }
 
-    /// Pass D conflict heuristic: same page + (n_rows, n_cols) within ±1.
+    /// Pass D conflict heuristic — Codex review v1.2-rc1 [P1] fix:
+    /// drop later-pass tables only when they spatially overlap an
+    /// already-accepted table, not just because their (n_rows, n_cols)
+    /// happen to be similar. A page can legitimately host two
+    /// similar-shaped tables side-by-side or stacked; the previous
+    /// ±1-cell rule dropped the second one even when the bboxes were
+    /// disjoint.
+    ///
+    /// Two tables conflict iff: same page AND IoU(bbox) ≥ 0.5. Tables
+    /// without a bbox (Pass A pre-bbox) fall back to the legacy
+    /// (n_rows, n_cols ±1) rule so we don't regress tagged-PDF dedup.
     fn conflictsExisting(existing: []const tables.Table, t: tables.Table) bool {
         for (existing) |e| {
-            if (e.page == t.page and
-                (@as(i32, @intCast(e.n_rows)) - @as(i32, @intCast(t.n_rows))) >= -1 and
-                (@as(i32, @intCast(e.n_rows)) - @as(i32, @intCast(t.n_rows))) <= 1 and
-                (@as(i32, @intCast(e.n_cols)) - @as(i32, @intCast(t.n_cols))) >= -1 and
-                (@as(i32, @intCast(e.n_cols)) - @as(i32, @intCast(t.n_cols))) <= 1)
-            {
-                return true;
+            if (e.page != t.page) continue;
+            if (e.bbox != null and t.bbox != null) {
+                if (bboxIoU(e.bbox.?, t.bbox.?) >= 0.5) return true;
+            } else {
+                const drow = @abs(@as(i32, @intCast(e.n_rows)) - @as(i32, @intCast(t.n_rows)));
+                const dcol = @abs(@as(i32, @intCast(e.n_cols)) - @as(i32, @intCast(t.n_cols)));
+                if (drow <= 1 and dcol <= 1) return true;
             }
         }
         return false;
+    }
+
+    fn bboxIoU(a: [4]f64, b: [4]f64) f64 {
+        const x0 = @max(a[0], b[0]);
+        const y0 = @max(a[1], b[1]);
+        const x1 = @min(a[2], b[2]);
+        const y1 = @min(a[3], b[3]);
+        if (x1 <= x0 or y1 <= y0) return 0.0;
+        const inter = (x1 - x0) * (y1 - y0);
+        const area_a = @max(0.0, (a[2] - a[0]) * (a[3] - a[1]));
+        const area_b = @max(0.0, (b[2] - b[0]) * (b[3] - b[1]));
+        const uni = area_a + area_b - inter;
+        if (uni <= 0) return 0.0;
+        return inter / uni;
     }
 
     fn pageRefToZeroBased(ctx: *const anyopaque, page_ref: ?ObjRef) ?u32 {

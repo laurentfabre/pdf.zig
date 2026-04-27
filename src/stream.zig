@@ -123,6 +123,8 @@ pub const TableRecord = struct {
     cells: []const TableCell,
     engine: TableEngine,
     confidence: f32,
+    /// Optional [x0, y0, x1, y1] in PDF user-space (bottom-left origin).
+    bbox: ?[4]f64 = null,
 };
 
 pub const DocumentInfo = struct {
@@ -288,9 +290,16 @@ pub const Envelope = struct {
             .stream => "native_stream",
         });
         try self.writer.print(
-            ",\"confidence\":{d:.2},\"n_rows\":{d},\"n_cols\":{d},\"header_rows\":{d},\"cells\":[",
+            ",\"confidence\":{d:.2},\"n_rows\":{d},\"n_cols\":{d},\"header_rows\":{d}",
             .{ t.confidence, t.n_rows, t.n_cols, t.header_rows },
         );
+        if (t.bbox) |b| {
+            try self.writer.print(
+                ",\"bbox\":[{d:.2},{d:.2},{d:.2},{d:.2}]",
+                .{ b[0], b[1], b[2], b[3] },
+            );
+        }
+        try self.writer.writeAll(",\"cells\":[");
         for (t.cells, 0..) |cell, i| {
             if (i > 0) try self.writer.writeAll(",");
             try self.writer.print(

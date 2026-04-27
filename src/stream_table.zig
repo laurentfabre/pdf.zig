@@ -56,9 +56,13 @@ pub fn extractFromSpans(
     }
     if (rows.len < MIN_ROWS) return out.toOwnedSlice(allocator);
 
-    // Walk consecutive rows; when we see ≥MIN_ROWS consecutive multi-span
-    // rows whose x-anchors cluster into ≥MIN_TABLE_COLS column peaks, emit
-    // one candidate table.
+    // Walk consecutive rows; section-header Y-gap split (Codex risk #3).
+    // An unruled hotel menu often has multiple sub-tables separated by a
+    // section title row (single-span or larger gap); naive "extend while
+    // multi-span" merges them into one giant grid (the v1.2-rc1 Anantara
+    // 16x4 over-merge). Terminator rules: (a) single-span row, (b) Y-gap
+    // > 2× running average AND > 16 pt, (c) span count materially out of
+    // band relative to first row of the run.
     var i: usize = 0;
     var table_id: u32 = 0;
     while (i < rows.len) {
@@ -66,15 +70,27 @@ pub fn extractFromSpans(
             i += 1;
             continue;
         }
-        // Extend run while subsequent rows are also multi-span.
-        var j = i;
-        while (j < rows.len and rows[j].spans.len >= MIN_COLS_PER_ROW) j += 1;
+        var j = i + 1;
+        var prev_y = rows[i].y;
+        var gap_sum: f64 = 0;
+        var gap_count: usize = 0;
+        const first_span_count = rows[i].spans.len;
+        while (j < rows.len) : (j += 1) {
+            if (rows[j].spans.len < MIN_COLS_PER_ROW) break;
+            const gap = prev_y - rows[j].y;
+            const avg_gap = if (gap_count > 0) gap_sum / @as(f64, @floatFromInt(gap_count)) else gap;
+            if (gap_count >= 2 and gap > avg_gap * 2.0 and gap > 16.0) break;
+            const sc = rows[j].spans.len;
+            if (sc > first_span_count * 2 or sc * 2 < first_span_count) break;
+            gap_sum += gap;
+            gap_count += 1;
+            prev_y = rows[j].y;
+        }
         if (j - i < MIN_ROWS) {
-            i = j + 1;
+            i = j;
             continue;
         }
 
-        // Build x-anchor histogram over rows [i..j).
         const peaks = try findColumnAnchors(allocator, rows[i..j]);
         defer allocator.free(peaks);
 
@@ -82,6 +98,7 @@ pub fn extractFromSpans(
             const n_rows: u32 = @intCast(j - i);
             const n_cols: u32 = @intCast(peaks.len);
             const conf = scoreConfidence(rows[i..j], peaks);
+            const bbox = computeBbox(rows[i..j]);
 
             var cells = try allocator.alloc(tables.Cell, @as(usize, n_rows) * @as(usize, n_cols));
             var idx: usize = 0;
@@ -102,13 +119,32 @@ pub fn extractFromSpans(
                 .cells = cells,
                 .engine = .stream,
                 .confidence = @floatCast(conf),
+                .bbox = bbox,
             });
             table_id += 1;
         }
-        i = j + 1;
+        i = j;
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Bounding box covering every span in a run of rows.
+fn computeBbox(run: []const Row) [4]f64 {
+    var x0: f64 = std.math.floatMax(f64);
+    var y0: f64 = std.math.floatMax(f64);
+    var x1: f64 = -std.math.floatMax(f64);
+    var y1: f64 = -std.math.floatMax(f64);
+    for (run) |row| {
+        for (row.spans) |span| {
+            if (!std.math.isFinite(span.x0) or !std.math.isFinite(span.y0)) continue;
+            if (span.x0 < x0) x0 = span.x0;
+            if (span.y0 < y0) y0 = span.y0;
+            if (span.x1 > x1) x1 = span.x1;
+            if (span.y1 > y1) y1 = span.y1;
+        }
+    }
+    return .{ x0, y0, x1, y1 };
 }
 
 /// Group spans into rows by Y coordinate. Sorts Y descending (top to
@@ -156,28 +192,51 @@ fn groupIntoRows(allocator: std.mem.Allocator, spans: []const layout.TextSpan) !
 }
 
 /// Build a histogram of span x-starts across all rows in `run`; return
-/// the bin centers whose hit count is ≥ COL_HIT_RATIO_FLOOR × len(run).
+/// the bin centers hit by ≥ COL_HIT_RATIO_FLOOR × len(run) DISTINCT rows.
 /// Sorted ascending. Caller frees.
+///
+/// Codex review v1.2-rc1 fixes:
+///  [P2] Per-row dedup: count each bin once per row, not once per span.
+///       Wrapped rows can otherwise contribute multiple hits to the same
+///       bin and inflate `peaks.len`.
+///  [P2] Non-finite x guard: PDFs occasionally emit NaN/inf coords; raw
+///       `@intFromFloat` panics in ReleaseSafe. Skip non-finite spans.
 fn findColumnAnchors(allocator: std.mem.Allocator, run: []const Row) ![]f64 {
     var bins = std.AutoHashMap(i32, u32).init(allocator);
     defer bins.deinit();
 
+    var seen_in_row = std.AutoHashMap(i32, void).init(allocator);
+    defer seen_in_row.deinit();
+
     for (run) |row| {
+        seen_in_row.clearRetainingCapacity();
         for (row.spans) |span| {
-            const bin: i32 = @intFromFloat(span.x0 / COL_X_BIN_WIDTH);
+            if (!std.math.isFinite(span.x0)) continue;
+            const bin: i32 = std.math.lossyCast(i32, span.x0 / COL_X_BIN_WIDTH);
+            if (seen_in_row.contains(bin)) continue;
+            try seen_in_row.put(bin, {});
             const e = try bins.getOrPut(bin);
             if (!e.found_existing) e.value_ptr.* = 0;
             e.value_ptr.* += 1;
         }
     }
 
-    const threshold = @as(u32, @intFromFloat(@as(f64, @floatFromInt(run.len)) * COL_HIT_RATIO_FLOOR));
+    // ≥ 50% of rows must hit the bin. Use floor for short runs (≤4
+    // rows): for 5 rows × 0.5 = 2.5 we want 2, not 3 — otherwise a
+    // 5-row table where each column has 5/5 hits still passes (5≥2),
+    // but a 4-row table with 4/4 hits could legitimately fail under
+    // ceil(2.0)=2 == OK, but a 3-row table with 3/3 fails under
+    // ceil(1.5)=2 (3≥2 OK), so floor is consistent. We also enforce
+    // an absolute floor of 2 hits so a single noisy row can't elect
+    // a column.
+    const N = @as(f64, @floatFromInt(run.len));
+    const need: u32 = @max(2, @as(u32, @intFromFloat(@floor(N * COL_HIT_RATIO_FLOOR))));
     var peaks: std.ArrayList(f64) = .empty;
     errdefer peaks.deinit(allocator);
 
     var it = bins.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* >= @max(threshold, 2)) {
+        if (entry.value_ptr.* >= need) {
             const x = (@as(f64, @floatFromInt(entry.key_ptr.*)) + 0.5) * COL_X_BIN_WIDTH;
             try peaks.append(allocator, x);
         }

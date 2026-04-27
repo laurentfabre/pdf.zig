@@ -255,18 +255,27 @@ def predict_tables(pdf_path: Path) -> list[dict]:
     return out
 
 
-def best_match(gold: dict, predicted: list[dict]) -> tuple[dict | None, float]:
-    """Pick the predicted table that maximises TEDS-Struct against `gold`."""
+def best_match(gold: dict, predicted: list[dict], used: set[int] | None = None) -> tuple[dict | None, int | None, float]:
+    """Pick the predicted table that maximises TEDS-Struct against `gold`,
+    skipping any prediction whose index is already in `used`. Returns
+    (predicted, index, score). Codex review v1.2-rc1 [P2]: enforce one-
+    to-one assignment so a single oversized prediction can't score
+    multiple gold entries and inflate means."""
+    used_set = used or set()
     best = None
     best_score = -1.0
-    for p in predicted:
+    best_idx: int | None = None
+    for i, p in enumerate(predicted):
+        if i in used_set:
+            continue
         if p.get("page") != gold.get("page"):
             continue
         s = teds_struct(p, gold)
         if s > best_score:
             best_score = s
             best = p
-    return best, max(best_score, 0.0)
+            best_idx = i
+    return best, best_idx, max(best_score, 0.0)
 
 
 def load_gold():
@@ -306,8 +315,11 @@ def main() -> int:
         predicted = predict_tables(pdf)
         st = sk.get("stratum", "?")
         by_stratum.setdefault(st, {"teds_sum": 0, "grits_sum": 0, "n": 0})
+        used: set[int] = set()
         for g in sk["tables"]:
-            match, teds = best_match(g, predicted)
+            match, midx, teds = best_match(g, predicted, used)
+            if midx is not None:
+                used.add(midx)
             grits = grits_con(match, g) if match else 0.0
             total_teds += teds
             total_grits += grits

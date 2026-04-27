@@ -310,6 +310,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                             .stream => .stream,
                         },
                         .confidence = t.confidence,
+                        .bbox = t.bbox,
                     });
                 }
             } else |_| {}
