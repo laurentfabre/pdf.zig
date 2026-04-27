@@ -998,3 +998,13 @@ test "superscript positioning does not insert spurious newline" {
     // superscript is below the threshold max(7,12)*0.7=8.4 (Fix 8)
     try std.testing.expect(std.mem.indexOf(u8, output.items, "\n") == null);
 }
+
+// PR-1 stub — see docs/ROADMAP.md PR-1.
+// Pass B (lattice) must recurse into Form XObject `Do` operator, walking the
+// XObject's content stream with its own CTM stack, so ruled tables drawn
+// inside reusable templates are detected. Fixture + assertion land in the
+// implementation commit; this stub keeps the test name reserved and the PR
+// non-empty so /pr-cycle has a diff to review against main.
+test "lattice pass B recurses form xobject" {
+    return error.SkipZigTest;
+}
