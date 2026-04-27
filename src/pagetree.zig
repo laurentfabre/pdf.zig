@@ -133,9 +133,13 @@ fn resolveCompressedObject(
         return Object{ .null = {} };
     };
 
-    // Parse object stream header
-    const n = stream.dict.getInt("N") orelse return Object{ .null = {} };
-    const first = stream.dict.getInt("First") orelse return Object{ .null = {} };
+    // Parse object stream header. Codex review v1.2-rc4 round 14 [P2]:
+    // /N and /First may legally be indirect references. The previous
+    // direct-only `getInt` call returned null and aborted the whole
+    // ObjStm, making every object stored inside it (including page
+    // contents, resource dicts, and Form XObjects) invisible.
+    const n = (try resolveIntMaybeIndirect(allocator, data, xref, stream.dict.get("N"), resolved_cache)) orelse return Object{ .null = {} };
+    const first = (try resolveIntMaybeIndirect(allocator, data, xref, stream.dict.get("First"), resolved_cache)) orelse return Object{ .null = {} };
 
     if (n <= 0 or first < 0) return Object{ .null = {} };
 
@@ -189,6 +193,34 @@ fn resolveCompressedObject(
 
     try resolved_cache.put(offsets.items[index].num, result);
     return result;
+}
+
+/// Resolve a numeric Object (possibly via one level of indirect
+/// reference) to i64. Returns null on missing / non-numeric / domain
+/// failure; bubbles `error.OutOfMemory`.
+///
+/// Codex review v1.2-rc4 round 14 [P2]: ObjStm header keys `/N` and
+/// `/First` may legally be indirect references. The direct-only
+/// `Dict.getInt` returned null on `.reference`, aborting the entire
+/// object-stream parse.
+fn resolveIntMaybeIndirect(
+    parse_allocator: std.mem.Allocator,
+    data: []const u8,
+    xref: *const XRefTable,
+    obj_opt: ?Object,
+    cache: *std.AutoHashMap(u32, Object),
+) error{OutOfMemory}!?i64 {
+    const obj = obj_opt orelse return null;
+    const concrete = switch (obj) {
+        .integer, .real => obj,
+        .reference => (try resolveDictEntry(parse_allocator, data, xref, obj, cache)) orelse return null,
+        else => return null,
+    };
+    return switch (concrete) {
+        .integer => |i| i,
+        .real => |r| @intFromFloat(r),
+        else => null,
+    };
 }
 
 /// Resolve one level of indirect reference. Returns the input
@@ -359,15 +391,32 @@ fn walkPageTree(
     const cropbox = extractBox(dict, "CropBox") orelse inherited_cropbox;
     const rotation = @as(i32, @intCast(dict.getInt("Rotate") orelse inherited_rotation));
 
+    // Resources inheritance: per PDF spec §7.7.3.4, page-tree
+    // attributes inherit from ancestors only when the key is ABSENT.
+    // If the key is PRESENT but resolves to anything that isn't a
+    // dict (null, malformed, unresolvable indirect ref), the page
+    // has declared its own (broken) resource scope and must NOT
+    // silently fall back to the parent's resources.
+    //
+    // Codex review v1.2-rc4 round 14 [P2]: the previous code wrote
+    //   var resources = inherited_resources;
+    //   if (dict.get("Resources")) |res_obj| {
+    //       ... if (resolved == .dict) resources = resolved.dict;
+    //   }
+    // which meant a present-but-invalid /Resources silently kept
+    // the inherited dict, allowing page-level Do operators to
+    // resolve against ancestor /XObject maps the page itself can't
+    // legally see.
     var resources = inherited_resources;
     if (dict.get("Resources")) |res_obj| {
         const resolved = switch (res_obj) {
-            .reference => |r| resolveRef(allocator, data, xref, r, cache) catch res_obj,
+            .reference => |r| resolveRef(allocator, data, xref, r, cache) catch Object{ .null = {} },
             else => res_obj,
         };
-        if (resolved == .dict) {
-            resources = resolved.dict;
-        }
+        resources = switch (resolved) {
+            .dict => |d| d,
+            else => null, // present-but-invalid → fail closed
+        };
     }
 
     if (std.mem.eql(u8, type_name, "Pages")) {
