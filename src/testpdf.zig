@@ -1500,27 +1500,29 @@ pub fn generateImageXObjectIgnoredByLatticePdf(allocator: std.mem.Allocator) ![]
     return pdf.toOwnedSlice(allocator);
 }
 
-/// Like `generateFormXObjectTablePdf`, but the Form XObject stores both
-/// `/Matrix` and `/Resources` as indirect references rather than inline
-/// objects. Exercises the codex-flagged P2 paths: lattice must resolve
-/// these references via `pagetree.resolveRef` rather than accepting only
-/// the `.array` / `.dict` shapes.
+/// Like `generateFormXObjectTablePdf`, but the outer Form XObject stores
+/// both `/Matrix` and `/Resources` as indirect references rather than
+/// inline objects. The outer form delegates the actual table drawing to
+/// a NESTED Form XObject (`/InnerForm`), reachable ONLY via the indirect
+/// `/Resources` lookup. This makes the indirect-ref Resources path
+/// load-bearing: if lattice fails to resolve `/Resources 7 0 R`, the
+/// nested `/InnerForm Do` cannot be resolved and zero strokes are
+/// collected, which the integration test catches.
 ///
 /// Object layout:
 ///   1. Catalog
 ///   2. Pages
 ///   3. Page (Resources/XObject -> 5 0 R inline)
-///   4. Page content stream (just `/TableForm Do`)
-///   5. Form XObject — /Matrix 6 0 R, /Resources 7 0 R, content draws 3x3 grid
-///   6. The Matrix array (translates by +50 in x; doubles checked downstream)
-///   7. The Resources dict (empty — Form has no nested resources)
+///   4. Page content stream (`/TableForm Do`)
+///   5. Outer Form — /Matrix 6 0 R, /Resources 7 0 R, content invokes
+///      `/InnerForm Do`. NO strokes drawn directly.
+///   6. The Matrix array — [1 0 0 1 50 0] translates by +50pt in x.
+///   7. The Resources dict — { /XObject << /InnerForm 8 0 R >> }
+///   8. Inner Form — identity Matrix, content draws the 3x3 grid.
 ///
-/// Matrix [1 0 0 1 50 0] translates the form by +50pt in x. The 3x3
-/// grid drawn at [100,400,400,700] in form-space ends up at
-/// [150,400,450,700] in page-space. If lattice fails to resolve the
-/// indirect /Matrix it would fall back to identity and the bbox would
-/// be the original [100,400,400,700] — that's the regression we're
-/// catching.
+/// End-to-end: page invokes outer; outer must resolve indirect Matrix
+/// to translate by +50pt; outer must resolve indirect Resources to find
+/// /InnerForm; inner draws the grid. Detected bbox: [150, 400, 450, 700].
 pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
@@ -1547,8 +1549,32 @@ pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll(page_content);
     try writer.writeAll("\nendstream\nendobj\n");
 
-    // Form XObject — Matrix and Resources are BOTH indirect references.
-    const form_content =
+    // Outer form delegates to the nested form via `/InnerForm Do`. The
+    // /InnerForm name resolves ONLY through the indirect /Resources 7 0 R,
+    // so reverting the indirect-Resources fix would make this test fail.
+    const outer_form_content = "/InnerForm Do\n";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix 6 0 R /Resources 7 0 R " ++
+        "/Length {} >>\n",
+        .{outer_form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(outer_form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // Matrix object — [1 0 0 1 50 0] translates the form by +50pt in x.
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n[1 0 0 1 50 0]\nendobj\n");
+
+    // Resources object — exposes /InnerForm so the nested Do resolves.
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /XObject << /InnerForm 8 0 R >> >>\nendobj\n");
+
+    // Inner form — draws the 3x3 ruled grid in form-space.
+    const inner_form_content =
         \\100 400 300 300 re S
         \\100 500 m 400 500 l S
         \\100 600 m 400 600 l S
@@ -1556,28 +1582,19 @@ pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
         \\300 400 m 300 700 l S
         \\
     ;
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n");
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix 6 0 R /Resources 7 0 R " ++
-        "/Length {} >>\n",
-        .{form_content.len},
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{inner_form_content.len},
     );
     try writer.writeAll("stream\n");
-    try writer.writeAll(form_content);
+    try writer.writeAll(inner_form_content);
     try writer.writeAll("endstream\nendobj\n");
 
-    // Matrix object — [1 0 0 1 50 0] translates the form by +50pt in x.
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n[1 0 0 1 50 0]\nendobj\n");
-
-    // Resources object — empty dict (Form has no nested XObjects).
-    const obj7_offset = pdf.items.len;
-    try writer.writeAll("7 0 obj\n<< >>\nendobj\n");
-
     const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 8\n");
+    try writer.writeAll("xref\n0 9\n");
     try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
     try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
     try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
@@ -1586,8 +1603,9 @@ pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
     try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
     try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
 
-    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    try writer.writeAll("trailer\n<< /Size 9 /Root 1 0 R >>\n");
     try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
 
     return pdf.toOwnedSlice(allocator);

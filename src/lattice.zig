@@ -290,13 +290,43 @@ fn collectStrokesWalk(
     }
 }
 
+/// Resolve an indirect reference, preserving `error.OutOfMemory` while
+/// converting domain errors (CorruptObject etc.) into a soft `null`
+/// return so callers can gracefully fall through.
+///
+/// Codex review v1.2-rc4 round 2 [P2]: previously each `catch return`
+/// or `catch break` masked OOM as well, downgrading allocator pressure
+/// to a silent skip. The contract for the lattice helpers is
+/// "OOM bubbles, all other errors soft-fail" — this helper enforces it.
+fn resolveRefSoft(doc: DocState, ref: parser.ObjRef) error{OutOfMemory}!?parser.Object {
+    return pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+}
+
+/// Decompress a stream's body, preserving `error.OutOfMemory` while
+/// converting domain errors (corrupt filter chain, bad params) into a
+/// `null` return.
+fn decompressStreamSoft(
+    doc: DocState,
+    body: []const u8,
+    filter: ?parser.Object,
+    params: ?parser.Object,
+) error{OutOfMemory}!?[]u8 {
+    return decompress.decompressStream(doc.scratch_allocator, body, filter, params) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+}
+
 /// Recurse into the Form XObject named `name`, appending strokes to
 /// `out` in the parent's user-space coordinate frame.
 ///
-/// All non-OOM errors are returned to the caller for the soft-fail
-/// pattern at the call site. The function is conservative — any
-/// resource lookup miss, missing Subtype, decode failure, or visited-
-/// reference cycle results in a no-op return.
+/// `error.OutOfMemory` propagates so allocator pressure can't be silently
+/// masked. All other errors (corrupt object stream, bad indirect ref,
+/// missing Subtype, decode failure, visited cycle) result in a no-op
+/// return.
 fn handleDoOperator(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -314,7 +344,7 @@ fn handleDoOperator(
     const xobjects = switch (xobjects_obj) {
         .dict => |d| d,
         .reference => |ref| blk: {
-            const resolved = pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch return;
+            const resolved = (try resolveRefSoft(doc, ref)) orelse return;
             break :blk switch (resolved) {
                 .dict => |d| d,
                 else => return,
@@ -332,7 +362,7 @@ fn handleDoOperator(
             xobj_ref_num = ref.num;
             // Cycle guard: if we're already inside this XObject, bail.
             if (visited.contains(ref.num)) return;
-            const resolved = pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch return;
+            const resolved = (try resolveRefSoft(doc, ref)) orelse return;
             break :blk switch (resolved) {
                 .stream => |s| s,
                 else => return,
@@ -348,28 +378,27 @@ fn handleDoOperator(
     // Decompress the Form content stream into scratch memory.
     const filter = xobj_resolved.dict.get("Filter");
     const params = xobj_resolved.dict.get("DecodeParms");
-    const form_content = decompress.decompressStream(doc.scratch_allocator, xobj_resolved.data, filter, params) catch return;
+    const form_content = (try decompressStreamSoft(doc, xobj_resolved.data, filter, params)) orelse return;
     defer doc.scratch_allocator.free(form_content);
 
     // Compose the effective CTM for the Form's own content. Per PDF
     // spec §8.10: the Form's `/Matrix` (default identity) is applied
     // BEFORE the parent's CTM, i.e. effective = parent_ctm × form_matrix.
-    const form_matrix = readMatrix(xobj_resolved.dict, doc);
+    const form_matrix = try readMatrix(xobj_resolved.dict, doc);
     const effective_ctm = form_matrix.mul(parent_ctm);
 
     // Form Resources: inline dict, indirect ref, or absent (inherit
-    // from parent). Codex review v1.2-rc4 [P2]: the previous version
-    // used `getDict("Resources")` which silently returned null on the
-    // legal `.reference` shape, falling back to the *parent's*
-    // resources. Nested `Do` inside that form would then either miss
-    // its child XObjects entirely or resolve the wrong one from the
-    // page-level dictionary. Resolve the reference explicitly.
+    // from parent). Codex review v1.2-rc4 round 1 [P2]: the previous
+    // version used `getDict("Resources")` which silently returned null
+    // on the legal `.reference` shape, falling back to the *parent's*
+    // resources. Round 2 [P2]: also bubble OOM on the indirect-ref
+    // resolution path so allocator pressure surfaces.
     const form_resources = blk: {
         const obj = xobj_resolved.dict.get("Resources") orelse break :blk resources;
         break :blk switch (obj) {
             .dict => |d| d,
             .reference => |ref| ref_blk: {
-                const resolved = pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch break :ref_blk resources;
+                const resolved = (try resolveRefSoft(doc, ref)) orelse break :ref_blk resources;
                 break :ref_blk switch (resolved) {
                     .dict => |d| d,
                     else => resources,
@@ -399,18 +428,17 @@ fn handleDoOperator(
 /// Read a Form XObject's `/Matrix` entry into a `Mat`.
 /// Falls back to identity when missing or malformed.
 ///
-/// Codex review v1.2-rc4 [P2]: `/Matrix` is legally allowed to be an
-/// indirect reference (e.g. `/Matrix 8 0 R`). The previous version
-/// only matched `.array` and silently fell back to identity in that
-/// case, which projected scaled/translated form strokes into the
-/// wrong user-space coordinates. Now resolves indirect references
-/// before consuming.
-fn readMatrix(dict: parser.Object.Dict, doc: DocState) Mat {
+/// Codex review v1.2-rc4 round 1 [P2]: `/Matrix` is legally allowed to
+/// be an indirect reference (e.g. `/Matrix 8 0 R`). Round 2 [P2]: the
+/// indirect-ref resolution must propagate `error.OutOfMemory` rather
+/// than masking it as a soft identity-fallback. Returns an error
+/// union now; the caller `try`s.
+fn readMatrix(dict: parser.Object.Dict, doc: DocState) error{OutOfMemory}!Mat {
     const obj = dict.get("Matrix") orelse return Mat{};
     const arr = switch (obj) {
         .array => |a| a,
         .reference => |ref| blk: {
-            const resolved = pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch return Mat{};
+            const resolved = (try resolveRefSoft(doc, ref)) orelse return Mat{};
             break :blk switch (resolved) {
                 .array => |a| a,
                 else => return Mat{},

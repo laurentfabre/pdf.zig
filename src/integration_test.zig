@@ -1044,15 +1044,16 @@ test "lattice pass B recurses form xobject" {
 }
 
 // Codex review v1.2-rc4 [P2] regression: lattice must resolve indirect
-// references in `/Matrix` and `/Resources` before consuming them.
+// references in BOTH `/Matrix` and `/Resources` before consuming them.
 //
-// Fixture has both stored as indirect refs (`/Matrix 6 0 R`,
-// `/Resources 7 0 R`). The Matrix translates the form's local
-// coordinate frame by +50pt in x, so the 3x3 grid drawn at
-// form-space [100,400,400,700] lands in page-space
-// [150,400,450,700]. If readMatrix falls back to identity (the
-// pre-fix behavior), the bbox would be the original [100,...] and
-// this test fails.
+// Round 2 strengthening: the outer form delegates to a nested
+// /InnerForm reachable ONLY via the indirect `/Resources 7 0 R`. So
+// the test exercises both fixes at once:
+//   - indirect Matrix: must resolve `/Matrix 6 0 R` to translate by
+//     +50pt; otherwise bbox lands at [100,...] not [150,...].
+//   - indirect Resources: must resolve `/Resources 7 0 R` to find
+//     /InnerForm; otherwise the nested Do is a no-op and zero
+//     strokes are collected (no table at all).
 test "lattice pass B resolves indirect Matrix and Resources refs" {
     const allocator = std.testing.allocator;
 
