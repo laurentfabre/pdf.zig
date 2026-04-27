@@ -357,12 +357,24 @@ fn getStreamData(
         },
         .stream => |s| {
             const decompress = @import("decompress.zig");
+            // Codex review v1.2-rc4 round 6 [P2]: previously every
+            // decompress error, including error.OutOfMemory, fell
+            // through to `return s.data` — a Pass B caller that
+            // expected to see allocator pressure surface as an error
+            // would instead get raw compressed bytes and silently
+            // produce zero strokes. Bubble OOM; keep the soft fall-
+            // back to the original (compressed) payload for genuine
+            // domain errors so a corrupt filter chain still leaves
+            // the parser something to scan.
             return decompress.decompressStream(
                 scratch_allocator,
                 s.data,
                 s.dict.get("Filter"),
                 s.dict.get("DecodeParms"),
-            ) catch return s.data;
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return s.data;
+            };
         },
         .array => |arr| {
             // Concatenate multiple content streams

@@ -124,6 +124,29 @@ const Mat = struct {
             .f = self.e * other.b + self.f * other.d + other.f,
         };
     }
+    /// Compute the inverse of this affine matrix. Returns null when
+    /// the matrix is singular (det ≈ 0). PDF user-space matrices that
+    /// fall through here are rotation / scale / shear / translation
+    /// composites; non-singular by construction in well-formed PDFs.
+    fn inverse(self: Mat) ?Mat {
+        const det = self.a * self.d - self.b * self.c;
+        if (!std.math.isFinite(det)) return null;
+        if (@abs(det) < 1e-12) return null;
+        const inv_det = 1.0 / det;
+        return Mat{
+            .a = self.d * inv_det,
+            .b = -self.b * inv_det,
+            .c = -self.c * inv_det,
+            .d = self.a * inv_det,
+            .e = (self.c * self.f - self.d * self.e) * inv_det,
+            .f = (self.b * self.e - self.a * self.f) * inv_det,
+        };
+    }
+    fn isFinite(self: Mat) bool {
+        return std.math.isFinite(self.a) and std.math.isFinite(self.b) and
+            std.math.isFinite(self.c) and std.math.isFinite(self.d) and
+            std.math.isFinite(self.e) and std.math.isFinite(self.f);
+    }
 };
 
 /// Walk a content stream and return every horizontal/vertical stroke
@@ -437,17 +460,80 @@ fn handleDoOperator(
     try collectStrokesWalk(allocator, form_content, child_ctx, visited, out);
 
     if (try readBBox(xobj_resolved.dict, doc)) |bbox_form| {
-        const clip_user = transformBBox(bbox_form, effective_ctm);
-        var write: usize = snapshot;
-        var read: usize = snapshot;
-        while (read < out.items.len) : (read += 1) {
-            if (clipStrokeToBox(out.items[read], clip_user)) |clipped| {
-                out.items[write] = clipped;
-                write += 1;
+        // Codex review v1.2-rc4 round 6 [P2]: clipping against the
+        // user-space AABB of a transformed /BBox is conservative —
+        // for non-orthogonal CTMs (rotation, shear) it admits strokes
+        // that fall outside the true rotated quadrilateral. Round-trip
+        // each user-space stroke back to form-space via inverse_ctm,
+        // clip against the form-space (axis-aligned) /BBox there, then
+        // map clipped endpoints back to user-space.
+        //
+        // When effective_ctm is singular (det ≈ 0) we fall back to the
+        // user-space AABB approach: the form is degenerate (collapsed
+        // to a line or point), so any clipping policy will produce
+        // collinear strokes that downstream filters drop anyway.
+        if (effective_ctm.inverse()) |inv_ctm| {
+            var write: usize = snapshot;
+            var read: usize = snapshot;
+            while (read < out.items.len) : (read += 1) {
+                if (clipStrokeInFormSpace(out.items[read], bbox_form, inv_ctm, effective_ctm)) |clipped| {
+                    out.items[write] = clipped;
+                    write += 1;
+                }
             }
+            out.shrinkRetainingCapacity(write);
+        } else {
+            const clip_user = transformBBox(bbox_form, effective_ctm);
+            var write: usize = snapshot;
+            var read: usize = snapshot;
+            while (read < out.items.len) : (read += 1) {
+                if (clipStrokeToBox(out.items[read], clip_user)) |clipped| {
+                    out.items[write] = clipped;
+                    write += 1;
+                }
+            }
+            out.shrinkRetainingCapacity(write);
         }
-        out.shrinkRetainingCapacity(write);
     }
+}
+
+/// Round-trip a user-space stroke into form-space, clip against the
+/// axis-aligned form-space /BBox, then map back to user-space.
+///
+/// A form-space rotated `/BBox` is exact for any non-singular CTM —
+/// strokes that touch the visible quadrilateral survive (with their
+/// out-of-quad portions trimmed); strokes fully outside drop. After
+/// the round-trip, axis-aligned strokes in form-space remain axis-
+/// aligned in user-space too (the CTM is invertible affine), so
+/// downstream `isHorizontal`/`isVertical` filters still apply.
+fn clipStrokeInFormSpace(
+    s: Stroke,
+    bbox_form: [4]f64,
+    inv_ctm: Mat,
+    fwd_ctm: Mat,
+) ?Stroke {
+    // User-space → form-space.
+    const a_form = inv_ctm.apply(s.x0, s.y0);
+    const b_form = inv_ctm.apply(s.x1, s.y1);
+    if (!std.math.isFinite(a_form.x) or !std.math.isFinite(a_form.y) or
+        !std.math.isFinite(b_form.x) or !std.math.isFinite(b_form.y)) return null;
+
+    const form_stroke = Stroke{
+        .x0 = a_form.x, .y0 = a_form.y,
+        .x1 = b_form.x, .y1 = b_form.y,
+    };
+    const clipped_form = clipStrokeToBox(form_stroke, bbox_form) orelse return null;
+
+    // Form-space → user-space via the forward CTM.
+    const a_back = fwd_ctm.apply(clipped_form.x0, clipped_form.y0);
+    const b_back = fwd_ctm.apply(clipped_form.x1, clipped_form.y1);
+    if (!std.math.isFinite(a_back.x) or !std.math.isFinite(a_back.y) or
+        !std.math.isFinite(b_back.x) or !std.math.isFinite(b_back.y)) return null;
+
+    return Stroke{
+        .x0 = a_back.x, .y0 = a_back.y,
+        .x1 = b_back.x, .y1 = b_back.y,
+    };
 }
 
 /// Read a Form XObject's `/BBox` entry. Same indirect-ref + OOM
