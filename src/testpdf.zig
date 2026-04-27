@@ -1363,6 +1363,143 @@ pub fn generateFormXObjectTablePdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Generate a PDF where Form XObject A's content stream invokes itself
+/// via `/SelfForm Do`. The cycle guard in lattice.collectStrokesIn must
+/// catch this and bail before stack overflow / hang.
+///
+/// The Form draws a single rect so we can also verify that the FIRST
+/// invocation (depth 0) successfully collects strokes before the cycle
+/// is detected on the recursive Do.
+pub fn generateFormXObjectSelfReferencingPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /SelfForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/SelfForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // SelfForm — content stream draws ONE rect, then invokes itself.
+    // The Form's own Resources expose itself as /SelfForm so the
+    // recursive `Do` resolves back to the same XObject (object 5).
+    const form_content =
+        \\100 400 300 300 re S
+        \\/SelfForm Do
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] " ++
+        "/Resources << /XObject << /SelfForm 5 0 R >> >> " ++
+        "/Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF where the page references an XObject whose Subtype
+/// is `/Image` (NOT `/Form`). Lattice must NOT recurse into image
+/// XObjects; non-Form subtypes are silently ignored.
+pub fn generateImageXObjectIgnoredByLatticePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /Im1 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Page draws a real ruled table inline AND invokes the Image XObject.
+    const page_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\/Im1 Do
+        \\
+    ;
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // /Im1 is an Image XObject. If lattice mistakenly recursed into the
+    // body it would parse the random image bytes as a content stream;
+    // we keep the body short and harmless.
+    const image_data = "fake-image-bytes";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 " ++
+        "/ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\n",
+        .{image_data.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(image_data);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
 /// Like `generateFormXObjectTablePdf`, but the Form XObject stores both
 /// `/Matrix` and `/Resources` as indirect references rather than inline
 /// objects. Exercises the codex-flagged P2 paths: lattice must resolve

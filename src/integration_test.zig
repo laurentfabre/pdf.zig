@@ -1083,3 +1083,60 @@ test "lattice pass B resolves indirect Matrix and Resources refs" {
     try std.testing.expectApproxEqAbs(@as(f64, 450), bb[2], 2.0);
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
+
+// Cycle guard: a Form XObject that invokes itself via `Do` must not
+// hang or stack-overflow lattice. The first invocation collects the
+// outer rect (1 stroke set); the recursive Do is rejected by the
+// visited-set guard. getTables completes successfully.
+test "lattice pass B handles self-referencing Form XObject without hanging" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectSelfReferencingPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    // Must return without hanging or panicking. The single rect drawn
+    // by the form has only 4 strokes so lattice produces no table
+    // (needs >= 2 cluster lines on each axis); the test is the
+    // *non-hang* itself.
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+    // No stronger assertion — the success of `getTables` returning is
+    // the only invariant the cycle guard guarantees.
+}
+
+// Subtype filter: an /Image XObject must not be walked as a content
+// stream. The page draws a real 3x3 table inline, then invokes the
+// Image XObject; lattice detects exactly one table from the inline
+// strokes and ignores the image.
+test "lattice pass B ignores non-Form XObject Subtypes" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateImageXObjectIgnoredByLatticePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3) {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+    // bbox of the inline table — same as generateFormXObjectTablePdf
+    // because the strokes are drawn directly in the page content
+    // stream, no Matrix involved.
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    try std.testing.expectApproxEqAbs(@as(f64, 100), bb[0], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+}
