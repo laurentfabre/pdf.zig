@@ -409,8 +409,14 @@ fn handleDoOperator(
     if (!std.mem.eql(u8, subtype, "Form")) return;
 
     // Decompress the Form content stream into scratch memory.
-    const filter = try dictGetResolvedSoft(xobj_resolved.dict, "Filter", doc);
-    const params = try dictGetResolvedSoft(xobj_resolved.dict, "DecodeParms", doc);
+    // Round 10 [P2] resolved indirect /Filter and /DecodeParms at the
+    // dict-entry level. Round 11 [P2] additionally normalizes per-
+    // element indirect refs inside their array shape so chains like
+    // `/Filter [12 0 R]` survive through the decompressor.
+    const filter_raw = try dictGetResolvedSoft(xobj_resolved.dict, "Filter", doc);
+    const params_raw = try dictGetResolvedSoft(xobj_resolved.dict, "DecodeParms", doc);
+    const filter = try normalizeFilterChain(filter_raw, doc);
+    const params = try normalizeFilterChain(params_raw, doc);
     const form_content = (try decompressStreamSoft(doc, xobj_resolved.data, filter, params)) orelse return;
     defer doc.scratch_allocator.free(form_content);
 
@@ -564,6 +570,48 @@ fn dictGetResolvedSoft(dict: parser.Object.Dict, key: []const u8, doc: DocState)
     return switch (obj) {
         .reference => |ref| try resolveRefSoft(doc, ref),
         else => obj,
+    };
+}
+
+/// Normalize a filter-chain Object into a shape `decompress.decompressStream`
+/// can consume — every member resolved through one level of indirect
+/// reference.
+///
+/// Codex review v1.2-rc4 round 11 [P2]: `/Filter` and `/DecodeParms`
+/// can be `[N 0 R N 0 R ...]` arrays where each element is itself an
+/// indirect reference. Round-10 only resolved the outer dict entry;
+/// any array members stayed as `.reference` and decompressStream
+/// silently dropped them. The chain collapsed to "no filters" and
+/// compressed Form bytes leaked through as raw content.
+///
+/// Allocates a fresh array on `doc.scratch_allocator` only when needed
+/// (i.e. an indirect array member is found). Direct `.name` arrays
+/// pass through unchanged.
+fn normalizeFilterChain(obj: ?parser.Object, doc: DocState) error{OutOfMemory}!?parser.Object {
+    const o = obj orelse return null;
+    return switch (o) {
+        .array => |arr| blk: {
+            // First pass: do any elements need resolving?
+            var needs_alloc = false;
+            for (arr) |el| {
+                if (el == .reference) {
+                    needs_alloc = true;
+                    break;
+                }
+            }
+            if (!needs_alloc) break :blk o;
+
+            // Second pass: build a new array with resolved elements.
+            const out = doc.scratch_allocator.alloc(parser.Object, arr.len) catch return error.OutOfMemory;
+            for (arr, 0..) |el, i| {
+                out[i] = switch (el) {
+                    .reference => |ref| (try resolveRefSoft(doc, ref)) orelse parser.Object{ .null = {} },
+                    else => el,
+                };
+            }
+            break :blk parser.Object{ .array = out };
+        },
+        else => o,
     };
 }
 
@@ -1111,4 +1159,63 @@ test "Mat.inverse on singular matrix returns null" {
     // Two columns linearly dependent → det = 0.
     const m = Mat{ .a = 1, .b = 2, .c = 2, .d = 4, .e = 0, .f = 0 };
     try std.testing.expect(m.inverse() == null);
+}
+
+// ----- normalizeFilterChain (PR-1 round 11 [P2] regression) -----
+
+test "normalizeFilterChain passes null through" {
+    var cache = std.AutoHashMap(u32, parser.Object).init(std.testing.allocator);
+    defer cache.deinit();
+    var xref = xref_mod.XRefTable.init(std.testing.allocator);
+    defer xref.deinit();
+    const doc = DocState{
+        .parse_allocator = std.testing.allocator,
+        .scratch_allocator = std.testing.allocator,
+        .data = "",
+        .xref_table = &xref,
+        .object_cache = &cache,
+    };
+    try std.testing.expect(try normalizeFilterChain(null, doc) == null);
+}
+
+test "normalizeFilterChain leaves a direct .name unchanged" {
+    var cache = std.AutoHashMap(u32, parser.Object).init(std.testing.allocator);
+    defer cache.deinit();
+    var xref = xref_mod.XRefTable.init(std.testing.allocator);
+    defer xref.deinit();
+    const doc = DocState{
+        .parse_allocator = std.testing.allocator,
+        .scratch_allocator = std.testing.allocator,
+        .data = "",
+        .xref_table = &xref,
+        .object_cache = &cache,
+    };
+    const inp = parser.Object{ .name = "FlateDecode" };
+    const out = (try normalizeFilterChain(inp, doc)) orelse unreachable;
+    try std.testing.expect(out == .name);
+    try std.testing.expectEqualStrings("FlateDecode", out.name);
+}
+
+test "normalizeFilterChain leaves a direct-only .array unchanged" {
+    var cache = std.AutoHashMap(u32, parser.Object).init(std.testing.allocator);
+    defer cache.deinit();
+    var xref = xref_mod.XRefTable.init(std.testing.allocator);
+    defer xref.deinit();
+    const doc = DocState{
+        .parse_allocator = std.testing.allocator,
+        .scratch_allocator = std.testing.allocator,
+        .data = "",
+        .xref_table = &xref,
+        .object_cache = &cache,
+    };
+    var arr = [_]parser.Object{
+        .{ .name = "ASCII85Decode" },
+        .{ .name = "FlateDecode" },
+    };
+    const inp = parser.Object{ .array = &arr };
+    const out = (try normalizeFilterChain(inp, doc)) orelse unreachable;
+    try std.testing.expect(out == .array);
+    // No allocation needed → the returned array slice points at the
+    // same storage as the input.
+    try std.testing.expect(out.array.ptr == &arr);
 }
