@@ -29,6 +29,8 @@ pub const structtree = @import("structtree.zig");
 pub const markdown = @import("markdown.zig");
 pub const outline = @import("outline.zig");
 pub const tables = @import("tables.zig");
+pub const lattice = @import("lattice.zig");
+pub const stream_table = @import("stream_table.zig");
 
 // Re-exports
 pub const Object = parser.Object;
@@ -1019,17 +1021,93 @@ pub const Document = struct {
         );
     }
 
-    /// v1.2 — Pass A tagged-path table extraction. Returns one `tables.Table`
-    /// per `/Table` element in the document's structure tree. Returns an
-    /// empty slice for PDFs without `/StructTreeRoot`. Caller frees via
-    /// `tables.freeTables(allocator, result)`.
+    /// v1.2 — table extraction across all three passes (A tagged → B
+    /// lattice → C stream) plus Pass D confidence-based merge. Returns a
+    /// flat slice of `tables.Table` records covering every page; caller
+    /// frees via `tables.freeTables(allocator, result)`.
+    ///
+    /// Per docs/v1.2-table-detection-design.md §3.4 the merge rule is:
+    /// for each page, take Pass-A tables first (confidence 1.0), then
+    /// Pass-B tables that don't overlap a Pass-A table, then Pass-C
+    /// tables that don't overlap a Pass-A or Pass-B table. Overlap is
+    /// approximated structurally for v1: same page + matching n_rows
+    /// & n_cols within ±1 cell. Pass-D multi-page continuation linking
+    /// is a v1.2.W5 follow-up.
     pub fn getTables(self: *Document, allocator: std.mem.Allocator) ![]tables.Table {
+        var combined: std.ArrayList(tables.Table) = .empty;
+        errdefer {
+            for (combined.items) |t| allocator.free(t.cells);
+            combined.deinit(allocator);
+        }
+
+        // Pass A — tagged path.
         const arena = self.parsing_arena.allocator();
-        var tree = structtree.parseStructTree(arena, self.data, &self.xref_table, &self.object_cache) catch
-            return allocator.alloc(tables.Table, 0);
-        defer tree.deinit();
-        const ctx = self;
-        return tables.extractTaggedTables(allocator, &tree, @ptrCast(ctx), pageRefToZeroBased);
+        var tree_opt: ?structtree.StructTree = structtree.parseStructTree(arena, self.data, &self.xref_table, &self.object_cache) catch null;
+        if (tree_opt) |*tree| {
+            defer tree.deinit();
+            const ctx = self;
+            const pass_a = try tables.extractTaggedTables(allocator, tree, @ptrCast(ctx), pageRefToZeroBased);
+            for (pass_a) |t| try combined.append(allocator, t);
+            allocator.free(pass_a); // we copied each element above (cells are still owned by the original elements; transfer)
+        }
+        // We transferred the cells slices; re-own via pass_a's allocator path.
+        // (Above `allocator.free(pass_a)` only freed the outer slice; cells move
+        // into `combined` and stay owned for freeTables on the merged result.)
+
+        // Pass B + C run per page.
+        const num_pages = self.pages.items.len;
+        var page_idx: usize = 0;
+        while (page_idx < num_pages) : (page_idx += 1) {
+            // Pass B: collect strokes from the page content stream, run lattice.
+            var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch_arena.deinit();
+            const scratch = scratch_arena.allocator();
+
+            const content = pagetree.getPageContents(arena, scratch, self.data, &self.xref_table, self.pages.items[page_idx], &self.object_cache) catch &[_]u8{};
+            const strokes = lattice.collectStrokes(scratch, content) catch &[_]lattice.Stroke{};
+            const pass_b = lattice.extractFromStrokes(allocator, strokes, @intCast(page_idx + 1)) catch &[_]tables.Table{};
+            for (pass_b) |t| {
+                if (!conflictsExisting(combined.items, t)) {
+                    try combined.append(allocator, t);
+                } else {
+                    allocator.free(t.cells);
+                }
+            }
+            allocator.free(pass_b);
+
+            // Pass C: get text spans, run stream-layout. Stick to the
+            // mutable []TextSpan returned by extractTextWithBounds so
+            // freeTextSpans can clean it up.
+            const spans_opt: ?[]TextSpan = self.extractTextWithBounds(page_idx, allocator) catch null;
+            defer if (spans_opt) |s| Document.freeTextSpans(allocator, s);
+            const span_view: []const layout.TextSpan = if (spans_opt) |s| s else &.{};
+            const pass_c = stream_table.extractFromSpans(allocator, span_view, @intCast(page_idx + 1)) catch &[_]tables.Table{};
+            for (pass_c) |t| {
+                if (!conflictsExisting(combined.items, t)) {
+                    try combined.append(allocator, t);
+                } else {
+                    allocator.free(t.cells);
+                }
+            }
+            allocator.free(pass_c);
+        }
+
+        return combined.toOwnedSlice(allocator);
+    }
+
+    /// Pass D conflict heuristic: same page + (n_rows, n_cols) within ±1.
+    fn conflictsExisting(existing: []const tables.Table, t: tables.Table) bool {
+        for (existing) |e| {
+            if (e.page == t.page and
+                (@as(i32, @intCast(e.n_rows)) - @as(i32, @intCast(t.n_rows))) >= -1 and
+                (@as(i32, @intCast(e.n_rows)) - @as(i32, @intCast(t.n_rows))) <= 1 and
+                (@as(i32, @intCast(e.n_cols)) - @as(i32, @intCast(t.n_cols))) >= -1 and
+                (@as(i32, @intCast(e.n_cols)) - @as(i32, @intCast(t.n_cols))) <= 1)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn pageRefToZeroBased(ctx: *const anyopaque, page_ref: ?ObjRef) ?u32 {
