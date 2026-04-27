@@ -432,11 +432,14 @@ fn handleDoOperator(
     // Round 10 [P2] resolved indirect /Filter and /DecodeParms at the
     // dict-entry level. Round 11 [P2] additionally normalizes per-
     // element indirect refs inside their array shape so chains like
-    // `/Filter [12 0 R]` survive through the decompressor.
+    // `/Filter [12 0 R]` survive through the decompressor. Round 18
+    // [P2] adds inner-dict resolution for /DecodeParms — entries
+    // like `/Predictor N 0 R` or `/Columns N 0 R` are now resolved
+    // before the decompressor reads them.
     const filter_raw = try dictGetResolvedSoft(xobj_resolved.dict, "Filter", doc);
     const params_raw = try dictGetResolvedSoft(xobj_resolved.dict, "DecodeParms", doc);
     const filter = try normalizeFilterChain(filter_raw, doc);
-    const params = try normalizeFilterChain(params_raw, doc);
+    const params = try normalizeDecodeParms(params_raw, doc);
     const form_content = (try decompressStreamSoft(doc, xobj_resolved.data, filter, params)) orelse return;
     defer doc.scratch_allocator.free(form_content);
 
@@ -613,8 +616,7 @@ fn dictGetResolvedSoft(dict: parser.Object.Dict, key: []const u8, doc: DocState)
 /// can be `[N 0 R N 0 R ...]` arrays where each element is itself an
 /// indirect reference. Round-10 only resolved the outer dict entry;
 /// any array members stayed as `.reference` and decompressStream
-/// silently dropped them. The chain collapsed to "no filters" and
-/// compressed Form bytes leaked through as raw content.
+/// silently dropped them.
 ///
 /// Allocates a fresh array on `doc.scratch_allocator` only when needed
 /// (i.e. an indirect array member is found). Direct `.name` arrays
@@ -645,6 +647,85 @@ fn normalizeFilterChain(obj: ?parser.Object, doc: DocState) error{OutOfMemory}!?
         },
         else => o,
     };
+}
+
+/// Like `normalizeFilterChain`, but for `/DecodeParms`. Each member
+/// of a `/DecodeParms` is itself a dict (e.g. FlateDecode params:
+/// `<< /Predictor N /Columns N /Colors N /BitsPerComponent N >>`).
+/// Per ISO 32000-1 §7.3.10, those inner entry values may legally be
+/// indirect references. PDFBox dereferences them via FilterParameters;
+/// pdf.js dereferences via parser auto-resolution; MuPDF documents
+/// the same.
+///
+/// Codex review v1.2-rc4 round 18 [P2]: previously the lattice path
+/// resolved the outer `/DecodeParms` and any wrapping array members
+/// but left dict entries unresolved, so `decompressStream()`
+/// (which reads `Predictor`/`Columns`/etc. with direct-only get)
+/// silently used wrong values, post-predictor bytes leaked into
+/// the parser, and tables were missed.
+///
+/// Allocations are scratch-allocated only when at least one inner
+/// reference needs resolving. Direct-only inputs pass through
+/// unchanged (slice ptr identity preserved).
+fn normalizeDecodeParms(obj: ?parser.Object, doc: DocState) error{OutOfMemory}!?parser.Object {
+    const o = obj orelse return null;
+    return switch (o) {
+        .dict => |d| try normalizeParamsDict(d, doc),
+        .array => |arr| blk: {
+            // Walk array; if any member is a dict that needs
+            // normalization, build a fresh array with each dict
+            // (recursively) normalized.
+            var needs_alloc = false;
+            for (arr) |el| {
+                switch (el) {
+                    .dict => |d| {
+                        if (paramsDictNeedsAlloc(d)) {
+                            needs_alloc = true;
+                            break;
+                        }
+                    },
+                    .reference => {
+                        needs_alloc = true;
+                        break;
+                    },
+                    else => {},
+                }
+            }
+            if (!needs_alloc) break :blk o;
+
+            const out = doc.scratch_allocator.alloc(parser.Object, arr.len) catch return error.OutOfMemory;
+            for (arr, 0..) |el, i| {
+                out[i] = switch (el) {
+                    .reference => |ref| (try resolveRefSoft(doc, ref)) orelse parser.Object{ .null = {} },
+                    .dict => |d| try normalizeParamsDict(d, doc),
+                    else => el,
+                };
+            }
+            break :blk parser.Object{ .array = out };
+        },
+        else => o,
+    };
+}
+
+fn paramsDictNeedsAlloc(d: parser.Object.Dict) bool {
+    for (d.entries) |e| if (e.value == .reference) return true;
+    return false;
+}
+
+fn normalizeParamsDict(d: parser.Object.Dict, doc: DocState) error{OutOfMemory}!parser.Object {
+    if (!paramsDictNeedsAlloc(d)) return parser.Object{ .dict = d };
+
+    const new_entries = doc.scratch_allocator.alloc(parser.Object.Dict.Entry, d.entries.len) catch return error.OutOfMemory;
+    for (d.entries, 0..) |e, i| {
+        new_entries[i] = .{
+            .key = e.key,
+            .value = switch (e.value) {
+                .reference => |ref| (try resolveRefSoft(doc, ref)) orelse parser.Object{ .null = {} },
+                else => e.value,
+            },
+        };
+    }
+    return parser.Object{ .dict = .{ .entries = new_entries } };
 }
 
 /// Resolve a numeric Object element to f64, following one level of

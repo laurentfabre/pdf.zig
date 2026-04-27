@@ -122,7 +122,7 @@ fn resolveCompressedObject(
     const raw_filter = try resolveDictEntry(allocator, data, xref, stream.dict.get("Filter"), resolved_cache);
     const raw_params = try resolveDictEntry(allocator, data, xref, stream.dict.get("DecodeParms"), resolved_cache);
     const obj_filter = try normalizeFilterChain(allocator, allocator, data, xref, raw_filter, resolved_cache);
-    const obj_params = try normalizeFilterChain(allocator, allocator, data, xref, raw_params, resolved_cache);
+    const obj_params = try normalizeDecodeParms(allocator, allocator, data, xref, raw_params, resolved_cache);
     const decoded = decompress.decompressStream(
         allocator,
         stream.data,
@@ -252,12 +252,7 @@ fn resolveDictEntry(
     };
 }
 
-/// Walk a `/Filter` or `/DecodeParms` Object and resolve any
-/// `.reference` array members. Allocates a fresh array on
-/// `scratch_allocator` only when at least one member needs
-/// resolving; direct-only arrays pass through unchanged.
-/// Bubbles `error.OutOfMemory` from both the allocation and
-/// every per-element resolveRef (round 13 [P2]).
+/// Walk a `/Filter` Object and resolve any `.reference` array members.
 fn normalizeFilterChain(
     scratch_allocator: std.mem.Allocator,
     parse_allocator: std.mem.Allocator,
@@ -293,6 +288,94 @@ fn normalizeFilterChain(
         },
         else => obj,
     };
+}
+
+/// Codex review v1.2-rc4 round 18 [P2]: `/DecodeParms` dict entries
+/// (Predictor, Columns, Colors, BitsPerComponent) may legally be
+/// indirect refs per ISO 32000-1 §7.3.10. The lattice path mirrors
+/// this same logic; the page-content path needs the parallel fix.
+fn normalizeDecodeParms(
+    scratch_allocator: std.mem.Allocator,
+    parse_allocator: std.mem.Allocator,
+    data: []const u8,
+    xref: *const XRefTable,
+    obj_opt: ?Object,
+    cache: *std.AutoHashMap(u32, Object),
+) error{OutOfMemory}!?Object {
+    const obj = obj_opt orelse return null;
+    return switch (obj) {
+        .dict => |d| try normalizeParamsDict(d, scratch_allocator, parse_allocator, data, xref, cache),
+        .array => |arr| blk: {
+            var needs_alloc = false;
+            for (arr) |el| {
+                switch (el) {
+                    .dict => |d| {
+                        if (paramsDictNeedsAlloc(d)) {
+                            needs_alloc = true;
+                            break;
+                        }
+                    },
+                    .reference => {
+                        needs_alloc = true;
+                        break;
+                    },
+                    else => {},
+                }
+            }
+            if (!needs_alloc) break :blk obj;
+
+            const out = try scratch_allocator.alloc(Object, arr.len);
+            for (arr, 0..) |el, i| {
+                out[i] = switch (el) {
+                    .reference => |ref| ref_blk: {
+                        const resolved = resolveRef(parse_allocator, data, xref, ref, cache) catch |err| {
+                            if (err == error.OutOfMemory) return error.OutOfMemory;
+                            break :ref_blk Object{ .null = {} };
+                        };
+                        break :ref_blk resolved;
+                    },
+                    .dict => |d| try normalizeParamsDict(d, scratch_allocator, parse_allocator, data, xref, cache),
+                    else => el,
+                };
+            }
+            break :blk Object{ .array = out };
+        },
+        else => obj,
+    };
+}
+
+fn paramsDictNeedsAlloc(d: Object.Dict) bool {
+    for (d.entries) |e| if (e.value == .reference) return true;
+    return false;
+}
+
+fn normalizeParamsDict(
+    d: Object.Dict,
+    scratch_allocator: std.mem.Allocator,
+    parse_allocator: std.mem.Allocator,
+    data: []const u8,
+    xref: *const XRefTable,
+    cache: *std.AutoHashMap(u32, Object),
+) error{OutOfMemory}!Object {
+    if (!paramsDictNeedsAlloc(d)) return Object{ .dict = d };
+
+    const new_entries = try scratch_allocator.alloc(Object.Dict.Entry, d.entries.len);
+    for (d.entries, 0..) |e, i| {
+        new_entries[i] = .{
+            .key = e.key,
+            .value = switch (e.value) {
+                .reference => |ref| ref_blk: {
+                    const resolved = resolveRef(parse_allocator, data, xref, ref, cache) catch |err| {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        break :ref_blk Object{ .null = {} };
+                    };
+                    break :ref_blk resolved;
+                },
+                else => e.value,
+            },
+        };
+    }
+    return Object{ .dict = .{ .entries = new_entries } };
 }
 
 /// Build page array from PDF document
@@ -528,7 +611,7 @@ fn getStreamData(
             const raw_filter = try resolveDictEntry(parse_allocator, data, xref, s.dict.get("Filter"), cache);
             const raw_params = try resolveDictEntry(parse_allocator, data, xref, s.dict.get("DecodeParms"), cache);
             const filter = try normalizeFilterChain(scratch_allocator, parse_allocator, data, xref, raw_filter, cache);
-            const params = try normalizeFilterChain(scratch_allocator, parse_allocator, data, xref, raw_params, cache);
+            const params = try normalizeDecodeParms(scratch_allocator, parse_allocator, data, xref, raw_params, cache);
             return decompress.decompressStream(
                 scratch_allocator,
                 s.data,
