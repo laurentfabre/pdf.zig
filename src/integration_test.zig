@@ -1460,3 +1460,13 @@ test "tagged table extracts cell text from nested MCID children" {
     try std.testing.expectEqual(@as(usize, 6), t.cells.len);
     try std.testing.expectEqual(@as(u32, 1), t.page);
 }
+
+// PR-2 stub — see docs/ROADMAP.md PR-2.
+// Continuation-link bbox-y constraint: tables.linkContinuations() must check
+// that table_a sits near the bottom of page p AND table_b sits near the top
+// of page p+1 (via media_box) before chaining them. Two new fixtures land
+// alongside the implementation: two-unrelated-tables.pdf (no link) and the
+// existing 4-page Anantara spa price list (link preserved).
+test "continuation link respects bbox-y constraint" {
+    return error.SkipZigTest;
+}
