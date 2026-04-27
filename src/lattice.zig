@@ -27,9 +27,61 @@
 const std = @import("std");
 const interpreter = @import("interpreter.zig");
 const tables = @import("tables.zig");
+const parser = @import("parser.zig");
+const pagetree = @import("pagetree.zig");
+const decompress = @import("decompress.zig");
+const xref_mod = @import("xref.zig");
 
 const COORD_TOLERANCE: f64 = 1.0; // 1 pt (≈0.35 mm)
 const MIN_STROKE_LEN: f64 = 4.0; // ignore strokes shorter than 4 pt
+
+/// Hard cap on Form XObject `Do` recursion. Mirrors the constant used by
+/// the text-extraction path in root.zig (`ExtractionContext.MAX_DEPTH`).
+/// PDF spec allows nested XObjects; 10 frames is comfortably above any
+/// realistic template nesting and below the point where stack pressure
+/// matters.
+pub const MAX_XOBJECT_DEPTH: u8 = 10;
+
+/// Document-level state needed to resolve indirect references when
+/// recursing into Form XObjects. All fields point at long-lived storage
+/// owned by the `Document`; lattice never frees them.
+pub const DocState = struct {
+    /// Allocator the parser uses for resolved object dictionaries that
+    /// land in `object_cache`. Must outlive the recursion.
+    parse_allocator: std.mem.Allocator,
+    /// Allocator for transient buffers (decompressed Form content).
+    /// Freed by `collectStrokes` before returning.
+    scratch_allocator: std.mem.Allocator,
+    /// Raw PDF bytes — parser reads object data straight from this.
+    data: []const u8,
+    xref_table: *const xref_mod.XRefTable,
+    object_cache: *std.AutoHashMap(u32, parser.Object),
+};
+
+/// Optional context for `collectStrokes`. Default is the legacy
+/// page-content-only behaviour: `Do` operators are ignored.
+///
+/// Provide `resources` + `doc` to opt into Form XObject recursion.
+pub const CollectContext = struct {
+    /// Page (or parent Form XObject) Resources dict. Used to resolve
+    /// `/XObject/<name>` lookups when the content stream emits `Do`.
+    resources: ?parser.Object.Dict = null,
+    /// Document-level state for indirect-reference resolution.
+    /// Must be non-null whenever `resources` is set; both are required
+    /// for recursion to fire.
+    doc: ?DocState = null,
+    /// Current recursion depth. The public entry point starts at 0;
+    /// each `Do` increments by 1. Recursion stops at MAX_XOBJECT_DEPTH.
+    depth: u8 = 0,
+    /// Initial CTM applied before walking `content`. Default identity.
+    /// Used to inject the parent's CTM × the Form's `/Matrix` when
+    /// recursing.
+    initial_ctm: Mat = .{},
+    /// Visited set (object numbers) for cycle detection across the
+    /// whole recursion. The outermost call passes `null`; the worker
+    /// allocates a local set and threads it through.
+    visited: ?*std.AutoHashMap(u32, void) = null,
+};
 
 pub const Stroke = struct {
     /// Two endpoints in user-space.
@@ -76,16 +128,64 @@ const Mat = struct {
 
 /// Walk a content stream and return every horizontal/vertical stroke
 /// in user-space, ignoring text + colour + clip ops. Caller frees.
+///
+/// This is the legacy entry point: `Do` operators are silently ignored,
+/// so any tables drawn inside Form XObjects are invisible. Use
+/// `collectStrokesIn` to opt into Form XObject recursion.
 pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stroke {
+    return collectStrokesIn(allocator, content, .{});
+}
+
+/// Resource-aware variant of `collectStrokes`.
+///
+/// When `ctx.resources` AND `ctx.doc` are both set, `Do` operators
+/// resolve the named XObject from the page Resources, push the parent
+/// CTM × the Form's `/Matrix` onto the graphics state, and recurse into
+/// the Form content stream. Recursion is depth-capped at
+/// `MAX_XOBJECT_DEPTH` and cycle-guarded via a visited set keyed on
+/// indirect-reference object numbers.
+///
+/// All recursion errors are swallowed — a corrupt or unsupported
+/// XObject must not poison the surrounding stroke collection.
+pub fn collectStrokesIn(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    ctx: CollectContext,
+) ![]Stroke {
+    var strokes: std.ArrayList(Stroke) = .empty;
+    errdefer strokes.deinit(allocator);
+
+    // The outermost call owns the visited set; nested calls borrow it.
+    var owned_visited: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(allocator);
+    defer if (ctx.visited == null) owned_visited.deinit();
+    const visited = ctx.visited orelse &owned_visited;
+
+    try collectStrokesWalk(allocator, content, ctx, visited, &strokes);
+    return strokes.toOwnedSlice(allocator);
+}
+
+/// Inner worker. Walks a single content stream and appends to `out`.
+/// `Do` triggers a recursive call into the worker on the resolved Form
+/// XObject's content stream. CTM stack is local to this frame.
+fn collectStrokesWalk(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    ctx: CollectContext,
+    visited: *std.AutoHashMap(u32, void),
+    out: *std.ArrayList(Stroke),
+) anyerror!void {
     var lexer = interpreter.ContentLexer.init(allocator, content);
     var operands: std.ArrayList(f64) = .empty;
     defer operands.deinit(allocator);
     var ctm_stack: std.ArrayList(Mat) = .empty;
     defer ctm_stack.deinit(allocator);
-    try ctm_stack.append(allocator, Mat{});
+    try ctm_stack.append(allocator, ctx.initial_ctm);
 
-    var strokes: std.ArrayList(Stroke) = .empty;
-    errdefer strokes.deinit(allocator);
+    // Most-recent name token. PDF operators consume the immediately-
+    // preceding name (e.g. `Do`, `Tf`, `gs`). Reset after each operator
+    // so a stale name from three ops ago can't be misread as the
+    // operand of the next `Do`.
+    var last_name: []const u8 = "";
 
     var path_x: f64 = 0;
     var path_y: f64 = 0;
@@ -97,9 +197,16 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
     while (try lexer.next()) |tok| {
         switch (tok) {
             .number => |n| try operands.append(allocator, n),
-            .name, .string, .hex_string, .array => operands.clearRetainingCapacity(),
+            .name => |n| {
+                last_name = n;
+                operands.clearRetainingCapacity();
+            },
+            .string, .hex_string, .array => operands.clearRetainingCapacity(),
             .operator => |op| {
-                defer operands.clearRetainingCapacity();
+                defer {
+                    operands.clearRetainingCapacity();
+                    last_name = "";
+                }
                 if (op.len == 0) continue;
                 const ctm = ctm_stack.items[ctm_stack.items.len - 1];
 
@@ -162,7 +269,7 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
                     // Path stroked — keep horizontal+vertical segments only.
                     for (path_segments.items) |seg| {
                         if (seg.isHorizontal() or seg.isVertical()) {
-                            try strokes.append(allocator, seg);
+                            try out.append(allocator, seg);
                         }
                     }
                     path_segments.clearRetainingCapacity();
@@ -171,12 +278,119 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
                 {
                     // Unstroked path — discard segments.
                     path_segments.clearRetainingCapacity();
+                } else if (std.mem.eql(u8, op, "Do") and last_name.len > 0) {
+                    handleDoOperator(allocator, last_name, ctx, ctm, visited, out) catch |err| {
+                        // OOM must propagate; everything else is a soft
+                        // failure that should not abort outer collection.
+                        if (err == error.OutOfMemory) return err;
+                    };
                 }
             },
         }
     }
+}
 
-    return strokes.toOwnedSlice(allocator);
+/// Recurse into the Form XObject named `name`, appending strokes to
+/// `out` in the parent's user-space coordinate frame.
+///
+/// All non-OOM errors are returned to the caller for the soft-fail
+/// pattern at the call site. The function is conservative — any
+/// resource lookup miss, missing Subtype, decode failure, or visited-
+/// reference cycle results in a no-op return.
+fn handleDoOperator(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    ctx: CollectContext,
+    parent_ctm: Mat,
+    visited: *std.AutoHashMap(u32, void),
+    out: *std.ArrayList(Stroke),
+) anyerror!void {
+    if (ctx.depth >= MAX_XOBJECT_DEPTH) return;
+    const resources = ctx.resources orelse return;
+    const doc = ctx.doc orelse return;
+
+    // Resolve `/XObject` dict (may be inline or an indirect reference).
+    const xobjects_obj = resources.get("XObject") orelse return;
+    const xobjects = switch (xobjects_obj) {
+        .dict => |d| d,
+        .reference => |ref| blk: {
+            const resolved = pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch return;
+            break :blk switch (resolved) {
+                .dict => |d| d,
+                else => return,
+            };
+        },
+        else => return,
+    };
+
+    // Look up the named XObject (also possibly a reference).
+    const xobj = xobjects.get(name) orelse return;
+    var xobj_ref_num: ?u32 = null;
+    const xobj_resolved = switch (xobj) {
+        .stream => |s| s,
+        .reference => |ref| blk: {
+            xobj_ref_num = ref.num;
+            // Cycle guard: if we're already inside this XObject, bail.
+            if (visited.contains(ref.num)) return;
+            const resolved = pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch return;
+            break :blk switch (resolved) {
+                .stream => |s| s,
+                else => return,
+            };
+        },
+        else => return,
+    };
+
+    // Form XObjects only — Image / PS XObjects don't contribute strokes.
+    const subtype = xobj_resolved.dict.getName("Subtype") orelse return;
+    if (!std.mem.eql(u8, subtype, "Form")) return;
+
+    // Decompress the Form content stream into scratch memory.
+    const filter = xobj_resolved.dict.get("Filter");
+    const params = xobj_resolved.dict.get("DecodeParms");
+    const form_content = decompress.decompressStream(doc.scratch_allocator, xobj_resolved.data, filter, params) catch return;
+    defer doc.scratch_allocator.free(form_content);
+
+    // Compose the effective CTM for the Form's own content. Per PDF
+    // spec §8.10: the Form's `/Matrix` (default identity) is applied
+    // BEFORE the parent's CTM, i.e. effective = parent_ctm × form_matrix.
+    const form_matrix = readMatrix(xobj_resolved.dict);
+    const effective_ctm = form_matrix.mul(parent_ctm);
+
+    // Inherit parent Resources when the Form omits its own.
+    const form_resources = xobj_resolved.dict.getDict("Resources") orelse resources;
+
+    // Mark this XObject visited for the duration of the recursion so
+    // that mutual references can't loop.
+    if (xobj_ref_num) |n| try visited.put(n, {});
+    defer {
+        if (xobj_ref_num) |n| _ = visited.remove(n);
+    }
+
+    const child_ctx = CollectContext{
+        .resources = form_resources,
+        .doc = doc,
+        .depth = ctx.depth + 1,
+        .initial_ctm = effective_ctm,
+        .visited = visited,
+    };
+    try collectStrokesWalk(allocator, form_content, child_ctx, visited, out);
+}
+
+/// Read a Form XObject's `/Matrix` entry into a `Mat`.
+/// Falls back to identity when missing or malformed.
+fn readMatrix(dict: parser.Object.Dict) Mat {
+    const arr = dict.getArray("Matrix") orelse return Mat{};
+    if (arr.len < 6) return Mat{};
+    var v: [6]f64 = undefined;
+    for (0..6) |i| {
+        v[i] = switch (arr[i]) {
+            .real => |r| r,
+            .integer => |n| @floatFromInt(n),
+            else => return Mat{},
+        };
+    }
+    return Mat{ .a = v[0], .b = v[1], .c = v[2], .d = v[3], .e = v[4], .f = v[5] };
 }
 
 const Cluster = struct { coord: f64, members: std.ArrayList(Stroke) };
