@@ -1109,6 +1109,30 @@ test "lattice pass B resolves indirect /Subtype on Form XObject" {
     try std.testing.expectEqual(@as(usize, 1), lattice_count);
 }
 
+// Codex round 20 [P2]: PDF spec §7.3.5 allows `#xx` hex escapes in
+// content-stream names. Lattice must decode at the XObject lookup
+// boundary (`/Fm#31 Do` ↔ `/Fm1` in Resources). Without the decoder,
+// the lookup misses entirely and the form is not invoked.
+test "lattice pass B decodes escaped Form XObject names (Fm#31 -> Fm1)" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectEscapedNamePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var lattice_count: usize = 0;
+    for (detected) |t| {
+        if (t.engine == zpdf.tables.Engine.lattice and
+            t.n_rows == 3 and t.n_cols == 3) lattice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lattice_count);
+}
+
 // Codex round 17 [P2]: nested Form /Resources fallback uses the
 // PAGE Resources, not the calling Form's. Per ISO 32000-1 §7.8.3.
 // Three-level chain: page → OuterForm → MidForm. OuterForm shadows

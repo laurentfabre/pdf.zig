@@ -397,7 +397,21 @@ fn handleDoOperator(
     };
 
     // Look up the named XObject (also possibly a reference).
-    const xobj = xobjects.get(name) orelse return;
+    //
+    // Codex round 20 [P2]: PDF spec §7.3.5 lets names in the content
+    // stream use `#xx` escapes for special characters (e.g.
+    // `/Fm#31 Do` is the same name as `/Fm1`). The dictionary parser
+    // (`parser.zig::scanName`) decodes those escapes when building
+    // resource keys, but `interpreter.ContentLexer.scanName` does
+    // not — so a raw lookup with the lexer's bytes can miss a
+    // legitimate match.
+    //
+    // PDFBox, MuPDF, and pdf.js all decode at the matching boundary.
+    // Decode-then-lookup; if the name has no escapes the helper
+    // returns the input slice unchanged (no allocation).
+    var name_buf: [256]u8 = undefined;
+    const decoded_name = decodePdfName(name, &name_buf);
+    const xobj = xobjects.get(decoded_name) orelse return;
     var xobj_ref_num: ?u32 = null;
     const xobj_resolved = switch (xobj) {
         .stream => |s| s,
@@ -593,6 +607,42 @@ fn clipStrokeInFormSpace(
         .x0 = a_back.x, .y0 = a_back.y,
         .x1 = b_back.x, .y1 = b_back.y,
     };
+}
+
+/// Decode PDF name escapes (`#xx` → byte 0xXX) per ISO 32000-1
+/// §7.3.5. The output is written into `out_buf`; if the input
+/// contains no `#` byte the input slice is returned as-is (no
+/// copy). On invalid escapes (truncated, non-hex), copies the raw
+/// `#` byte through — same conservative recovery PDFBox uses.
+///
+/// Codex review v1.2-rc4 round 20 [P2]: ContentLexer.scanName does
+/// not decode escapes, but parser.zig::scanName does, so dict keys
+/// like `/Fm1` won't match a content-stream name like `/Fm#31`.
+/// Apply this decoder at the lookup boundary.
+fn decodePdfName(name: []const u8, out_buf: []u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, name, '#') == null) return name;
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < name.len and w < out_buf.len) : (w += 1) {
+        if (name[i] == '#' and i + 2 < name.len) {
+            const hi = std.fmt.charToDigit(name[i + 1], 16) catch {
+                out_buf[w] = name[i];
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(name[i + 2], 16) catch {
+                out_buf[w] = name[i];
+                i += 1;
+                continue;
+            };
+            out_buf[w] = (hi << 4) | lo;
+            i += 3;
+        } else {
+            out_buf[w] = name[i];
+            i += 1;
+        }
+    }
+    return out_buf[0..w];
 }
 
 /// Look up `key` in `dict`, following one level of indirect reference.
@@ -1310,6 +1360,39 @@ test "CTM concatenation: scale then translate maps x=0 to 100" {
     const p = ctm.apply(0, 0);
     try std.testing.expectApproxEqAbs(@as(f64, 100), p.x, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0), p.y, 1e-9);
+}
+
+// ----- decodePdfName (PR-1 round 20 [P2] regression) -----
+
+test "decodePdfName passes plain names unchanged (no allocation)" {
+    var buf: [16]u8 = undefined;
+    const out = decodePdfName("Fm1", &buf);
+    // Slice identity: result points at the input, no copy.
+    try std.testing.expect(out.ptr == "Fm1".ptr);
+    try std.testing.expectEqualStrings("Fm1", out);
+}
+
+test "decodePdfName decodes #xx hex escapes" {
+    var buf: [16]u8 = undefined;
+    // #31 = 0x31 = '1' → "Fm1"
+    try std.testing.expectEqualStrings("Fm1", decodePdfName("Fm#31", &buf));
+    // #20 = 0x20 = ' ' → "A B"
+    try std.testing.expectEqualStrings("A B", decodePdfName("A#20B", &buf));
+    // ## sequence → "#" (decodes #23 = '#')
+    try std.testing.expectEqualStrings("#", decodePdfName("#23", &buf));
+}
+
+test "decodePdfName tolerates malformed trailing escape" {
+    var buf: [16]u8 = undefined;
+    // Truncated `#3` (missing second hex digit) — pass # through.
+    const out = decodePdfName("Fm#3", &buf);
+    try std.testing.expectEqualStrings("Fm#3", out);
+}
+
+test "decodePdfName tolerates non-hex escape" {
+    var buf: [16]u8 = undefined;
+    // `#zz` — invalid hex → pass # through and continue.
+    try std.testing.expectEqualStrings("F#zz", decodePdfName("F#zz", &buf));
 }
 
 test "CTM concatenation: distinct point shows scale applied after translate" {

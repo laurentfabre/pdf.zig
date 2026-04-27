@@ -399,9 +399,12 @@ pub fn buildPageTree(
         else => return PageTreeError.CatalogNotFound,
     };
 
-    // Resolve catalog
-    const catalog = resolveRef(allocator, data, xref, root_ref, &resolved_cache) catch
+    // Resolve catalog. Codex round 20 [P2]: split OOM from domain
+    // failure; previously OOM was masked as CatalogNotFound.
+    const catalog = resolveRef(allocator, data, xref, root_ref, &resolved_cache) catch |err| {
+        if (err == error.OutOfMemory) return PageTreeError.OutOfMemory;
         return PageTreeError.CatalogNotFound;
+    };
 
     const catalog_dict = switch (catalog) {
         .dict => |d| d,
@@ -462,9 +465,12 @@ fn walkPageTree(
     visited.put(node_ref.num, {}) catch return PageTreeError.OutOfMemory;
     defer _ = visited.remove(node_ref.num);
 
-    // Resolve node
-    const node = resolveRef(allocator, data, xref, node_ref, cache) catch
+    // Resolve node. Codex round 20 [P2]: split OOM from
+    // InvalidPageTree (the previous catch swallowed both).
+    const node = resolveRef(allocator, data, xref, node_ref, cache) catch |err| {
+        if (err == error.OutOfMemory) return PageTreeError.OutOfMemory;
         return PageTreeError.InvalidPageTree;
+    };
 
     const dict = switch (node) {
         .dict => |d| d,
