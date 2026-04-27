@@ -37,7 +37,18 @@ pub const PageTreeError = error{
     OutOfMemory,
 };
 
-/// Resolve object reference using XRef table
+/// Resolve object reference using XRef table.
+///
+/// `error.OutOfMemory` propagates so allocator pressure is observable
+/// at the call site. Domain errors (corrupt object, malformed stream
+/// header) collapse to `Object{ .null = {} }` so a single bad
+/// reference can't poison the whole document walk.
+///
+/// Codex review v1.2-rc4 round 3 [P2]: previously every parser /
+/// decompress error was masked via `catch return Object{ .null = {} }`,
+/// including OOM. Lattice's `resolveRefSoft` boundary couldn't
+/// preserve OOM if this primitive ate it first. Now bubble OOM here
+/// and keep the soft-fail for domain failures.
 pub fn resolveRef(
     allocator: std.mem.Allocator,
     data: []const u8,
@@ -58,7 +69,10 @@ pub fn resolveRef(
             if (entry.offset >= data.len) return Object{ .null = {} };
 
             var p = parser.Parser.initAt(allocator, data, @intCast(entry.offset));
-            const indirect = p.parseIndirectObject() catch return Object{ .null = {} };
+            const indirect = p.parseIndirectObject() catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return Object{ .null = {} };
+            };
 
             try resolved_cache.put(ref.num, indirect.obj);
             return indirect.obj;
@@ -86,7 +100,10 @@ fn resolveCompressedObject(
     if (objstm_entry.offset >= data.len) return Object{ .null = {} };
 
     var p = parser.Parser.initAt(allocator, data, @intCast(objstm_entry.offset));
-    const indirect = p.parseIndirectObject() catch return Object{ .null = {} };
+    const indirect = p.parseIndirectObject() catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return Object{ .null = {} };
+    };
 
     const stream = switch (indirect.obj) {
         .stream => |s| s,
@@ -100,7 +117,10 @@ fn resolveCompressedObject(
         stream.data,
         stream.dict.get("Filter"),
         stream.dict.get("DecodeParms"),
-    ) catch return Object{ .null = {} };
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return Object{ .null = {} };
+    };
 
     // Parse object stream header
     const n = stream.dict.getInt("N") orelse return Object{ .null = {} };
@@ -139,7 +159,10 @@ fn resolveCompressedObject(
     if (obj_offset + rel_offset >= decoded.len) return Object{ .null = {} };
 
     var obj_parser = parser.Parser.initAt(allocator, decoded, obj_offset + @as(usize, @intCast(rel_offset)));
-    const result = obj_parser.parseObject() catch return Object{ .null = {} };
+    const result = obj_parser.parseObject() catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return Object{ .null = {} };
+    };
 
     try resolved_cache.put(offsets.items[index].num, result);
     return result;
