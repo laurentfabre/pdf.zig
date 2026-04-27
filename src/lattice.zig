@@ -974,3 +974,98 @@ test "MAX_XOBJECT_DEPTH is non-zero" {
     // disable Form XObject recursion entirely.
     try std.testing.expect(MAX_XOBJECT_DEPTH >= 1);
 }
+
+// ----- clipStrokeToBox (Liang–Barsky, PR-1 round 7 [P2] regression) -----
+
+test "clipStrokeToBox axis-aligned horizontal stroke fully inside" {
+    const s = Stroke{ .x0 = 50, .y0 = 100, .x1 = 200, .y1 = 100 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 300, 300 }) orelse unreachable;
+    try std.testing.expectEqual(@as(f64, 50), r.x0);
+    try std.testing.expectEqual(@as(f64, 200), r.x1);
+}
+
+test "clipStrokeToBox axis-aligned horizontal stroke crossing right edge" {
+    const s = Stroke{ .x0 = 50, .y0 = 100, .x1 = 500, .y1 = 100 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 300, 300 }) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 50), r.x0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 300), r.x1, 1e-9);
+}
+
+test "clipStrokeToBox axis-aligned vertical stroke crossing both edges" {
+    const s = Stroke{ .x0 = 50, .y0 = -10, .x1 = 50, .y1 = 400 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 300, 300 }) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.y0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 300), r.y1, 1e-9);
+}
+
+test "clipStrokeToBox stroke fully outside box returns null" {
+    const s = Stroke{ .x0 = -50, .y0 = -50, .x1 = -10, .y1 = -10 };
+    try std.testing.expect(clipStrokeToBox(s, .{ 0, 0, 100, 100 }) == null);
+}
+
+test "clipStrokeToBox diagonal stroke crossing box clamps both endpoints" {
+    // Codex round-7 counterexample: form-space segment (0,0)→(100,100)
+    // clipped against /BBox [0,0,50,50] should yield (0,0)→(50,50).
+    const s = Stroke{ .x0 = 0, .y0 = 0, .x1 = 100, .y1 = 100 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 50, 50 }) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.x0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.y0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50), r.x1, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50), r.y1, 1e-9);
+}
+
+test "clipStrokeToBox diagonal stroke trimmed at near and far edges" {
+    // (-50, -50) → (150, 150) intersects [0,0,100,100] at (0,0) and (100,100).
+    const s = Stroke{ .x0 = -50, .y0 = -50, .x1 = 150, .y1 = 150 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 100, 100 }) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.x0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.y0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), r.x1, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), r.y1, 1e-9);
+}
+
+test "clipStrokeToBox diagonal stroke entirely outside (parallel-but-displaced)" {
+    // 45° line above the box.
+    const s = Stroke{ .x0 = 200, .y0 = 250, .x1 = 250, .y1 = 300 };
+    try std.testing.expect(clipStrokeToBox(s, .{ 0, 0, 100, 100 }) == null);
+}
+
+test "clipStrokeToBox horizontal-on-edge stroke survives" {
+    // Stroke runs ON the bottom edge — q[i] == 0 path.
+    const s = Stroke{ .x0 = 10, .y0 = 0, .x1 = 90, .y1 = 0 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 100, 100 }) orelse unreachable;
+    try std.testing.expectEqual(@as(f64, 10), r.x0);
+    try std.testing.expectEqual(@as(f64, 90), r.x1);
+}
+
+test "clipStrokeToBox NaN endpoint returns null" {
+    const s = Stroke{ .x0 = std.math.nan(f64), .y0 = 0, .x1 = 100, .y1 = 100 };
+    try std.testing.expect(clipStrokeToBox(s, .{ 0, 0, 100, 100 }) == null);
+}
+
+// ----- Mat.inverse (PR-1 round 6 [P2] regression) -----
+
+test "Mat.inverse on identity returns identity" {
+    const m = Mat{};
+    const inv = m.inverse() orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 1), inv.a, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), inv.b, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), inv.c, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), inv.d, 1e-12);
+}
+
+test "Mat.inverse round-trip on translation+rotation" {
+    // 90° CCW + translate (e=10, f=20).
+    const m = Mat{ .a = 0, .b = 1, .c = -1, .d = 0, .e = 10, .f = 20 };
+    const inv = m.inverse() orelse unreachable;
+    const p = m.apply(5, 7);
+    const back = inv.apply(p.x, p.y);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), back.x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 7), back.y, 1e-9);
+}
+
+test "Mat.inverse on singular matrix returns null" {
+    // Two columns linearly dependent → det = 0.
+    const m = Mat{ .a = 1, .b = 2, .c = 2, .d = 4, .e = 0, .f = 0 };
+    try std.testing.expect(m.inverse() == null);
+}
