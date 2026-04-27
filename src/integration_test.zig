@@ -1085,6 +1085,45 @@ test "lattice pass B resolves indirect Matrix and Resources refs" {
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
 
+// Codex review v1.2-rc4 round 4 [P2]: Form XObject /BBox clipping.
+// The form draws two identical 3x3 grids — one at y=400..700 inside
+// the form's declared /BBox [100, 400, 400, 700], and one at y=50..350
+// outside. Per PDF spec §8.10 only the inside grid is visible. Lattice
+// must drop the out-of-BBox strokes; otherwise both grids cluster into
+// detected tables.
+test "lattice pass B clips strokes to Form XObject /BBox" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectBBoxClippedPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // Count distinct 3x3 lattice tables on page 1. Without clipping
+    // we'd see two (one inside the BBox, one outside). With clipping
+    // we see only the inside one.
+    var matches: usize = 0;
+    var inside_bbox_match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3 and
+            t.engine == zpdf.tables.Engine.lattice)
+        {
+            matches += 1;
+            if (t.bbox) |bb| {
+                // The visible grid sits at [100, 400, 400, 700]. The
+                // hidden grid would sit at [100, 50, 400, 350].
+                if (bb[1] >= 350) inside_bbox_match_idx = i;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches);
+    try std.testing.expect(inside_bbox_match_idx != null);
+}
+
 // Cycle guard: a Form XObject that invokes itself via `Do` must not
 // hang or stack-overflow lattice. The first invocation collects the
 // outer rect (1 stroke set); the recursive Do is rejected by the

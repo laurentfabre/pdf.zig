@@ -422,7 +422,98 @@ fn handleDoOperator(
         .initial_ctm = effective_ctm,
         .visited = visited,
     };
+
+    // Codex review v1.2-rc4 round 4 [P2]: per PDF spec §8.10, a Form
+    // XObject's `/BBox` is a *mandatory* clip region — content drawn
+    // outside is invisible to the rasterizer. Lattice ignored this
+    // and counted out-of-BBox strokes, which could surface phantom
+    // tables that never render.
+    //
+    // Snapshot the stroke list length, run the recursion, then drop
+    // strokes that fall entirely outside the BBox transformed into
+    // user-space. Strokes crossing the boundary are kept (partial
+    // visibility still contributes to row/column clusters).
+    const snapshot = out.items.len;
     try collectStrokesWalk(allocator, form_content, child_ctx, visited, out);
+
+    if (try readBBox(xobj_resolved.dict, doc)) |bbox_form| {
+        const clip_user = transformBBox(bbox_form, effective_ctm);
+        var write: usize = snapshot;
+        var read: usize = snapshot;
+        while (read < out.items.len) : (read += 1) {
+            if (!strokeOutsideBox(out.items[read], clip_user)) {
+                if (write != read) out.items[write] = out.items[read];
+                write += 1;
+            }
+        }
+        out.shrinkRetainingCapacity(write);
+    }
+}
+
+/// Read a Form XObject's `/BBox` entry. Same indirect-ref + OOM
+/// discipline as `readMatrix`. Returns null when missing or malformed
+/// (treated as "no clip" — same as inline page content).
+fn readBBox(dict: parser.Object.Dict, doc: DocState) error{OutOfMemory}!?[4]f64 {
+    const obj = dict.get("BBox") orelse return null;
+    const arr = switch (obj) {
+        .array => |a| a,
+        .reference => |ref| blk: {
+            const resolved = (try resolveRefSoft(doc, ref)) orelse return null;
+            break :blk switch (resolved) {
+                .array => |a| a,
+                else => return null,
+            };
+        },
+        else => return null,
+    };
+    if (arr.len < 4) return null;
+    var v: [4]f64 = undefined;
+    for (0..4) |i| {
+        v[i] = switch (arr[i]) {
+            .real => |r| r,
+            .integer => |n| @floatFromInt(n),
+            else => return null,
+        };
+        if (!std.math.isFinite(v[i])) return null;
+    }
+    // Normalize to [x_min, y_min, x_max, y_max] — PDF spec doesn't
+    // require any particular corner ordering.
+    return [4]f64{
+        @min(v[0], v[2]),
+        @min(v[1], v[3]),
+        @max(v[0], v[2]),
+        @max(v[1], v[3]),
+    };
+}
+
+/// Transform a form-space bbox by the effective CTM into user-space.
+/// All four corners are mapped (CTM may rotate), then the AABB is
+/// returned. Conservative — a rotated form's true clip region is a
+/// tilted rectangle, but treating it as the AABB is sound (it only
+/// preserves *more* strokes than strictly needed, never drops a
+/// visible one).
+fn transformBBox(bb: [4]f64, ctm: Mat) [4]f64 {
+    const c0 = ctm.apply(bb[0], bb[1]);
+    const c1 = ctm.apply(bb[2], bb[1]);
+    const c2 = ctm.apply(bb[2], bb[3]);
+    const c3 = ctm.apply(bb[0], bb[3]);
+    return [4]f64{
+        @min(@min(c0.x, c1.x), @min(c2.x, c3.x)),
+        @min(@min(c0.y, c1.y), @min(c2.y, c3.y)),
+        @max(@max(c0.x, c1.x), @max(c2.x, c3.x)),
+        @max(@max(c0.y, c1.y), @max(c2.y, c3.y)),
+    };
+}
+
+/// True iff the stroke's AABB is fully outside the user-space clip box.
+/// Strokes crossing the boundary count as inside (kept).
+fn strokeOutsideBox(s: Stroke, box: [4]f64) bool {
+    const min_x = @min(s.x0, s.x1);
+    const max_x = @max(s.x0, s.x1);
+    const min_y = @min(s.y0, s.y1);
+    const max_y = @max(s.y0, s.y1);
+    return max_x < box[0] or min_x > box[2] or
+        max_y < box[1] or min_y > box[3];
 }
 
 /// Read a Form XObject's `/Matrix` entry into a `Mat`.
