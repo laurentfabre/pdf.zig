@@ -1363,6 +1363,102 @@ pub fn generateFormXObjectTablePdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Generate a PDF where the outer Form XObject sets `/Resources null`
+/// (a malformed but parseable shape — present-but-non-dict). Codex
+/// review v1.2-rc4 round 9 [P2]: when /Resources is present but
+/// invalid, lattice must NOT inherit from the parent — the form has
+/// declared its own resource scope, however broken.
+///
+/// Layout:
+///   1. Catalog
+///   2. Pages
+///   3. Page (XObject map exposes /OuterForm 5 0 R AND /InnerGrid 6 0 R)
+///   4. Page content (`/OuterForm Do`)
+///   5. OuterForm — /Resources null. Content invokes `/InnerGrid Do`.
+///      A buggy walker would inherit page Resources and find
+///      /InnerGrid 6 0 R there, drawing its 3x3 grid. The correct
+///      walker fails closed at the first nested Do.
+///   6. InnerGrid — draws a 3x3 grid in user-space [100, 400, 400, 700].
+///
+/// Expected: zero detected tables on page 1.
+pub fn generateFormXObjectMalformedResourcesPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /OuterForm 5 0 R /InnerGrid 6 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/OuterForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // OuterForm with malformed (null) /Resources. A correct walker
+    // must NOT inherit page-level /XObject -> /InnerGrid here.
+    const outer_content = "/InnerGrid Do\n";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources null " ++
+        "/Length {} >>\n",
+        .{outer_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(outer_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // InnerGrid draws a 3x3 grid. Reachable from page Resources but
+    // NOT from a malformed-Resources form.
+    const inner_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{inner_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(inner_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 7\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+
+    try writer.writeAll("trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
 /// Generate a PDF where the Form XObject's `/BBox` and `/Matrix` arrays
 /// contain INDIRECT element references — e.g. `/BBox [11 0 R 12 0 R
 /// 13 0 R 14 0 R]`. Per PDF spec §7.3.10, indirect references are legal

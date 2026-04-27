@@ -1085,6 +1085,35 @@ test "lattice pass B resolves indirect Matrix and Resources refs" {
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
 
+// Codex review v1.2-rc4 round 9 [P2]: a Form with a present-but-
+// malformed /Resources MUST NOT inherit from its parent. The fixture
+// gives the outer form `/Resources null` and lets the page expose
+// `/InnerGrid` at the page-level Resources. A buggy walker would
+// inherit the page Resources, find /InnerGrid, and draw its 3x3
+// grid; the correct walker fails closed at the first nested Do
+// inside the malformed-Resources form.
+test "lattice pass B fails closed on malformed Form /Resources" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectMalformedResourcesPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // Zero lattice tables expected: outer form's malformed /Resources
+    // prevents the nested /InnerGrid Do from resolving; the inner
+    // grid never gets drawn, no strokes collected.
+    var lattice_count: usize = 0;
+    for (detected) |t| {
+        if (t.engine == zpdf.tables.Engine.lattice) lattice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), lattice_count);
+}
+
 // Codex review v1.2-rc4 round 8 [P2]: indirect numeric elements in
 // /BBox and /Matrix arrays. Both arrays are expressed as `[N 0 R ...]`;
 // readBBox/readMatrix must resolve each element through resolveRefSoft.

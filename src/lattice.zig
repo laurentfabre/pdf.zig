@@ -410,24 +410,32 @@ fn handleDoOperator(
     const form_matrix = try readMatrix(xobj_resolved.dict, doc);
     const effective_ctm = form_matrix.mul(parent_ctm);
 
-    // Form Resources: inline dict, indirect ref, or absent (inherit
-    // from parent). Codex review v1.2-rc4 round 1 [P2]: the previous
-    // version used `getDict("Resources")` which silently returned null
-    // on the legal `.reference` shape, falling back to the *parent's*
-    // resources. Round 2 [P2]: also bubble OOM on the indirect-ref
-    // resolution path so allocator pressure surfaces.
-    const form_resources = blk: {
+    // Form Resources lookup, three-state result:
+    //   - Key ABSENT → inherit parent resources (PDF spec §8.10.1).
+    //   - Key PRESENT and resolves to a Dict → use that dict.
+    //   - Key PRESENT but null / non-dict / unresolved → fail closed:
+    //     the Form declared its own resources, so we MUST NOT inherit
+    //     from the parent. Set to null so nested `Do` bails at the
+    //     `ctx.resources orelse return;` guard rather than silently
+    //     resolving against an unrelated parent /XObject map.
+    //
+    // Codex review v1.2-rc4 round 9 [P2]: the previous version inherited
+    // parent resources on every non-Dict shape, allowing nested Do
+    // recursion to walk into objects the Form itself cannot legally
+    // access. Round 1/2 [P2] context: the .reference path needs
+    // resolveRefSoft to bubble OOM and handle indirect Resources.
+    const form_resources: ?parser.Object.Dict = blk: {
         const obj = xobj_resolved.dict.get("Resources") orelse break :blk resources;
         break :blk switch (obj) {
             .dict => |d| d,
             .reference => |ref| ref_blk: {
-                const resolved = (try resolveRefSoft(doc, ref)) orelse break :ref_blk resources;
+                const resolved = (try resolveRefSoft(doc, ref)) orelse break :ref_blk null;
                 break :ref_blk switch (resolved) {
                     .dict => |d| d,
-                    else => resources,
+                    else => null,
                 };
             },
-            else => resources,
+            else => null,
         };
     };
 
