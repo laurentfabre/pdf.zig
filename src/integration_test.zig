@@ -1109,13 +1109,40 @@ test "lattice pass B resolves indirect /Subtype on Form XObject" {
     try std.testing.expectEqual(@as(usize, 1), lattice_count);
 }
 
-// Codex review v1.2-rc4 round 9 [P2]: a Form with a present-but-
-// malformed /Resources MUST NOT inherit from its parent. The fixture
-// gives the outer form `/Resources null` and lets the page expose
-// `/InnerGrid` at the page-level Resources. A buggy walker would
-// inherit the page Resources, find /InnerGrid, and draw its 3x3
-// grid; the correct walker fails closed at the first nested Do
-// inside the malformed-Resources form.
+// Codex round 16 [P2]: per PDF 32000-1 §7.3.9, a `null` dictionary
+// value is equivalent to omitting the entry, so /Resources null on
+// a Form must inherit parent resources rather than fail closed.
+// The fixture sets /Resources null on the outer form and exposes
+// /InnerGrid via the page-level Resources. With spec-conform
+// inheritance, /InnerGrid resolves and produces a 3x3 lattice
+// table.
+test "lattice pass B treats Form /Resources null as inherited" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectNullResourcesPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var lattice_count: usize = 0;
+    for (detected) |t| {
+        if (t.engine == zpdf.tables.Engine.lattice and
+            t.n_rows == 3 and t.n_cols == 3) lattice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lattice_count);
+}
+
+// Round-9 [P2] + round-16 [P2]: a Form with a present-but-malformed
+// /Resources (NOT including .null, which is spec-equivalent to
+// absent) must NOT inherit from its parent. The fixture sets
+// /Resources to integer 42 and lets the page expose /InnerGrid at
+// the page-level Resources. A buggy walker would inherit page
+// Resources, find /InnerGrid, draw its 3x3 grid; the correct walker
+// fails closed at the first nested Do.
 test "lattice pass B fails closed on malformed Form /Resources" {
     const allocator = std.testing.allocator;
 

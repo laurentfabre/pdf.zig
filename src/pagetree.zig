@@ -413,6 +413,10 @@ fn walkPageTree(
     // allocator pressure to a silent fail-closed. Bubble OOM
     // explicitly through PageTreeError.OutOfMemory; only domain
     // resolution errors collapse to null.
+    // PDF 32000-1 §7.7.3.4 page attribute inheritance + §7.3.9
+    // null-equivalence: inherit parent when /Resources is ABSENT
+    // OR resolves to .null. Only present-and-non-null-and-non-dict
+    // values fail closed.
     var resources = inherited_resources;
     if (dict.get("Resources")) |res_obj| {
         const resolved: Object = switch (res_obj) {
@@ -426,7 +430,8 @@ fn walkPageTree(
         };
         resources = switch (resolved) {
             .dict => |d| d,
-            else => null, // present-but-invalid → fail closed
+            .null => inherited_resources, // §7.3.9: null ≡ absent → inherit
+            else => null, // present-and-non-null-and-non-dict → fail closed
         };
     }
 
