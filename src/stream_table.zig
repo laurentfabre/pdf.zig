@@ -21,8 +21,14 @@ const std = @import("std");
 const layout = @import("layout.zig");
 const tables = @import("tables.zig");
 
+const debug_log = false; // flip to true for Pass C decision tracing
 const ROW_Y_TOLERANCE_RATIO: f64 = 0.7;  // rows are within 0.7 × font size
-const COL_X_BIN_WIDTH: f64 = 5.0;        // 5 pt histogram bin width
+// 10 pt bin (≈ font size) so multi-token dish names whose first-span x
+// drifts a few pt across rows still cluster into the same column anchor.
+// 5 pt was too tight: "Soupe à l'oignon" → "Soupe"@x=10, "à"@x=15,
+// "l'oignon"@x=20 each landed in different bins, so the dish-name
+// column anchor never reached the 50%-of-rows threshold.
+const COL_X_BIN_WIDTH: f64 = 10.0;
 const MIN_ROWS: usize = 3;
 const MIN_COLS_PER_ROW: usize = 2;
 const MIN_TABLE_ROWS: u32 = 3;
@@ -55,6 +61,12 @@ pub fn extractFromSpans(
         allocator.free(rows);
     }
     if (rows.len < MIN_ROWS) return out.toOwnedSlice(allocator);
+
+    if (debug_log) {
+        std.debug.print("[stream_table p{d}] {d} rows, span counts: ", .{ page, rows.len });
+        for (rows) |r| std.debug.print("{d}/", .{r.spans.len});
+        std.debug.print("\n", .{});
+    }
 
     // Walk consecutive rows; section-header Y-gap split (Codex risk #3).
     // An unruled hotel menu often has multiple sub-tables separated by a
@@ -100,16 +112,7 @@ pub fn extractFromSpans(
             const conf = scoreConfidence(rows[i..j], peaks);
             const bbox = computeBbox(rows[i..j]);
 
-            var cells = try allocator.alloc(tables.Cell, @as(usize, n_rows) * @as(usize, n_cols));
-            var idx: usize = 0;
-            var r: u32 = 0;
-            while (r < n_rows) : (r += 1) {
-                var c: u32 = 0;
-                while (c < n_cols) : (c += 1) {
-                    cells[idx] = .{ .r = r, .c = c, .rowspan = 1, .colspan = 1, .is_header = false };
-                    idx += 1;
-                }
-            }
+            const cells = try buildCellsWithText(allocator, rows[i..j], peaks, bbox);
             try out.append(allocator, .{
                 .page = page,
                 .id = table_id,
@@ -127,6 +130,70 @@ pub fn extractFromSpans(
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Build the (n_rows × n_cols) cell grid for a Pass-C run, assigning each
+/// span's text to the cell whose bbox covers the span's left edge. Cell
+/// bboxes are derived from the row's Y midline ± font_size and from the
+/// column-anchor x positions (with the rightmost column extending to the
+/// run's right edge).
+///
+/// Cell text is the space-joined concatenation of each span.text whose
+/// (x0, y0) lands inside the cell's bbox. Empty cells get text = null.
+fn buildCellsWithText(
+    allocator: std.mem.Allocator,
+    run: []const Row,
+    peaks: []const f64,
+    bbox: [4]f64,
+) ![]tables.Cell {
+    const n_rows: u32 = @intCast(run.len);
+    const n_cols: u32 = @intCast(peaks.len);
+    var cells = try allocator.alloc(tables.Cell, @as(usize, n_rows) * @as(usize, n_cols));
+    errdefer allocator.free(cells);
+
+    // Per-cell text accumulators (owned by each cell on success).
+    const total = @as(usize, n_rows) * @as(usize, n_cols);
+    var bufs = try allocator.alloc(std.ArrayList(u8), total);
+    defer allocator.free(bufs);
+    for (bufs) |*b| b.* = .empty;
+    errdefer for (bufs) |*b| b.deinit(allocator);
+
+    // Assign spans to (r, c).
+    for (run, 0..) |row, r_idx| {
+        for (row.spans) |span| {
+            if (!std.math.isFinite(span.x0)) continue;
+            const c_idx = anchorIndex(peaks, span.x0);
+            const idx = r_idx * peaks.len + c_idx;
+            if (bufs[idx].items.len > 0) try bufs[idx].append(allocator, ' ');
+            try bufs[idx].appendSlice(allocator, span.text);
+        }
+    }
+
+    // Materialise cells.
+    var idx: usize = 0;
+    var r: u32 = 0;
+    while (r < n_rows) : (r += 1) {
+        var c: u32 = 0;
+        while (c < n_cols) : (c += 1) {
+            const text = if (bufs[idx].items.len > 0) try bufs[idx].toOwnedSlice(allocator) else null;
+            // ArrayList already drained on toOwnedSlice; if empty, deinit it now.
+            if (text == null) bufs[idx].deinit(allocator);
+            cells[idx] = .{ .r = r, .c = c, .rowspan = 1, .colspan = 1, .is_header = false, .text = text };
+            idx += 1;
+        }
+    }
+    _ = bbox; // bbox parameter retained for future per-cell bbox emission
+
+    return cells;
+}
+
+/// Pick the column index whose anchor is the largest peak ≤ span_x.
+fn anchorIndex(peaks: []const f64, span_x: f64) usize {
+    var idx: usize = 0;
+    for (peaks, 0..) |p, k| {
+        if (span_x + 0.001 >= p) idx = k else break;
+    }
+    return idx;
 }
 
 /// Bounding box covering every span in a run of rows.

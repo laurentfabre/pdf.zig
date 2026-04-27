@@ -27,6 +27,15 @@ pub const Cell = struct {
     rowspan: u32 = 1,
     colspan: u32 = 1,
     is_header: bool = false,
+    /// Cell text content. Populated by Pass C (and Pass A once MCID-to-bbox
+    /// lookup lands); Pass B leaves it null until Pass-B-text is added.
+    /// Owned by the table's allocator; freed by `freeTables`.
+    text: ?[]const u8 = null,
+};
+
+pub const ContinuationLink = struct {
+    page: u32,
+    table_id: u32,
 };
 
 pub const Table = struct {
@@ -44,11 +53,47 @@ pub const Table = struct {
     /// Bounding box in user-space PDF points: [x0, y0, x1, y1].
     /// Origin is bottom-left. Optional — Pass A doesn't compute it yet.
     bbox: ?[4]f64 = null,
+    /// Multi-page continuation links. Set by `linkContinuations` after
+    /// Passes A/B/C dispatch. `continued_from` points at the previous
+    /// page's last-table-of-the-chain; `continued_to` points at the
+    /// next page's first-table-of-the-chain.
+    continued_from: ?ContinuationLink = null,
+    continued_to: ?ContinuationLink = null,
 };
+
+/// Walk a page-sorted table list and link consecutive tables that
+/// look like continuations of each other. Heuristic for v1.2-rc3:
+/// next table is the first on its page (id == 0), prev table is the
+/// last on the previous page, and their column counts match within
+/// ±1. Refinements (column-anchor proximity, near-bottom-of-page /
+/// near-top-of-page geometry) land in v1.2-rc4 once page-height
+/// context is threaded through.
+pub fn linkContinuations(list: []Table) void {
+    if (list.len < 2) return;
+    // Find the LAST table on each page.
+    var i: usize = 0;
+    while (i + 1 < list.len) : (i += 1) {
+        const a = &list[i];
+        const b = &list[i + 1];
+        if (a.page == 0 or b.page == 0) continue;
+        if (b.page != a.page + 1) continue;
+        if (b.id != 0) continue; // next must be the first on its page
+        // Check that `a` is the last table on its page.
+        if (i + 2 < list.len and list[i + 2].page == a.page) continue;
+        // Column-count match (±1).
+        const dcol: i64 = @as(i64, @intCast(a.n_cols)) - @as(i64, @intCast(b.n_cols));
+        if (dcol < -1 or dcol > 1) continue;
+        a.continued_to = .{ .page = b.page, .table_id = b.id };
+        b.continued_from = .{ .page = a.page, .table_id = a.id };
+    }
+}
 
 /// Free a slice returned by `extractDocumentTables`.
 pub fn freeTables(allocator: std.mem.Allocator, tables: []Table) void {
-    for (tables) |t| allocator.free(t.cells);
+    for (tables) |t| {
+        for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+        allocator.free(t.cells);
+    }
     allocator.free(tables);
 }
 

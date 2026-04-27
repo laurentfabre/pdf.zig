@@ -110,6 +110,12 @@ pub const TableCell = struct {
     rowspan: u32 = 1,
     colspan: u32 = 1,
     is_header: bool = false,
+    text: ?[]const u8 = null,
+};
+
+pub const TableContinuationLink = struct {
+    page: u32,
+    table_id: u32,
 };
 
 pub const TableRecord = struct {
@@ -125,6 +131,10 @@ pub const TableRecord = struct {
     confidence: f32,
     /// Optional [x0, y0, x1, y1] in PDF user-space (bottom-left origin).
     bbox: ?[4]f64 = null,
+    /// Multi-page continuation links — null when this table doesn't
+    /// continue across pages.
+    continued_from: ?TableContinuationLink = null,
+    continued_to: ?TableContinuationLink = null,
 };
 
 pub const DocumentInfo = struct {
@@ -299,13 +309,30 @@ pub const Envelope = struct {
                 .{ b[0], b[1], b[2], b[3] },
             );
         }
+        if (t.continued_from) |link| {
+            try self.writer.print(
+                ",\"continued_from\":{{\"page\":{d},\"table_id\":{d}}}",
+                .{ link.page, link.table_id },
+            );
+        }
+        if (t.continued_to) |link| {
+            try self.writer.print(
+                ",\"continued_to\":{{\"page\":{d},\"table_id\":{d}}}",
+                .{ link.page, link.table_id },
+            );
+        }
         try self.writer.writeAll(",\"cells\":[");
         for (t.cells, 0..) |cell, i| {
             if (i > 0) try self.writer.writeAll(",");
             try self.writer.print(
-                "{{\"r\":{d},\"c\":{d},\"rowspan\":{d},\"colspan\":{d},\"is_header\":{}}}",
+                "{{\"r\":{d},\"c\":{d},\"rowspan\":{d},\"colspan\":{d},\"is_header\":{}",
                 .{ cell.r, cell.c, cell.rowspan, cell.colspan, cell.is_header },
             );
+            if (cell.text) |txt| {
+                try self.writer.writeAll(",\"text\":");
+                try writeJsonString(self.writer, txt);
+            }
+            try self.writer.writeAll("}");
         }
         try self.writer.writeAll("]");
         try self.endRecord();
@@ -614,6 +641,28 @@ test "chunk record emits pages array + tokens_est + break" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\"pages\":[0,1,2]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"tokens_est\":12") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"break\":\"section_heading\"") != null);
+}
+
+test "table cell with text is emitted with `text` field" {
+    var buf: [2048]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "menu.pdf", FIXED_DOC_ID);
+    try env.emitTable(.{
+        .page = 2,
+        .table_id = 0,
+        .n_rows = 1,
+        .n_cols = 2,
+        .header_rows = 0,
+        .engine = .stream,
+        .confidence = 0.8,
+        .cells = &.{
+            .{ .r = 0, .c = 0, .text = "Soupe à l'oignon" },
+            .{ .r = 0, .c = 1, .text = "20" },
+        },
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"text\":\"Soupe à l'oignon\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"text\":\"20\"") != null);
 }
 
 test "table record emits page + engine + cell grid + confidence" {

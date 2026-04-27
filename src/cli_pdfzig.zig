@@ -295,6 +295,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                             .rowspan = c.rowspan,
                             .colspan = c.colspan,
                             .is_header = c.is_header,
+                            .text = c.text,
                         });
                     }
                     try env.emitTable(.{
@@ -311,6 +312,8 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                         },
                         .confidence = t.confidence,
                         .bbox = t.bbox,
+                        .continued_from = if (t.continued_from) |l| .{ .page = l.page, .table_id = l.table_id } else null,
+                        .continued_to = if (t.continued_to) |l| .{ .page = l.page, .table_id = l.table_id } else null,
                     });
                 }
             } else |_| {}

@@ -1092,7 +1092,17 @@ pub const Document = struct {
             allocator.free(pass_c);
         }
 
-        return combined.toOwnedSlice(allocator);
+        const result = try combined.toOwnedSlice(allocator);
+        // Pass-D continuation linking on the page-sorted list. Sort by
+        // (page, id) then emit continued_from/continued_to refs in place.
+        std.mem.sort(tables.Table, result, {}, struct {
+            fn lt(_: void, a: tables.Table, b: tables.Table) bool {
+                if (a.page != b.page) return a.page < b.page;
+                return a.id < b.id;
+            }
+        }.lt);
+        tables.linkContinuations(result);
+        return result;
     }
 
     /// Pass D conflict heuristic — Codex review v1.2-rc1 [P1] fix:
