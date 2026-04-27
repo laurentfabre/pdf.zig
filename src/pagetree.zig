@@ -110,13 +110,24 @@ fn resolveCompressedObject(
         else => return Object{ .null = {} },
     };
 
-    // Decompress stream (arena-allocated, no need to free)
+    // Decompress stream (arena-allocated, no need to free).
+    // Codex review v1.2-rc4 round 13 [P2]: ObjStm /Filter and
+    // /DecodeParms can also be indirect refs or arrays-with-indirect-
+    // members. Apply the same normalization as `getStreamData` so a
+    // legal `/Filter [12 0 R]` here doesn't silently desync the
+    // object-stream header parse and make a Form XObject (or any
+    // other indirect-ref target stored inside that ObjStm)
+    // invisible to lattice.
     const decompress = @import("decompress.zig");
+    const raw_filter = try resolveDictEntry(allocator, data, xref, stream.dict.get("Filter"), resolved_cache);
+    const raw_params = try resolveDictEntry(allocator, data, xref, stream.dict.get("DecodeParms"), resolved_cache);
+    const obj_filter = try normalizeFilterChain(allocator, allocator, data, xref, raw_filter, resolved_cache);
+    const obj_params = try normalizeFilterChain(allocator, allocator, data, xref, raw_params, resolved_cache);
     const decoded = decompress.decompressStream(
         allocator,
         stream.data,
-        stream.dict.get("Filter"),
-        stream.dict.get("DecodeParms"),
+        obj_filter,
+        obj_params,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return Object{ .null = {} };
@@ -181,25 +192,30 @@ fn resolveCompressedObject(
 }
 
 /// Resolve one level of indirect reference. Returns the input
-/// unchanged when not a `.reference`, or the resolved object on
-/// success, or null on resolution failure (kept silent so the caller
-/// can fall through to a soft default).
+/// unchanged when not a `.reference`, the resolved object on
+/// success, or null on domain resolution failure (kept silent so
+/// the caller can fall through to a soft default). Bubbles
+/// `error.OutOfMemory`.
 ///
 /// Codex review v1.2-rc4 round 12 [P2]: page-level `/Contents`
 /// stream `/Filter` and `/DecodeParms` need the same indirect-ref
-/// hygiene as the lattice Form XObject path. This and
-/// `normalizeFilterChain` mirror lattice's helpers but live here so
-/// pagetree is self-sufficient.
+/// hygiene as the lattice Form XObject path.
+/// Round 13 [P2]: bubble OOM here — the round-5/12 contract is
+/// "OOM surfaces, domain errors soft-fail" and the original
+/// `catch return null` masked OOM.
 fn resolveDictEntry(
     parse_allocator: std.mem.Allocator,
     data: []const u8,
     xref: *const XRefTable,
     obj_opt: ?Object,
     cache: *std.AutoHashMap(u32, Object),
-) ?Object {
+) error{OutOfMemory}!?Object {
     const obj = obj_opt orelse return null;
     return switch (obj) {
-        .reference => |ref| resolveRef(parse_allocator, data, xref, ref, cache) catch return null,
+        .reference => |ref| resolveRef(parse_allocator, data, xref, ref, cache) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return null;
+        },
         else => obj,
     };
 }
@@ -207,8 +223,9 @@ fn resolveDictEntry(
 /// Walk a `/Filter` or `/DecodeParms` Object and resolve any
 /// `.reference` array members. Allocates a fresh array on
 /// `scratch_allocator` only when at least one member needs
-/// resolving; direct-only arrays pass through unchanged. Bubbles
-/// `error.OutOfMemory`.
+/// resolving; direct-only arrays pass through unchanged.
+/// Bubbles `error.OutOfMemory` from both the allocation and
+/// every per-element resolveRef (round 13 [P2]).
 fn normalizeFilterChain(
     scratch_allocator: std.mem.Allocator,
     parse_allocator: std.mem.Allocator,
@@ -216,7 +233,7 @@ fn normalizeFilterChain(
     xref: *const XRefTable,
     obj_opt: ?Object,
     cache: *std.AutoHashMap(u32, Object),
-) !?Object {
+) error{OutOfMemory}!?Object {
     const obj = obj_opt orelse return null;
     return switch (obj) {
         .array => |arr| blk: {
@@ -230,7 +247,13 @@ fn normalizeFilterChain(
             const out = try scratch_allocator.alloc(Object, arr.len);
             for (arr, 0..) |el, i| {
                 out[i] = switch (el) {
-                    .reference => |ref| resolveRef(parse_allocator, data, xref, ref, cache) catch Object{ .null = {} },
+                    .reference => |ref| ref_blk: {
+                        const resolved = resolveRef(parse_allocator, data, xref, ref, cache) catch |err| {
+                            if (err == error.OutOfMemory) return error.OutOfMemory;
+                            break :ref_blk Object{ .null = {} };
+                        };
+                        break :ref_blk resolved;
+                    },
                     else => el,
                 };
             }
@@ -437,8 +460,8 @@ fn getStreamData(
             // `/Filter [12 0 R]` would silently collapse the chain to
             // "no filters" and a Pass B caller would scan compressed
             // bytes as content.
-            const raw_filter = resolveDictEntry(parse_allocator, data, xref, s.dict.get("Filter"), cache);
-            const raw_params = resolveDictEntry(parse_allocator, data, xref, s.dict.get("DecodeParms"), cache);
+            const raw_filter = try resolveDictEntry(parse_allocator, data, xref, s.dict.get("Filter"), cache);
+            const raw_params = try resolveDictEntry(parse_allocator, data, xref, s.dict.get("DecodeParms"), cache);
             const filter = try normalizeFilterChain(scratch_allocator, parse_allocator, data, xref, raw_filter, cache);
             const params = try normalizeFilterChain(scratch_allocator, parse_allocator, data, xref, raw_params, cache);
             return decompress.decompressStream(
