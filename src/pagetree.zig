@@ -328,11 +328,17 @@ fn normalizeDecodeParms(
             for (arr, 0..) |el, i| {
                 out[i] = switch (el) {
                     .reference => |ref| ref_blk: {
+                        // Round 19 [P2]: when an array member resolves
+                        // to a dict, normalize THAT dict's entries too
+                        // so inner /Predictor N 0 R etc. don't survive.
                         const resolved = resolveRef(parse_allocator, data, xref, ref, cache) catch |err| {
                             if (err == error.OutOfMemory) return error.OutOfMemory;
                             break :ref_blk Object{ .null = {} };
                         };
-                        break :ref_blk resolved;
+                        break :ref_blk switch (resolved) {
+                            .dict => |d| try normalizeParamsDict(d, scratch_allocator, parse_allocator, data, xref, cache),
+                            else => resolved,
+                        };
                     },
                     .dict => |d| try normalizeParamsDict(d, scratch_allocator, parse_allocator, data, xref, cache),
                     else => el,

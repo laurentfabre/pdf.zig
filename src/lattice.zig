@@ -696,7 +696,16 @@ fn normalizeDecodeParms(obj: ?parser.Object, doc: DocState) error{OutOfMemory}!?
             const out = doc.scratch_allocator.alloc(parser.Object, arr.len) catch return error.OutOfMemory;
             for (arr, 0..) |el, i| {
                 out[i] = switch (el) {
-                    .reference => |ref| (try resolveRefSoft(doc, ref)) orelse parser.Object{ .null = {} },
+                    .reference => |ref| ref_blk: {
+                        // Round 19 [P2]: when an array member resolves
+                        // to a dict, normalize THAT dict's entries too
+                        // so inner /Predictor N 0 R etc. don't survive.
+                        const resolved = (try resolveRefSoft(doc, ref)) orelse break :ref_blk parser.Object{ .null = {} };
+                        break :ref_blk switch (resolved) {
+                            .dict => |d| try normalizeParamsDict(d, doc),
+                            else => resolved,
+                        };
+                    },
                     .dict => |d| try normalizeParamsDict(d, doc),
                     else => el,
                 };
