@@ -441,8 +441,8 @@ fn handleDoOperator(
         var write: usize = snapshot;
         var read: usize = snapshot;
         while (read < out.items.len) : (read += 1) {
-            if (!strokeOutsideBox(out.items[read], clip_user)) {
-                if (write != read) out.items[write] = out.items[read];
+            if (clipStrokeToBox(out.items[read], clip_user)) |clipped| {
+                out.items[write] = clipped;
                 write += 1;
             }
         }
@@ -506,7 +506,6 @@ fn transformBBox(bb: [4]f64, ctm: Mat) [4]f64 {
 }
 
 /// True iff the stroke's AABB is fully outside the user-space clip box.
-/// Strokes crossing the boundary count as inside (kept).
 fn strokeOutsideBox(s: Stroke, box: [4]f64) bool {
     const min_x = @min(s.x0, s.x1);
     const max_x = @max(s.x0, s.x1);
@@ -514,6 +513,48 @@ fn strokeOutsideBox(s: Stroke, box: [4]f64) bool {
     const max_y = @max(s.y0, s.y1);
     return max_x < box[0] or min_x > box[2] or
         max_y < box[1] or min_y > box[3];
+}
+
+/// Clip an axis-aligned (horizontal or vertical) stroke to the
+/// user-space clip box. Returns null if the stroke is fully outside
+/// the box. Boundary-crossing strokes are clamped to the visible
+/// portion so downstream cluster + bbox computations don't see the
+/// invisible tail.
+///
+/// Codex review v1.2-rc4 round 5 [P2]: the previous fully-outside
+/// AABB filter kept boundary-crossing strokes at full length, which
+/// could widen the detected table bbox or count an offscreen
+/// separator as a row/column. Now we actively clamp.
+///
+/// Non-axis-aligned strokes never appear in `out` (collectStrokesWalk
+/// only appends segments whose `isHorizontal()` or `isVertical()`
+/// holds), so the fall-through is defensive: we keep them unchanged
+/// rather than guessing at a clip line.
+fn clipStrokeToBox(s: Stroke, box: [4]f64) ?Stroke {
+    if (strokeOutsideBox(s, box)) return null;
+    if (s.isHorizontal()) {
+        const lo_x = @min(s.x0, s.x1);
+        const hi_x = @max(s.x0, s.x1);
+        const new_lo = @max(lo_x, box[0]);
+        const new_hi = @min(hi_x, box[2]);
+        if (new_hi <= new_lo) return null;
+        return Stroke{
+            .x0 = new_lo, .y0 = s.y0,
+            .x1 = new_hi, .y1 = s.y1,
+        };
+    }
+    if (s.isVertical()) {
+        const lo_y = @min(s.y0, s.y1);
+        const hi_y = @max(s.y0, s.y1);
+        const new_lo = @max(lo_y, box[1]);
+        const new_hi = @min(hi_y, box[3]);
+        if (new_hi <= new_lo) return null;
+        return Stroke{
+            .x0 = s.x0, .y0 = new_lo,
+            .x1 = s.x1, .y1 = new_hi,
+        };
+    }
+    return s;
 }
 
 /// Read a Form XObject's `/Matrix` entry into a `Mat`.

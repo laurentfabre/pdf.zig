@@ -1063,7 +1063,16 @@ pub const Document = struct {
             defer scratch_arena.deinit();
             const scratch = scratch_arena.allocator();
 
-            const content = pagetree.getPageContents(arena, scratch, self.data, &self.xref_table, self.pages.items[page_idx], &self.object_cache) catch &[_]u8{};
+            // Codex review v1.2-rc4 round 5 [P2]: each Pass B step now
+            // bubbles error.OutOfMemory so the public getTables
+            // boundary surfaces allocator pressure instead of silently
+            // returning "no tables on this page". Domain errors still
+            // soft-fail, matching the helper-level policy in lattice
+            // and pagetree.
+            const content = pagetree.getPageContents(arena, scratch, self.data, &self.xref_table, self.pages.items[page_idx], &self.object_cache) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                break :blk &[_]u8{};
+            };
             const lattice_ctx = lattice.CollectContext{
                 .resources = self.pages.items[page_idx].resources,
                 .doc = .{
@@ -1074,8 +1083,14 @@ pub const Document = struct {
                     .object_cache = &self.object_cache,
                 },
             };
-            const strokes = lattice.collectStrokesIn(scratch, content, lattice_ctx) catch &[_]lattice.Stroke{};
-            const pass_b = lattice.extractFromStrokes(allocator, strokes, @intCast(page_idx + 1)) catch &[_]tables.Table{};
+            const strokes = lattice.collectStrokesIn(scratch, content, lattice_ctx) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                break :blk &[_]lattice.Stroke{};
+            };
+            const pass_b = lattice.extractFromStrokes(allocator, strokes, @intCast(page_idx + 1)) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                break :blk &[_]tables.Table{};
+            };
             for (pass_b) |t| {
                 if (!conflictsExisting(combined.items, t)) {
                     try combined.append(allocator, t);

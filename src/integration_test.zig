@@ -1085,12 +1085,12 @@ test "lattice pass B resolves indirect Matrix and Resources refs" {
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
 
-// Codex review v1.2-rc4 round 4 [P2]: Form XObject /BBox clipping.
-// The form draws two identical 3x3 grids — one at y=400..700 inside
-// the form's declared /BBox [100, 400, 400, 700], and one at y=50..350
-// outside. Per PDF spec §8.10 only the inside grid is visible. Lattice
-// must drop the out-of-BBox strokes; otherwise both grids cluster into
-// detected tables.
+// Codex review v1.2-rc4 [P2] /BBox clipping (round 4 + round 5).
+// The form draws an oversized inside grid that extends past the BBox
+// right edge AND a separate fully-outside grid. Lattice must:
+//   round-4: drop fully-outside strokes (the y=50..350 grid)
+//   round-5: clamp boundary-crossing strokes so the detected table's
+//            bbox doesn't extend past the BBox edge at x=400
 test "lattice pass B clips strokes to Form XObject /BBox" {
     const allocator = std.testing.allocator;
 
@@ -1103,25 +1103,31 @@ test "lattice pass B clips strokes to Form XObject /BBox" {
     const detected = try doc.getTables(allocator);
     defer zpdf.tables.freeTables(allocator, detected);
 
-    // Count distinct 3x3 lattice tables on page 1. Without clipping
-    // we'd see two (one inside the BBox, one outside). With clipping
-    // we see only the inside one.
-    var matches: usize = 0;
-    var inside_bbox_match_idx: ?usize = null;
+    // Exactly one 3x3 lattice table on page 1: the inside grid clamped
+    // to the BBox. Without round-4 clipping we'd see 2 tables; without
+    // round-5 partial clipping the surviving table's bbox would have
+    // x1 ≈ 700 instead of ≈ 400.
+    var lattice_matches: usize = 0;
+    var match_idx: ?usize = null;
     for (detected, 0..) |t, i| {
         if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3 and
             t.engine == zpdf.tables.Engine.lattice)
         {
-            matches += 1;
-            if (t.bbox) |bb| {
-                // The visible grid sits at [100, 400, 400, 700]. The
-                // hidden grid would sit at [100, 50, 400, 350].
-                if (bb[1] >= 350) inside_bbox_match_idx = i;
-            }
+            lattice_matches += 1;
+            match_idx = i;
         }
     }
-    try std.testing.expectEqual(@as(usize, 1), matches);
-    try std.testing.expect(inside_bbox_match_idx != null);
+    try std.testing.expectEqual(@as(usize, 1), lattice_matches);
+
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    // Inside-BBox region: y must be >= 400 (no leak from outside grid).
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+    // Round-5: boundary strokes clamped to BBox right edge ≈ 400.
+    // Without per-stroke clipping the bbox would be ≈ 700.
+    try std.testing.expect(bb[2] <= 405.0);
 }
 
 // Cycle guard: a Form XObject that invokes itself via `Do` must not

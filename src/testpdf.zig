@@ -1363,15 +1363,21 @@ pub fn generateFormXObjectTablePdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
-/// Generate a PDF where the Form XObject's content draws TWO 3x3 grids:
-/// one INSIDE the form's declared `/BBox` and one OUTSIDE. Per PDF
-/// spec §8.10 the BBox is a clip region — only the inside grid should
-/// surface as a detected table.
+/// Generate a PDF whose Form XObject draws a 3x3 ruled grid that
+/// extends WAY past its declared `/BBox`, plus a separate fully-out-of-
+/// BBox grid. Tests two clipping behaviours:
 ///
-/// BBox is [100, 400, 400, 700] (300x300 region). The inside grid
-/// occupies that exact rectangle. The outside grid is drawn at
-/// [100, 50, 400, 350] — same shape, lower y. Lattice's BBox-clipping
-/// must drop the outside grid's strokes.
+/// 1. The fully-outside grid (y=50..350) must be DROPPED entirely.
+/// 2. The boundary-crossing strokes of the inside grid must be CLAMPED
+///    to the BBox so the detected table's bbox doesn't extend past the
+///    visible region.
+///
+/// Inside grid: outer rect at [100, 400, 700, 700] — 600pt wide, but
+/// the BBox is only [100, 400, 400, 700]. Without per-stroke clipping
+/// the detected bbox would have x1 ≈ 700; with proper clipping it
+/// must be ≤ ~402 (BBox right edge + tolerance).
+///
+/// Outside grid: a separate 3x3 at y=50..350 — must produce 0 tables.
 pub fn generateFormXObjectBBoxClippedPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
@@ -1398,11 +1404,21 @@ pub fn generateFormXObjectBBoxClippedPdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll(page_content);
     try writer.writeAll("\nendstream\nendobj\n");
 
-    // Two 3x3 grids: visible at y=400..700, hidden at y=50..350.
+    // Inside grid: clean 300x300 outer rect at the BBox extent
+    // [100,400,400,700]. The two interior horizontal separators are
+    // drawn OVERSIZED — from x=100 to x=700, way past the BBox right
+    // edge. Round-5 clipping must clamp them to x=400 so the table's
+    // detected bbox doesn't extend past the visible region.
+    //
+    // Two interior verticals at x=200, x=300. The result post-clip is
+    // a 3x3 grid bounded at [100, 400, 400, 700].
+    //
+    // Outside grid: separate 3x3 at y=50..350, entirely below the
+    // BBox bottom. Round-4 clipping must drop it whole.
     const form_content =
         \\100 400 300 300 re S
-        \\100 500 m 400 500 l S
-        \\100 600 m 400 600 l S
+        \\100 500 m 700 500 l S
+        \\100 600 m 700 600 l S
         \\200 400 m 200 700 l S
         \\300 400 m 300 700 l S
         \\100 50 300 300 re S
