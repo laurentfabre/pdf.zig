@@ -1085,6 +1085,30 @@ test "lattice pass B resolves indirect Matrix and Resources refs" {
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
 
+// Codex review v1.2-rc4 round 10 [P2]: indirect /Subtype on a Form
+// XObject. Lattice must resolve `/Subtype N 0 R` before checking for
+// "Form"; otherwise the form is silently rejected and zero strokes
+// land in the table list.
+test "lattice pass B resolves indirect /Subtype on Form XObject" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectIndirectSubtypePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var lattice_count: usize = 0;
+    for (detected) |t| {
+        if (t.engine == zpdf.tables.Engine.lattice and
+            t.n_rows == 3 and t.n_cols == 3) lattice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lattice_count);
+}
+
 // Codex review v1.2-rc4 round 9 [P2]: a Form with a present-but-
 // malformed /Resources MUST NOT inherit from its parent. The fixture
 // gives the outer form `/Resources null` and lets the page expose

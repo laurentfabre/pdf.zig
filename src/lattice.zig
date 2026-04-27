@@ -395,12 +395,22 @@ fn handleDoOperator(
     };
 
     // Form XObjects only — Image / PS XObjects don't contribute strokes.
-    const subtype = xobj_resolved.dict.getName("Subtype") orelse return;
+    // Codex review v1.2-rc4 round 10 [P2]: /Subtype, /Filter, and
+    // /DecodeParms can each be stored as an indirect reference per
+    // PDF spec §7.3.10. Resolve them through resolveRefSoft (single
+    // level) before consuming so a Form with `/Subtype 99 0 R` is
+    // still recognized and a stream with `/Filter 99 0 R` is still
+    // decoded.
+    const subtype_obj = (try dictGetResolvedSoft(xobj_resolved.dict, "Subtype", doc)) orelse return;
+    const subtype = switch (subtype_obj) {
+        .name => |n| n,
+        else => return,
+    };
     if (!std.mem.eql(u8, subtype, "Form")) return;
 
     // Decompress the Form content stream into scratch memory.
-    const filter = xobj_resolved.dict.get("Filter");
-    const params = xobj_resolved.dict.get("DecodeParms");
+    const filter = try dictGetResolvedSoft(xobj_resolved.dict, "Filter", doc);
+    const params = try dictGetResolvedSoft(xobj_resolved.dict, "DecodeParms", doc);
     const form_content = (try decompressStreamSoft(doc, xobj_resolved.data, filter, params)) orelse return;
     defer doc.scratch_allocator.free(form_content);
 
@@ -541,6 +551,19 @@ fn clipStrokeInFormSpace(
     return Stroke{
         .x0 = a_back.x, .y0 = a_back.y,
         .x1 = b_back.x, .y1 = b_back.y,
+    };
+}
+
+/// Look up `key` in `dict`, following one level of indirect reference.
+/// Returns null when the key is absent or the indirect target can't be
+/// resolved. Codex review v1.2-rc4 round 10 [P2]: PDF dictionary
+/// values like `/Subtype`, `/Filter`, `/DecodeParms` can legally be
+/// indirect refs; this helper unifies the resolution policy.
+fn dictGetResolvedSoft(dict: parser.Object.Dict, key: []const u8, doc: DocState) error{OutOfMemory}!?parser.Object {
+    const obj = dict.get(key) orelse return null;
+    return switch (obj) {
+        .reference => |ref| try resolveRefSoft(doc, ref),
+        else => obj,
     };
 }
 
