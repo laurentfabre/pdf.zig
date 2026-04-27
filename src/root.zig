@@ -1064,7 +1064,17 @@ pub const Document = struct {
             const scratch = scratch_arena.allocator();
 
             const content = pagetree.getPageContents(arena, scratch, self.data, &self.xref_table, self.pages.items[page_idx], &self.object_cache) catch &[_]u8{};
-            const strokes = lattice.collectStrokes(scratch, content) catch &[_]lattice.Stroke{};
+            const lattice_ctx = lattice.CollectContext{
+                .resources = self.pages.items[page_idx].resources,
+                .doc = .{
+                    .parse_allocator = arena,
+                    .scratch_allocator = scratch,
+                    .data = self.data,
+                    .xref_table = &self.xref_table,
+                    .object_cache = &self.object_cache,
+                },
+            };
+            const strokes = lattice.collectStrokesIn(scratch, content, lattice_ctx) catch &[_]lattice.Stroke{};
             const pass_b = lattice.extractFromStrokes(allocator, strokes, @intCast(page_idx + 1)) catch &[_]tables.Table{};
             for (pass_b) |t| {
                 if (!conflictsExisting(combined.items, t)) {
