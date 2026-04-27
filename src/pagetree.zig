@@ -180,6 +180,66 @@ fn resolveCompressedObject(
     return result;
 }
 
+/// Resolve one level of indirect reference. Returns the input
+/// unchanged when not a `.reference`, or the resolved object on
+/// success, or null on resolution failure (kept silent so the caller
+/// can fall through to a soft default).
+///
+/// Codex review v1.2-rc4 round 12 [P2]: page-level `/Contents`
+/// stream `/Filter` and `/DecodeParms` need the same indirect-ref
+/// hygiene as the lattice Form XObject path. This and
+/// `normalizeFilterChain` mirror lattice's helpers but live here so
+/// pagetree is self-sufficient.
+fn resolveDictEntry(
+    parse_allocator: std.mem.Allocator,
+    data: []const u8,
+    xref: *const XRefTable,
+    obj_opt: ?Object,
+    cache: *std.AutoHashMap(u32, Object),
+) ?Object {
+    const obj = obj_opt orelse return null;
+    return switch (obj) {
+        .reference => |ref| resolveRef(parse_allocator, data, xref, ref, cache) catch return null,
+        else => obj,
+    };
+}
+
+/// Walk a `/Filter` or `/DecodeParms` Object and resolve any
+/// `.reference` array members. Allocates a fresh array on
+/// `scratch_allocator` only when at least one member needs
+/// resolving; direct-only arrays pass through unchanged. Bubbles
+/// `error.OutOfMemory`.
+fn normalizeFilterChain(
+    scratch_allocator: std.mem.Allocator,
+    parse_allocator: std.mem.Allocator,
+    data: []const u8,
+    xref: *const XRefTable,
+    obj_opt: ?Object,
+    cache: *std.AutoHashMap(u32, Object),
+) !?Object {
+    const obj = obj_opt orelse return null;
+    return switch (obj) {
+        .array => |arr| blk: {
+            var needs_alloc = false;
+            for (arr) |el| if (el == .reference) {
+                needs_alloc = true;
+                break;
+            };
+            if (!needs_alloc) break :blk obj;
+
+            const out = try scratch_allocator.alloc(Object, arr.len);
+            for (arr, 0..) |el, i| {
+                out[i] = switch (el) {
+                    .reference => |ref| resolveRef(parse_allocator, data, xref, ref, cache) catch Object{ .null = {} },
+                    else => el,
+                };
+            }
+            break :blk Object{ .array = out };
+        },
+        else => obj,
+    };
+}
+
 /// Build page array from PDF document
 pub fn buildPageTree(
     allocator: std.mem.Allocator,
@@ -369,20 +429,23 @@ fn getStreamData(
         },
         .stream => |s| {
             const decompress = @import("decompress.zig");
-            // Codex review v1.2-rc4 round 6 [P2]: previously every
-            // decompress error, including error.OutOfMemory, fell
-            // through to `return s.data` — a Pass B caller that
-            // expected to see allocator pressure surface as an error
-            // would instead get raw compressed bytes and silently
-            // produce zero strokes. Bubble OOM; keep the soft fall-
-            // back to the original (compressed) payload for genuine
-            // domain errors so a corrupt filter chain still leaves
-            // the parser something to scan.
+            // Codex review v1.2-rc4 round 6 [P2]: bubble OOM, keep
+            // soft fallback to raw bytes for domain errors.
+            // Codex round 12 [P2]: also normalize indirect array
+            // members in /Filter and /DecodeParms — `decompressStream`
+            // only consumes direct `.name` array entries, so a legal
+            // `/Filter [12 0 R]` would silently collapse the chain to
+            // "no filters" and a Pass B caller would scan compressed
+            // bytes as content.
+            const raw_filter = resolveDictEntry(parse_allocator, data, xref, s.dict.get("Filter"), cache);
+            const raw_params = resolveDictEntry(parse_allocator, data, xref, s.dict.get("DecodeParms"), cache);
+            const filter = try normalizeFilterChain(scratch_allocator, parse_allocator, data, xref, raw_filter, cache);
+            const params = try normalizeFilterChain(scratch_allocator, parse_allocator, data, xref, raw_params, cache);
             return decompress.decompressStream(
                 scratch_allocator,
                 s.data,
-                s.dict.get("Filter"),
-                s.dict.get("DecodeParms"),
+                filter,
+                params,
             ) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 return s.data;
