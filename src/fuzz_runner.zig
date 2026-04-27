@@ -23,6 +23,7 @@ const stream = @import("stream.zig");
 const chunk = @import("chunk.zig");
 const tokenizer = @import("tokenizer.zig");
 const cli = @import("cli_pdfzig.zig");
+const lattice = @import("lattice.zig");
 
 // ============================================================================
 // Target registry
@@ -57,6 +58,8 @@ const TARGETS = [_]Target{
     .{ .name = "pdf_open_magic_prefix", .run = fuzzPdfOpenMagicPrefix },
     .{ .name = "pdf_extract_seed_repeat", .run = fuzzPdfExtractSeedRepeat },
     .{ .name = "tokenizer_realistic_md", .run = fuzzTokenizerRealisticMd },
+    .{ .name = "lattice_content_random", .run = fuzzLatticeContentRandom },
+    .{ .name = "lattice_form_xobject_mutation", .run = fuzzLatticeFormXObjectMutation },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -292,6 +295,74 @@ fn fuzzPdfExtractMutation(rng: std.Random, allocator: std.mem.Allocator, scratch
     const page_idx = rng.intRangeAtMost(usize, 0, n - 1);
     const md = doc.extractMarkdown(page_idx, allocator) catch return;
     allocator.free(md);
+}
+
+// ============================================================================
+// Targets — lattice Pass B (Form XObject Do recursion, PR-1)
+// ============================================================================
+
+/// Fuzz `lattice.collectStrokes` with a random byte buffer pretending to
+/// be a PDF content stream. Exercises the operator dispatch + CTM stack
+/// + last-name tracking against arbitrary byte sequences. The legacy
+/// (no-context) entry point is used so `Do` is always a no-op — the
+/// invariant is no panic, no leak, output is well-formed (every stroke
+/// has finite endpoints).
+fn fuzzLatticeContentRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const len = rng.intRangeAtMost(usize, 0, @min(scratch.len, 8192));
+    rng.bytes(scratch[0..len]);
+
+    const got = lattice.collectStrokes(allocator, scratch[0..len]) catch return;
+    defer allocator.free(got);
+
+    for (got) |s| {
+        if (!std.math.isFinite(s.x0) or !std.math.isFinite(s.y0) or
+            !std.math.isFinite(s.x1) or !std.math.isFinite(s.y1))
+        {
+            return error.LatticeStrokeNonFinite;
+        }
+    }
+}
+
+/// Fuzz `lattice.collectStrokesIn` end-to-end through `getTables` against
+/// a mutated `generateFormXObjectTablePdf` fixture. Mutations target the
+/// last quarter of the buffer (the Form XObject content stream region)
+/// to keep the structural prefix valid most of the time so the recursion
+/// path actually fires.
+///
+/// Invariants: open + getTables + freeTables must succeed without panic
+/// or leak. Detected tables (when any) must have finite bboxes.
+fn fuzzLatticeFormXObjectMutation(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const pdf_data = testpdf.generateFormXObjectTablePdf(allocator) catch return;
+    defer allocator.free(pdf_data);
+    if (pdf_data.len > scratch.len) return;
+    @memcpy(scratch[0..pdf_data.len], pdf_data);
+
+    // Flip 1–4 bytes inside the Form XObject content region.
+    const flips = rng.intRangeAtMost(usize, 1, 4);
+    const mutate_start = pdf_data.len * 3 / 4;
+    if (mutate_start >= pdf_data.len) return;
+    for (0..flips) |_| {
+        const idx = rng.intRangeAtMost(usize, mutate_start, pdf_data.len - 1);
+        scratch[idx] ^= rng.int(u8);
+    }
+
+    dumpReproducer("lattice_form_xobject_mutation", scratch[0..pdf_data.len]);
+
+    var doc = zpdf.Document.openFromMemory(allocator, scratch[0..pdf_data.len], zpdf.ErrorConfig.permissive()) catch return;
+    defer doc.close();
+
+    const detected = doc.getTables(allocator) catch return;
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    for (detected) |t| {
+        if (t.bbox) |bb| {
+            for (bb) |v| {
+                if (!std.math.isFinite(v)) return error.LatticeBboxNonFinite;
+            }
+        }
+    }
 }
 
 /// Best-effort persist the most recent input the parser saw, so a segfault

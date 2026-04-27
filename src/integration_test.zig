@@ -1042,3 +1042,44 @@ test "lattice pass B recurses form xobject" {
     try std.testing.expectApproxEqAbs(@as(f64, 400), bb[2], 2.0);
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
+
+// Codex review v1.2-rc4 [P2] regression: lattice must resolve indirect
+// references in `/Matrix` and `/Resources` before consuming them.
+//
+// Fixture has both stored as indirect refs (`/Matrix 6 0 R`,
+// `/Resources 7 0 R`). The Matrix translates the form's local
+// coordinate frame by +50pt in x, so the 3x3 grid drawn at
+// form-space [100,400,400,700] lands in page-space
+// [150,400,450,700]. If readMatrix falls back to identity (the
+// pre-fix behavior), the bbox would be the original [100,...] and
+// this test fails.
+test "lattice pass B resolves indirect Matrix and Resources refs" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectIndirectRefsPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3) {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    // Matrix [1 0 0 1 50 0] shifts the form-space x by +50.
+    try std.testing.expectApproxEqAbs(@as(f64, 150), bb[0], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 450), bb[2], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+}

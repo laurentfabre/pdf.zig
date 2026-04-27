@@ -1363,6 +1363,99 @@ pub fn generateFormXObjectTablePdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Like `generateFormXObjectTablePdf`, but the Form XObject stores both
+/// `/Matrix` and `/Resources` as indirect references rather than inline
+/// objects. Exercises the codex-flagged P2 paths: lattice must resolve
+/// these references via `pagetree.resolveRef` rather than accepting only
+/// the `.array` / `.dict` shapes.
+///
+/// Object layout:
+///   1. Catalog
+///   2. Pages
+///   3. Page (Resources/XObject -> 5 0 R inline)
+///   4. Page content stream (just `/TableForm Do`)
+///   5. Form XObject — /Matrix 6 0 R, /Resources 7 0 R, content draws 3x3 grid
+///   6. The Matrix array (translates by +50 in x; doubles checked downstream)
+///   7. The Resources dict (empty — Form has no nested resources)
+///
+/// Matrix [1 0 0 1 50 0] translates the form by +50pt in x. The 3x3
+/// grid drawn at [100,400,400,700] in form-space ends up at
+/// [150,400,450,700] in page-space. If lattice fails to resolve the
+/// indirect /Matrix it would fall back to identity and the bbox would
+/// be the original [100,400,400,700] — that's the regression we're
+/// catching.
+pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /TableForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/TableForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // Form XObject — Matrix and Resources are BOTH indirect references.
+    const form_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix 6 0 R /Resources 7 0 R " ++
+        "/Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // Matrix object — [1 0 0 1 50 0] translates the form by +50pt in x.
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n[1 0 0 1 50 0]\nendobj\n");
+
+    // Resources object — empty dict (Form has no nested XObjects).
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< >>\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 8\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+
+    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
 /// Generate a PDF with UTF-16BE encoded metadata and outline title
 pub fn generateUtf16BePdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;

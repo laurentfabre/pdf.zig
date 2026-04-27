@@ -354,11 +354,30 @@ fn handleDoOperator(
     // Compose the effective CTM for the Form's own content. Per PDF
     // spec §8.10: the Form's `/Matrix` (default identity) is applied
     // BEFORE the parent's CTM, i.e. effective = parent_ctm × form_matrix.
-    const form_matrix = readMatrix(xobj_resolved.dict);
+    const form_matrix = readMatrix(xobj_resolved.dict, doc);
     const effective_ctm = form_matrix.mul(parent_ctm);
 
-    // Inherit parent Resources when the Form omits its own.
-    const form_resources = xobj_resolved.dict.getDict("Resources") orelse resources;
+    // Form Resources: inline dict, indirect ref, or absent (inherit
+    // from parent). Codex review v1.2-rc4 [P2]: the previous version
+    // used `getDict("Resources")` which silently returned null on the
+    // legal `.reference` shape, falling back to the *parent's*
+    // resources. Nested `Do` inside that form would then either miss
+    // its child XObjects entirely or resolve the wrong one from the
+    // page-level dictionary. Resolve the reference explicitly.
+    const form_resources = blk: {
+        const obj = xobj_resolved.dict.get("Resources") orelse break :blk resources;
+        break :blk switch (obj) {
+            .dict => |d| d,
+            .reference => |ref| ref_blk: {
+                const resolved = pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch break :ref_blk resources;
+                break :ref_blk switch (resolved) {
+                    .dict => |d| d,
+                    else => resources,
+                };
+            },
+            else => resources,
+        };
+    };
 
     // Mark this XObject visited for the duration of the recursion so
     // that mutual references can't loop.
@@ -379,8 +398,26 @@ fn handleDoOperator(
 
 /// Read a Form XObject's `/Matrix` entry into a `Mat`.
 /// Falls back to identity when missing or malformed.
-fn readMatrix(dict: parser.Object.Dict) Mat {
-    const arr = dict.getArray("Matrix") orelse return Mat{};
+///
+/// Codex review v1.2-rc4 [P2]: `/Matrix` is legally allowed to be an
+/// indirect reference (e.g. `/Matrix 8 0 R`). The previous version
+/// only matched `.array` and silently fell back to identity in that
+/// case, which projected scaled/translated form strokes into the
+/// wrong user-space coordinates. Now resolves indirect references
+/// before consuming.
+fn readMatrix(dict: parser.Object.Dict, doc: DocState) Mat {
+    const obj = dict.get("Matrix") orelse return Mat{};
+    const arr = switch (obj) {
+        .array => |a| a,
+        .reference => |ref| blk: {
+            const resolved = pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch return Mat{};
+            break :blk switch (resolved) {
+                .array => |a| a,
+                else => return Mat{},
+            };
+        },
+        else => return Mat{},
+    };
     if (arr.len < 6) return Mat{};
     var v: [6]f64 = undefined;
     for (0..6) |i| {
@@ -627,4 +664,51 @@ test "extractFromStrokes returns no table when fewer than 2 cluster lines on eit
     const out = try extractFromStrokes(a, &strokes, 1);
     defer tables.freeTables(a, out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+// ----- Form XObject Do recursion (PR-1) -----
+
+test "collectStrokes (legacy entry) ignores Do operator without context" {
+    // Backward-compat guard: the no-ctx public entry must treat `Do`
+    // as a silent no-op so existing callers see zero behavioural change.
+    const a = std.testing.allocator;
+    const content = "10 100 m 200 100 l S\n/Foo Do\n";
+    const got = try collectStrokes(a, content);
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expect(got[0].isHorizontal());
+}
+
+test "collectStrokesIn with empty context ignores Do" {
+    // ctx = .{} ⇒ resources = null and doc = null; the Do handler must
+    // bail before doing any allocation or lookup.
+    const a = std.testing.allocator;
+    const content = "/Foo Do\n10 100 m 200 100 l S\n";
+    const got = try collectStrokesIn(a, content, .{});
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+}
+
+test "collectStrokesIn with empty content returns no strokes and no leak" {
+    const a = std.testing.allocator;
+    const got = try collectStrokesIn(a, "", .{});
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "Do without a preceding name is ignored" {
+    // last_name is reset after every operator, so a bare `Do` with no
+    // preceding /Name has nothing to look up. Must not crash, must not
+    // leak a partial entry into the visited set.
+    const a = std.testing.allocator;
+    const content = "Do\n10 100 m 200 100 l S\n";
+    const got = try collectStrokesIn(a, content, .{});
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+}
+
+test "MAX_XOBJECT_DEPTH is non-zero" {
+    // Sanity guard against accidental zeroing — depth cap = 0 would
+    // disable Form XObject recursion entirely.
+    try std.testing.expect(MAX_XOBJECT_DEPTH >= 1);
 }
