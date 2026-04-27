@@ -135,13 +135,25 @@ fn resolveCompressedObject(
 
     var i: i64 = 0;
     while (i < n) : (i += 1) {
-        const obj = header_parser.parseObject() catch break;
+        // Codex review v1.2-rc4 round 7 [P2]: the round-3 OOM-bubble
+        // fix covered the outer parser/decompress paths but missed
+        // these inner header-loop parses. parseObject can allocate
+        // (e.g. constructing a temp dict during recovery); on
+        // allocator failure we must propagate, not silently truncate
+        // the header walk to whatever pairs we have so far.
+        const obj = header_parser.parseObject() catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            break;
+        };
         const num: u32 = switch (obj) {
             .integer => |int| @intCast(int),
             else => break,
         };
 
-        const offset_obj = header_parser.parseObject() catch break;
+        const offset_obj = header_parser.parseObject() catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            break;
+        };
         const offset: u64 = switch (offset_obj) {
             .integer => |int| @intCast(int),
             else => break,

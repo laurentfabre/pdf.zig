@@ -601,46 +601,62 @@ fn strokeOutsideBox(s: Stroke, box: [4]f64) bool {
         max_y < box[1] or min_y > box[3];
 }
 
-/// Clip an axis-aligned (horizontal or vertical) stroke to the
-/// user-space clip box. Returns null if the stroke is fully outside
-/// the box. Boundary-crossing strokes are clamped to the visible
-/// portion so downstream cluster + bbox computations don't see the
-/// invisible tail.
+/// Clip an arbitrary line segment to an axis-aligned box using the
+/// Liang–Barsky algorithm. Returns null if the segment is fully
+/// outside; otherwise returns the visible portion.
 ///
-/// Codex review v1.2-rc4 round 5 [P2]: the previous fully-outside
-/// AABB filter kept boundary-crossing strokes at full length, which
-/// could widen the detected table bbox or count an offscreen
-/// separator as a row/column. Now we actively clamp.
+/// Codex review v1.2-rc4 round 7 [P2]: the previous axis-aligned-only
+/// clipper handled horizontal/vertical strokes correctly but left
+/// diagonal segments untouched. After the form-space round-trip
+/// (round 6) a user-space axis-aligned stroke can become a diagonal
+/// form-space segment that crosses the /BBox boundary; the old
+/// helper would keep it at full length, leaking invisible tails back
+/// into user-space and inflating the detected table bbox.
 ///
-/// Non-axis-aligned strokes never appear in `out` (collectStrokesWalk
-/// only appends segments whose `isHorizontal()` or `isVertical()`
-/// holds), so the fall-through is defensive: we keep them unchanged
-/// rather than guessing at a clip line.
+/// Liang–Barsky handles arbitrary line orientations against an AABB
+/// in O(1) and falls through to a clean axis-aligned clamp when
+/// `dx` or `dy` is zero (parallel-to-edge case).
 fn clipStrokeToBox(s: Stroke, box: [4]f64) ?Stroke {
-    if (strokeOutsideBox(s, box)) return null;
-    if (s.isHorizontal()) {
-        const lo_x = @min(s.x0, s.x1);
-        const hi_x = @max(s.x0, s.x1);
-        const new_lo = @max(lo_x, box[0]);
-        const new_hi = @min(hi_x, box[2]);
-        if (new_hi <= new_lo) return null;
-        return Stroke{
-            .x0 = new_lo, .y0 = s.y0,
-            .x1 = new_hi, .y1 = s.y1,
-        };
+    const dx = s.x1 - s.x0;
+    const dy = s.y1 - s.y0;
+    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return null;
+    var t0: f64 = 0.0;
+    var t1: f64 = 1.0;
+
+    // p[i] is the directional gradient against edge i; q[i] is the
+    // signed distance from the start point to edge i. The four edges
+    // are: left (xmin), right (xmax), bottom (ymin), top (ymax).
+    const p = [4]f64{ -dx, dx, -dy, dy };
+    const q = [4]f64{
+        s.x0 - box[0],
+        box[2] - s.x0,
+        s.y0 - box[1],
+        box[3] - s.y0,
+    };
+
+    inline for (0..4) |i| {
+        if (p[i] == 0.0) {
+            // Line is parallel to this edge AND start point is outside.
+            if (q[i] < 0.0) return null;
+        } else {
+            const t = q[i] / p[i];
+            if (p[i] < 0.0) {
+                if (t > t1) return null;
+                if (t > t0) t0 = t;
+            } else {
+                if (t < t0) return null;
+                if (t < t1) t1 = t;
+            }
+        }
     }
-    if (s.isVertical()) {
-        const lo_y = @min(s.y0, s.y1);
-        const hi_y = @max(s.y0, s.y1);
-        const new_lo = @max(lo_y, box[1]);
-        const new_hi = @min(hi_y, box[3]);
-        if (new_hi <= new_lo) return null;
-        return Stroke{
-            .x0 = s.x0, .y0 = new_lo,
-            .x1 = s.x1, .y1 = new_hi,
-        };
-    }
-    return s;
+    if (t0 > t1) return null;
+
+    return Stroke{
+        .x0 = s.x0 + t0 * dx,
+        .y0 = s.y0 + t0 * dy,
+        .x1 = s.x0 + t1 * dx,
+        .y1 = s.y0 + t1 * dy,
+    };
 }
 
 /// Read a Form XObject's `/Matrix` entry into a `Mat`.
