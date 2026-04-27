@@ -999,12 +999,46 @@ test "superscript positioning does not insert spurious newline" {
     try std.testing.expect(std.mem.indexOf(u8, output.items, "\n") == null);
 }
 
-// PR-1 stub — see docs/ROADMAP.md PR-1.
-// Pass B (lattice) must recurse into Form XObject `Do` operator, walking the
-// XObject's content stream with its own CTM stack, so ruled tables drawn
-// inside reusable templates are detected. Fixture + assertion land in the
-// implementation commit; this stub keeps the test name reserved and the PR
-// non-empty so /pr-cycle has a diff to review against main.
+// PR-1 — Pass B (lattice) recurses into Form XObject `Do` operator,
+// walking the XObject's content stream with its own CTM stack so ruled
+// tables drawn inside reusable templates are detected.
+//
+// Fixture: testpdf.generateFormXObjectTablePdf produces a single page
+// whose only top-level operator is `/TableForm Do`. The Form XObject
+// draws a 3×3 ruled grid (outer 300×300 rect + 2 interior horizontals
+// + 2 interior verticals) at user-space [100, 400, 400, 700]. Without
+// resource-aware recursion, lattice walks an effectively empty page
+// stream and returns 0 tables. With recursion, lattice resolves the
+// XObject, decompresses its content, and detects exactly one 3×3
+// table.
 test "lattice pass B recurses form xobject" {
-    return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // At least one 3×3 table on page 1, lattice-detected.
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3) {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    // Bbox in user-space matches the gold rectangle within ±2 pt.
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    try std.testing.expectApproxEqAbs(@as(f64, 100), bb[0], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[2], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }

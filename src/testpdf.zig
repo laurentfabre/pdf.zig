@@ -1286,6 +1286,83 @@ pub fn generateImagePdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Generate a single-page PDF whose only page-level content stream
+/// emits `/TableForm Do`, where `TableForm` is a Form XObject that
+/// draws a 3×3 ruled table using stroke ops on absolute coordinates.
+///
+/// Used by the lattice Pass-B Form-XObject-recursion test. The
+/// expected detection is one table with `n_rows = 3`, `n_cols = 3`
+/// and `bbox ≈ [100, 400, 400, 700]` in user-space.
+pub fn generateFormXObjectTablePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    // Object 1 — Catalog
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // Object 2 — Pages
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Object 3 — Page (references the Form XObject in /Resources)
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /TableForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Object 4 — page content stream: just invoke the Form XObject.
+    const page_content = "/TableForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // Object 5 — Form XObject. Identity matrix, BBox covers the table.
+    // Content draws a 3x3 grid: outer 300x300 rect at (100,400) plus
+    // 2 interior horizontals at y=500/600 and 2 interior verticals at
+    // x=200/300. Each path is stroked with `S` so lattice picks up
+    // every segment.
+    const form_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // XRef
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
 /// Generate a PDF with UTF-16BE encoded metadata and outline title
 pub fn generateUtf16BePdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
