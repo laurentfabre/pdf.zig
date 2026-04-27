@@ -536,6 +536,27 @@ fn clipStrokeInFormSpace(
     };
 }
 
+/// Resolve a numeric Object element to f64, following one level of
+/// indirect reference. Returns null on non-numeric / non-finite /
+/// missing target. Codex review v1.2-rc4 round 8 [P2]: PDF arrays
+/// can legally contain indirect numeric refs (e.g. `/BBox [11 0 R
+/// 12 0 R 13 0 R 14 0 R]`). Both `readBBox` and `readMatrix` now
+/// route per-element through this helper.
+fn readNumberMaybeIndirect(obj: parser.Object, doc: DocState) error{OutOfMemory}!?f64 {
+    const concrete = switch (obj) {
+        .real, .integer => obj,
+        .reference => |ref| (try resolveRefSoft(doc, ref)) orelse return null,
+        else => return null,
+    };
+    const v: f64 = switch (concrete) {
+        .real => |r| r,
+        .integer => |n| @floatFromInt(n),
+        else => return null,
+    };
+    if (!std.math.isFinite(v)) return null;
+    return v;
+}
+
 /// Read a Form XObject's `/BBox` entry. Same indirect-ref + OOM
 /// discipline as `readMatrix`. Returns null when missing or malformed
 /// (treated as "no clip" — same as inline page content).
@@ -555,12 +576,7 @@ fn readBBox(dict: parser.Object.Dict, doc: DocState) error{OutOfMemory}!?[4]f64 
     if (arr.len < 4) return null;
     var v: [4]f64 = undefined;
     for (0..4) |i| {
-        v[i] = switch (arr[i]) {
-            .real => |r| r,
-            .integer => |n| @floatFromInt(n),
-            else => return null,
-        };
-        if (!std.math.isFinite(v[i])) return null;
+        v[i] = (try readNumberMaybeIndirect(arr[i], doc)) orelse return null;
     }
     // Normalize to [x_min, y_min, x_max, y_max] — PDF spec doesn't
     // require any particular corner ordering.
@@ -683,11 +699,7 @@ fn readMatrix(dict: parser.Object.Dict, doc: DocState) error{OutOfMemory}!Mat {
     if (arr.len < 6) return Mat{};
     var v: [6]f64 = undefined;
     for (0..6) |i| {
-        v[i] = switch (arr[i]) {
-            .real => |r| r,
-            .integer => |n| @floatFromInt(n),
-            else => return Mat{},
-        };
+        v[i] = (try readNumberMaybeIndirect(arr[i], doc)) orelse return Mat{};
     }
     return Mat{ .a = v[0], .b = v[1], .c = v[2], .d = v[3], .e = v[4], .f = v[5] };
 }

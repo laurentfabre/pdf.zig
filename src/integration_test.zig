@@ -1085,6 +1085,46 @@ test "lattice pass B resolves indirect Matrix and Resources refs" {
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
 
+// Codex review v1.2-rc4 round 8 [P2]: indirect numeric elements in
+// /BBox and /Matrix arrays. Both arrays are expressed as `[N 0 R ...]`;
+// readBBox/readMatrix must resolve each element through resolveRefSoft.
+// Matrix translates by +30 in x; the form-space 3x3 grid at
+// [100,400,400,700] should land in user-space at [130,400,430,700].
+// Without indirect-element resolution: BBox null + Matrix identity →
+// bbox at [100,400,400,700] (the regression we're catching).
+test "lattice pass B resolves indirect-element /BBox and /Matrix arrays" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectIndirectArrayElementsPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3 and
+            t.engine == zpdf.tables.Engine.lattice)
+        {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    // Translation +30: x should be in the [130, 430] range.
+    try std.testing.expectApproxEqAbs(@as(f64, 130), bb[0], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 430), bb[2], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+}
+
 // Codex review v1.2-rc4 [P2] /BBox clipping (round 4 + round 5).
 // The form draws an oversized inside grid that extends past the BBox
 // right edge AND a separate fully-outside grid. Lattice must:
