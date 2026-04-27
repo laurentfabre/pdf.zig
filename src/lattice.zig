@@ -63,9 +63,20 @@ pub const DocState = struct {
 ///
 /// Provide `resources` + `doc` to opt into Form XObject recursion.
 pub const CollectContext = struct {
-    /// Page (or parent Form XObject) Resources dict. Used to resolve
-    /// `/XObject/<name>` lookups when the content stream emits `Do`.
+    /// Currently in-scope Resources dict — the page's at the outermost
+    /// call, or the resolved Form Resources dict during recursion.
+    /// Used to resolve `/XObject/<name>` for `Do` operators in the
+    /// content stream being walked.
     resources: ?parser.Object.Dict = null,
+    /// The PAGE Resources dict — preserved across recursion frames.
+    /// Per ISO 32000-1 §7.8.3, when a Form XObject omits its own
+    /// `/Resources` (or sets it to .null per §7.3.9), the fallback
+    /// is the resources of the page on which the form appears,
+    /// NOT the calling form's resources. PDFBox and MuPDF agree.
+    /// Defaults to `resources` when set by the outermost caller via
+    /// `collectStrokesIn` (see initializer there); recursion preserves
+    /// it explicitly.
+    page_resources: ?parser.Object.Dict = null,
     /// Document-level state for indirect-reference resolution.
     /// Must be non-null whenever `resources` is set; both are required
     /// for recursion to fire.
@@ -183,7 +194,16 @@ pub fn collectStrokesIn(
     defer if (ctx.visited == null) owned_visited.deinit();
     const visited = ctx.visited orelse &owned_visited;
 
-    try collectStrokesWalk(allocator, content, ctx, visited, &strokes);
+    // Default `page_resources` to the caller's in-scope resources when
+    // unset. The outermost caller passes the page's resources via
+    // `ctx.resources`; the page IS the page in that frame, so they
+    // are equal at depth 0. Recursive frames preserve the original
+    // page_resources so a deeply nested Form's absent/null
+    // /Resources still falls back to the page, not its callers.
+    var seeded_ctx = ctx;
+    if (seeded_ctx.page_resources == null) seeded_ctx.page_resources = ctx.resources;
+
+    try collectStrokesWalk(allocator, content, seeded_ctx, visited, &strokes);
     return strokes.toOwnedSlice(allocator);
 }
 
@@ -427,31 +447,38 @@ fn handleDoOperator(
     const effective_ctm = form_matrix.mul(parent_ctm);
 
     // Form Resources lookup, four-state result:
-    //   - Key ABSENT       → inherit parent resources (PDF 32000-1 §7.7.3.4).
+    //   - Key ABSENT       → fall back to PAGE resources (§7.8.3).
     //   - Key PRESENT, .null → equivalent to absent per §7.3.9
     //     ("specifying the null object as the value of a dictionary
     //     entry shall be equivalent to omitting the entry entirely")
-    //     → inherit parent resources.
+    //     → fall back to PAGE resources.
     //   - Key PRESENT, resolves to a Dict → use that dict.
     //   - Key PRESENT, non-null and non-dict (or indirect ref to
     //     non-dict / non-null) → fail closed: the Form declared its
     //     own (broken) resource scope and must NOT silently access
     //     the parent's /XObject map.
     //
-    // Codex review v1.2-rc4 round 9 [P2]: original parent-fallback
-    // for every non-Dict shape was too permissive — fixed.
-    // Round 16 [P2]: round-9 over-corrected by including .null as
-    // fail-closed; spec §7.3.9 says .null == absent. Fixed.
+    // Codex review v1.2-rc4 round 9 [P2]: parent-fallback for every
+    // non-Dict shape was too permissive — fixed.
+    // Round 16 [P2]: round-9 over-corrected by including .null;
+    // spec §7.3.9 says .null == absent. Fixed.
+    // Round 17 [P2]: when Form Resources is absent/null, the spec-
+    // correct fallback is the PAGE Resources (preserved as
+    // ctx.page_resources), not the calling Form's resources.
+    // PDFBox and MuPDF agree. Previously we used `resources`
+    // (= calling frame's), which differed only for nested Forms
+    // where the outer Form shadowed page-level /XObject names.
+    const page_fallback = ctx.page_resources orelse resources;
     const form_resources: ?parser.Object.Dict = blk: {
-        const obj = xobj_resolved.dict.get("Resources") orelse break :blk resources;
+        const obj = xobj_resolved.dict.get("Resources") orelse break :blk page_fallback;
         break :blk switch (obj) {
             .dict => |d| d,
-            .null => resources, // §7.3.9: null ≡ absent → inherit
+            .null => page_fallback,
             .reference => |ref| ref_blk: {
-                const resolved = (try resolveRefSoft(doc, ref)) orelse break :ref_blk resources;
+                const resolved = (try resolveRefSoft(doc, ref)) orelse break :ref_blk page_fallback;
                 break :ref_blk switch (resolved) {
                     .dict => |d| d,
-                    .null => resources, // resolved-to-null ≡ absent
+                    .null => page_fallback,
                     else => null,
                 };
             },
@@ -468,6 +495,7 @@ fn handleDoOperator(
 
     const child_ctx = CollectContext{
         .resources = form_resources,
+        .page_resources = ctx.page_resources, // preserved across recursion
         .doc = doc,
         .depth = ctx.depth + 1,
         .initial_ctm = effective_ctm,

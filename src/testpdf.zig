@@ -1432,6 +1432,159 @@ pub fn generateFormXObjectIndirectSubtypePdf(allocator: std.mem.Allocator) ![]u8
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Three-level Form XObject nesting that exercises ISO 32000-1
+/// §7.8.3 page-resource fallback (Codex review v1.2-rc4 round 17 [P2]).
+///
+/// Layout:
+///   - Page /Resources/XObject: { OuterForm 5, InnerGrid 6 }
+///       (page-level /InnerGrid is a 3x3 grid)
+///   - OuterForm /Resources/XObject: { MidForm 7, InnerGrid 8 }
+///       (OuterForm shadows /InnerGrid with a 4x4 grid in obj 8)
+///   - OuterForm content: `/MidForm Do`
+///   - MidForm /Resources: null   ← absent per §7.3.9
+///   - MidForm content: `/InnerGrid Do`
+///
+/// When MidForm executes `/InnerGrid Do`, the spec requires falling
+/// back to the PAGE Resources (not OuterForm's shadowed map), so
+/// /InnerGrid resolves to obj 6 — the 3x3 grid. With the OLD
+/// caller-fallback behavior the resolution would chase OuterForm's
+/// shadow (obj 8) and produce a 4x4 grid instead.
+///
+/// PDFBox and MuPDF both implement page-fallback; pdf.js historically
+/// did not. This fixture proves pdf.zig matches the spec.
+///
+/// Object map:
+///   1. Catalog
+///   2. Pages
+///   3. Page (XObject /OuterForm 5 + /InnerGrid 6)
+///   4. Page content stream (`/OuterForm Do`)
+///   5. OuterForm — Resources/XObject /MidForm 7 + /InnerGrid 8
+///   6. Page-level /InnerGrid — 3x3 grid (the SPEC-CORRECT detection)
+///   7. MidForm — /Resources null, content `/InnerGrid Do`
+///   8. OuterForm-shadow /InnerGrid — 4x4 grid (the WRONG detection)
+pub fn generateFormXObjectShadowedXObjectPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /OuterForm 5 0 R /InnerGrid 6 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/OuterForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // OuterForm has its OWN /Resources that shadows /InnerGrid with
+    // obj 8 (a 4x4 grid). It also exposes /MidForm = obj 7. Body
+    // calls MidForm.
+    const outer_content = "/MidForm Do\n";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] " ++
+        "/Resources << /XObject << /MidForm 7 0 R /InnerGrid 8 0 R >> >> " ++
+        "/Length {} >>\n",
+        .{outer_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(outer_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // Page-level /InnerGrid: a 3x3 grid — what the SPEC says we
+    // should detect (page-fallback).
+    const page_inner =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{page_inner.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(page_inner);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // MidForm: /Resources null (so resolution must fall back somewhere).
+    // Body invokes /InnerGrid. With round-17 page-fallback this
+    // resolves to obj 6 (page); with the old caller-fallback it would
+    // resolve to obj 8 (OuterForm shadow).
+    const mid_content = "/InnerGrid Do\n";
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources null " ++
+        "/Length {} >>\n",
+        .{mid_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(mid_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // OuterForm-shadow /InnerGrid: a 4x4 grid — the WRONG detection
+    // (would only fire if MidForm's null /Resources fell back to
+    // OuterForm's resources instead of the page's).
+    const shadow_inner =
+        \\100 400 300 300 re S
+        \\100 475 m 400 475 l S
+        \\100 550 m 400 550 l S
+        \\100 625 m 400 625 l S
+        \\175 400 m 175 700 l S
+        \\250 400 m 250 700 l S
+        \\325 400 m 325 700 l S
+        \\
+    ;
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{shadow_inner.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(shadow_inner);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 9\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+
+    try writer.writeAll("trailer\n<< /Size 9 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
 /// Generate a PDF where the outer Form XObject sets `/Resources null`.
 /// Per PDF 32000-1 §7.3.9, a `null` dictionary value is equivalent to
 /// the entry being absent, so the form INHERITS its parent's

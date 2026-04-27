@@ -1109,6 +1109,37 @@ test "lattice pass B resolves indirect /Subtype on Form XObject" {
     try std.testing.expectEqual(@as(usize, 1), lattice_count);
 }
 
+// Codex round 17 [P2]: nested Form /Resources fallback uses the
+// PAGE Resources, not the calling Form's. Per ISO 32000-1 §7.8.3.
+// Three-level chain: page → OuterForm → MidForm. OuterForm shadows
+// /InnerGrid with a 4x4 grid; MidForm has /Resources null and calls
+// /InnerGrid. Spec-conform fallback resolves to the page's 3x3 grid;
+// pre-fix caller-fallback would have resolved to OuterForm's 4x4
+// shadow.
+test "lattice pass B nested-Form null Resources falls back to page (not caller)" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectShadowedXObjectPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var has_3x3: bool = false;
+    var has_4x4: bool = false;
+    for (detected) |t| {
+        if (t.engine != zpdf.tables.Engine.lattice) continue;
+        if (t.n_rows == 3 and t.n_cols == 3) has_3x3 = true;
+        if (t.n_rows == 4 and t.n_cols == 4) has_4x4 = true;
+    }
+    // Spec-conform: page's 3x3 wins; OuterForm's 4x4 shadow doesn't fire.
+    try std.testing.expect(has_3x3);
+    try std.testing.expect(!has_4x4);
+}
+
 // Codex round 16 [P2]: per PDF 32000-1 §7.3.9, a `null` dictionary
 // value is equivalent to omitting the entry, so /Resources null on
 // a Form must inherit parent resources rather than fail closed.
