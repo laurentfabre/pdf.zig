@@ -1161,6 +1161,46 @@ test "Mat.inverse on singular matrix returns null" {
     try std.testing.expect(m.inverse() == null);
 }
 
+// ----- CTM concatenation invariant (PR-1 round 15) -----
+//
+// Per PDF Reference §4.2.3 / PDF 2.0 §8.3.2: the cm operator
+// concatenates a matrix to the CTM such that the new CTM is
+// `M × CTM_old`, where M is the operand. In row-vector form
+// (used by PDF and `Mat.apply`), this means subsequent points are
+// transformed as `x × M × CTM_old` — the most-recent cm is applied
+// FIRST to the local coordinates, the earlier CTM is applied
+// SECOND. PDFBox, MuPDF, and pdf.js all use this convention.
+//
+// Codex round 15 [P2] claimed `m.mul(ctm)` was reversed; that
+// finding was REJECTED as a spec misread. This test locks in
+// the correct semantics.
+test "CTM concatenation: scale then translate maps x=0 to 100" {
+    var ctm = Mat{}; // identity
+    // First cm: scale by 2.
+    const m1 = Mat{ .a = 2, .b = 0, .c = 0, .d = 2, .e = 0, .f = 0 };
+    ctm = m1.mul(ctm);
+    // Second cm: translate by +50 in x.
+    const m2 = Mat{ .a = 1, .b = 0, .c = 0, .d = 1, .e = 50, .f = 0 };
+    ctm = m2.mul(ctm);
+    // Local origin (0, 0) → device:
+    //   apply translate first: (0,0) → (50,0)
+    //   apply scale second:    (50,0) → (100,0)
+    const p = ctm.apply(0, 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), p.x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), p.y, 1e-9);
+}
+
+test "CTM concatenation: distinct point shows scale applied after translate" {
+    var ctm = Mat{};
+    const m1 = Mat{ .a = 2, .b = 0, .c = 0, .d = 2, .e = 0, .f = 0 };
+    ctm = m1.mul(ctm);
+    const m2 = Mat{ .a = 1, .b = 0, .c = 0, .d = 1, .e = 50, .f = 0 };
+    ctm = m2.mul(ctm);
+    // Local x=10 → translate gives 60 → scale gives 120.
+    const p = ctm.apply(10, 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 120), p.x, 1e-9);
+}
+
 // ----- normalizeFilterChain (PR-1 round 11 [P2] regression) -----
 
 test "normalizeFilterChain passes null through" {

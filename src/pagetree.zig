@@ -407,10 +407,21 @@ fn walkPageTree(
     // the inherited dict, allowing page-level Do operators to
     // resolve against ancestor /XObject maps the page itself can't
     // legally see.
+    // Codex review v1.2-rc4 round 15 [P2]: the previous catch
+    // collapsed every resolveRef error — including
+    // error.OutOfMemory — into Object{ .null = {} }, downgrading
+    // allocator pressure to a silent fail-closed. Bubble OOM
+    // explicitly through PageTreeError.OutOfMemory; only domain
+    // resolution errors collapse to null.
     var resources = inherited_resources;
     if (dict.get("Resources")) |res_obj| {
-        const resolved = switch (res_obj) {
-            .reference => |r| resolveRef(allocator, data, xref, r, cache) catch Object{ .null = {} },
+        const resolved: Object = switch (res_obj) {
+            .reference => |r| ref_blk: {
+                break :ref_blk resolveRef(allocator, data, xref, r, cache) catch |err| {
+                    if (err == error.OutOfMemory) return PageTreeError.OutOfMemory;
+                    break :ref_blk Object{ .null = {} };
+                };
+            },
             else => res_obj,
         };
         resources = switch (resolved) {
