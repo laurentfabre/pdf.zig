@@ -73,7 +73,7 @@ updated: 2026-04-27
   > **Test strategy.** Add `integration_test.zig` case `lattice_pass_b_recurses_form_xobject`; rerun `audit/v1_2_eval.py`.
   > **Codex gate (`/pr-cycle`).** Findings expected on: CTM stacking correctness, infinite-recursion guard, Resources dictionary `null`-handling.
 
-- [ ] **PR-2 · feat: continuation-link bbox-y constraint**
+- [x] **PR-2 · feat: continuation-link bbox-y constraint** (merged in `97c53bd`, 2026-04-28; 3 commits, Codex converged round 1, 0 findings; ROADMAP entry's bbox.y inversion fixed in implementation)
   > [!info]- Details
   > **Why.** `[[PROJECT-LOG#v1.2-rc3]]` follow-up — current ±1 col rule has false positives (two unrelated price tables on consecutive pages).
   > **Files-touched envelope.** `src/tables.zig::linkContinuations` (primary), `src/integration_test.zig`.
