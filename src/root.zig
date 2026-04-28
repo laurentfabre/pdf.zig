@@ -1046,7 +1046,7 @@ pub const Document = struct {
         if (tree_opt) |*tree| {
             defer tree.deinit();
             const ctx = self;
-            const pass_a = try tables.extractTaggedTables(allocator, tree, @ptrCast(ctx), pageRefToZeroBased);
+            const pass_a = try tables.extractTaggedTables(allocator, tree, @ptrCast(ctx), pageRefToZeroBased, null, null);
             for (pass_a) |t| try combined.append(allocator, t);
             allocator.free(pass_a); // we copied each element above (cells are still owned by the original elements; transfer)
         }

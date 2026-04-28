@@ -97,26 +97,49 @@ pub fn freeTables(allocator: std.mem.Allocator, tables: []Table) void {
     allocator.free(tables);
 }
 
+/// Lookup signature for resolving an MCID's accumulated text on a given
+/// page. The text returned is borrowed (owned by the lookup's backing
+/// store, e.g. a `MarkedContentExtractor`); `extractTaggedTables`
+/// `dupe`s it before placing it into `Cell.text` so the cell owns its
+/// allocation.
+pub const McidTextLookupFn = *const fn (
+    ctx: *anyopaque,
+    page_ref: ?ObjRef,
+    mcid: i32,
+) ?[]const u8;
+
 /// Walk the structure tree and emit one `Table` record per `/Table`
 /// element. `page_lookup` maps an `/Pg` ObjRef to the document's
 /// 0-based page index; pass `null` to skip page resolution (the
 /// emitted `page` field will be 0, useful only for unit tests).
+///
+/// `mcid_text_lookup` is used to populate `Cell.text` on Pass A
+/// (tagged path). When provided, each TD/TH's MCID children are
+/// resolved via the lookup; their texts are concatenated with single-
+/// space separators. Codex review v1.2-rc4 PR-3 [P2 deferred from
+/// rc4 roadmap]: this closes the v1.2-rc1 "Pass A leaves text=null"
+/// known limitation.
 pub fn extractTaggedTables(
     allocator: std.mem.Allocator,
     tree: *const structtree.StructTree,
     page_lookup_ctx: ?*const anyopaque,
     page_lookup_fn: ?*const fn (ctx: *const anyopaque, page_ref: ?ObjRef) ?u32,
+    mcid_text_lookup_ctx: ?*anyopaque,
+    mcid_text_lookup_fn: ?McidTextLookupFn,
 ) ![]Table {
     var out: std.ArrayList(Table) = .empty;
     errdefer {
-        for (out.items) |t| allocator.free(t.cells);
+        for (out.items) |t| {
+            for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+            allocator.free(t.cells);
+        }
         out.deinit(allocator);
     }
 
     if (tree.root) |root| {
         var per_page_counter = std.AutoHashMap(u32, u32).init(allocator);
         defer per_page_counter.deinit();
-        try walkForTables(allocator, root, &out, &per_page_counter, page_lookup_ctx, page_lookup_fn);
+        try walkForTables(allocator, root, &out, &per_page_counter, page_lookup_ctx, page_lookup_fn, mcid_text_lookup_ctx, mcid_text_lookup_fn);
     }
 
     return out.toOwnedSlice(allocator);
@@ -129,9 +152,11 @@ fn walkForTables(
     per_page_counter: *std.AutoHashMap(u32, u32),
     page_lookup_ctx: ?*const anyopaque,
     page_lookup_fn: ?*const fn (ctx: *const anyopaque, page_ref: ?ObjRef) ?u32,
+    mcid_text_lookup_ctx: ?*anyopaque,
+    mcid_text_lookup_fn: ?McidTextLookupFn,
 ) anyerror!void {
     if (isTableElement(elem.struct_type)) {
-        if (try buildTableFromElement(allocator, elem, page_lookup_ctx, page_lookup_fn)) |raw| {
+        if (try buildTableFromElement(allocator, elem, page_lookup_ctx, page_lookup_fn, mcid_text_lookup_ctx, mcid_text_lookup_fn)) |raw| {
             var tbl = raw;
             const pg_zero_based: u32 = if (tbl.page == 0) 0 else tbl.page - 1;
             const next_id = per_page_counter.get(pg_zero_based) orelse 0;
@@ -145,7 +170,7 @@ fn walkForTables(
 
     for (elem.children) |child| {
         switch (child) {
-            .element => |sub| try walkForTables(allocator, sub, out, per_page_counter, page_lookup_ctx, page_lookup_fn),
+            .element => |sub| try walkForTables(allocator, sub, out, per_page_counter, page_lookup_ctx, page_lookup_fn, mcid_text_lookup_ctx, mcid_text_lookup_fn),
             .mcid => {},
         }
     }
@@ -156,6 +181,8 @@ fn buildTableFromElement(
     table_elem: *const structtree.StructElement,
     page_lookup_ctx: ?*const anyopaque,
     page_lookup_fn: ?*const fn (ctx: *const anyopaque, page_ref: ?ObjRef) ?u32,
+    mcid_text_lookup_ctx: ?*anyopaque,
+    mcid_text_lookup_fn: ?McidTextLookupFn,
 ) !?Table {
     // Collect rows: walk children, treating /TR nodes as rows.
     // The PDF spec also allows /THead /TBody /TFoot as wrappers — flatten them.
@@ -196,13 +223,49 @@ fn buildTableFromElement(
             const rowspan: u32 = 1; // span attribute parsing deferred
             const colspan: u32 = 1;
 
+            // PR-3 [feat]: populate cell text by walking the cell's
+            // MCID children and concatenating each MCID's accumulated
+            // text via the optional lookup. Falls back to text=null
+            // when the lookup is absent (legacy behavior preserved
+            // for unit-test call sites). Each MCID's text is
+            // separated by a single space; consecutive empty MCIDs
+            // collapse cleanly.
+            var cell_text: ?[]u8 = null;
+            errdefer if (cell_text) |t| allocator.free(t);
+            if (mcid_text_lookup_fn) |lookup| {
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                for (cell_elem.children) |sub| {
+                    const mcr = switch (sub) {
+                        .mcid => |m| m,
+                        .element => continue,
+                    };
+                    const page_ref = mcr.page_ref orelse cell_elem.page_ref orelse table_elem.page_ref;
+                    const mcid_text = lookup(mcid_text_lookup_ctx.?, page_ref, mcr.mcid) orelse continue;
+                    if (mcid_text.len == 0) continue;
+                    if (buf.items.len > 0) try buf.append(allocator, ' ');
+                    try buf.appendSlice(allocator, mcid_text);
+                }
+                if (buf.items.len > 0) {
+                    cell_text = try buf.toOwnedSlice(allocator);
+                } else {
+                    buf.deinit(allocator);
+                }
+            }
+
             try cells.append(allocator, .{
                 .r = @intCast(ri),
                 .c = col,
                 .rowspan = rowspan,
                 .colspan = colspan,
                 .is_header = is_header,
+                .text = cell_text,
             });
+            // Cell now owns the text slice; clear our local handle so
+            // the errdefer above doesn't double-free if a later append
+            // fails (toOwnedSlice already prevented buf.deinit from
+            // freeing the slice, but cell_text still aliases it).
+            cell_text = null;
             row_has_any_cell = true;
             if (!is_header) row_is_all_header = false;
 
@@ -281,7 +344,7 @@ test "empty struct tree → no tables" {
         .elements = &.{},
         .allocator = std.testing.allocator,
     };
-    const tables = try extractTaggedTables(std.testing.allocator, &tree, null, null);
+    const tables = try extractTaggedTables(std.testing.allocator, &tree, null, null, null, null);
     defer freeTables(std.testing.allocator, tables);
     try std.testing.expectEqual(@as(usize, 0), tables.len);
 }
@@ -343,7 +406,7 @@ test "minimal Table with 2 TR each containing 3 TD" {
         .elements = &.{},
         .allocator = a,
     };
-    const tables = try extractTaggedTables(a, &tree, null, null);
+    const tables = try extractTaggedTables(a, &tree, null, null, null, null);
     defer freeTables(a, tables);
 
     try std.testing.expectEqual(@as(usize, 1), tables.len);
@@ -396,7 +459,7 @@ test "Table with TH header row + TD rows → header_rows = 1" {
     defer a.destroy(tbl);
 
     var tree = structtree.StructTree{ .root = tbl, .elements = &.{}, .allocator = a };
-    const tables = try extractTaggedTables(a, &tree, null, null);
+    const tables = try extractTaggedTables(a, &tree, null, null, null, null);
     defer freeTables(a, tables);
 
     try std.testing.expectEqual(@as(u32, 2), tables[0].n_rows);
