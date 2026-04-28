@@ -1268,8 +1268,17 @@ pub const Document = struct {
             // extractContentStream in `.structured` mode. Domain
             // errors → leave extractor empty (cell.text falls back
             // to null for that page).
+            //
+            // Codex review v1.2-rc4 PR-3 round 6 [P1]: parse_allocator
+            // MUST be the document's long-lived parsing_arena, not
+            // the short-lived `self.arena` (mcid_arena) — pagetree
+            // resolveRef writes resolved objects into the document's
+            // shared object_cache, and those entries would dangle
+            // after mcid_arena.deinit() at the end of getTables.
+            // scratch_allocator stays on `self.arena` because
+            // decompressed content is single-use.
             const content = pagetree.getPageContents(
-                self.arena,
+                self.doc.parsing_arena.allocator(),
                 self.arena,
                 self.doc.data,
                 &self.doc.xref_table,
