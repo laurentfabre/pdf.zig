@@ -1361,3 +1361,14 @@ test "lattice pass B ignores non-Form XObject Subtypes" {
     try std.testing.expectApproxEqAbs(@as(f64, 100), bb[0], 2.0);
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
+
+// PR-3 stub — see docs/ROADMAP.md PR-3.
+// Pass A (tagged-path table extraction) must populate per-cell text by
+// walking each TD's MCID list, looking up each MCID's bbox via a new
+// upstream `MarkedContentExtractor.getMcidBoundingBox(page_idx, mcid)`
+// API, and concatenating the glyph spans whose centers fall inside.
+// Implementation lands in follow-up commits on this branch alongside
+// the audit/tables-gold/tagged-2x3.pdf fixture.
+test "tagged table extracts cell text" {
+    return error.SkipZigTest;
+}
