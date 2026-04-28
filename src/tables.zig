@@ -61,16 +61,42 @@ pub const Table = struct {
     continued_to: ?ContinuationLink = null,
 };
 
+/// Lookup signature for resolving a page's MediaBox. `page` is the
+/// 1-based page number stored in `Table.page`. Returns `[x0, y0, x1, y1]`
+/// in PDF user space (y0 = bottom, y1 = top). Pass `null`/`null` to
+/// linkContinuations to opt out of the bbox-y constraint (legacy
+/// behavior — column-count rule only).
+pub const PageMediaBoxFn = *const fn (ctx: *const anyopaque, page: u32) ?[4]f64;
+
+/// Fraction of page height that counts as "near a boundary".
+/// 20% per docs/ROADMAP.md PR-2 acceptance gate. Tables whose
+/// boundary edges fall outside this band are NOT linked even if the
+/// column-count rule would otherwise match.
+const BOUNDARY_BAND: f64 = 0.20;
+
 /// Walk a page-sorted table list and link consecutive tables that
-/// look like continuations of each other. Heuristic for v1.2-rc3:
-/// next table is the first on its page (id == 0), prev table is the
-/// last on the previous page, and their column counts match within
-/// ±1. Refinements (column-anchor proximity, near-bottom-of-page /
-/// near-top-of-page geometry) land in v1.2-rc4 once page-height
-/// context is threaded through.
-pub fn linkContinuations(list: []Table) void {
+/// look like continuations of each other. The base heuristic
+/// (v1.2-rc3): next table is the first on its page (id == 0), prev
+/// table is the last on the previous page, and their column counts
+/// match within ±1.
+///
+/// PR-2 [feat]: when `media_box_ctx` + `media_box_fn` are provided,
+/// also require `a` to sit near the bottom of its page AND `b` to
+/// sit near the top of the next page. Without this constraint, two
+/// unrelated price tables on consecutive pages would be linked just
+/// because their column counts happen to match. Tables without a
+/// bbox (Pass A pre-bbox) bypass this geometry check so we don't
+/// regress tagged-PDF dedup.
+///
+/// The "near a boundary" band is `BOUNDARY_BAND` × page-height
+/// (currently 20%). PDF coordinate convention: y0 = bottom, y1 = top,
+/// y increases upward.
+pub fn linkContinuations(
+    list: []Table,
+    media_box_ctx: ?*const anyopaque,
+    media_box_fn: ?PageMediaBoxFn,
+) void {
     if (list.len < 2) return;
-    // Find the LAST table on each page.
     var i: usize = 0;
     while (i + 1 < list.len) : (i += 1) {
         const a = &list[i];
@@ -83,6 +109,32 @@ pub fn linkContinuations(list: []Table) void {
         // Column-count match (±1).
         const dcol: i64 = @as(i64, @intCast(a.n_cols)) - @as(i64, @intCast(b.n_cols));
         if (dcol < -1 or dcol > 1) continue;
+
+        // PR-2 [feat]: bbox-y proximity constraint. Skip when ctx
+        // + fn are unset (legacy / unit-test path) or when either
+        // table has no bbox (Pass A pre-bbox falls back to
+        // column-count rule alone).
+        if (media_box_fn) |mbf| if (a.bbox != null and b.bbox != null) {
+            const ctx = media_box_ctx.?;
+            const mb_a = mbf(ctx, a.page) orelse continue;
+            const mb_b = mbf(ctx, b.page) orelse continue;
+            const h_a = mb_a[3] - mb_a[1];
+            const h_b = mb_b[3] - mb_b[1];
+            if (h_a <= 0 or h_b <= 0) continue; // degenerate page
+
+            // a near BOTTOM of page p: a.bbox.y0 (table's lower
+            // edge) must sit within BOUNDARY_BAND × h_a of the
+            // page's lower edge mb_a.y0.
+            const a_bottom_gap = a.bbox.?[1] - mb_a[1];
+            if (a_bottom_gap > BOUNDARY_BAND * h_a) continue;
+
+            // b near TOP of page p+1: b.bbox.y1 (table's upper
+            // edge) must sit within BOUNDARY_BAND × h_b of the
+            // page's upper edge mb_b.y1.
+            const b_top_gap = mb_b[3] - b.bbox.?[3];
+            if (b_top_gap > BOUNDARY_BAND * h_b) continue;
+        };
+
         a.continued_to = .{ .page = b.page, .table_id = b.id };
         b.continued_from = .{ .page = a.page, .table_id = a.id };
     }

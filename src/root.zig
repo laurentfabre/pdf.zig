@@ -1182,7 +1182,7 @@ pub const Document = struct {
                 return a.id < b.id;
             }
         }.lt);
-        tables.linkContinuations(result);
+        tables.linkContinuations(result, @ptrCast(self), pageMediaBoxLookup);
         return result;
     }
 
@@ -1223,6 +1223,17 @@ pub const Document = struct {
         const uni = area_a + area_b - inter;
         if (uni <= 0) return 0.0;
         return inter / uni;
+    }
+
+    /// PR-2: 1-based page → MediaBox lookup for tables.linkContinuations.
+    /// Returns null when `page` is 0 (sentinel for "page unknown")
+    /// or out of range.
+    fn pageMediaBoxLookup(ctx: *const anyopaque, page: u32) ?[4]f64 {
+        if (page == 0) return null;
+        const self: *const Document = @ptrCast(@alignCast(ctx));
+        const idx: usize = @intCast(page - 1);
+        if (idx >= self.pages.items.len) return null;
+        return self.pages.items[idx].media_box;
     }
 
     fn pageRefToZeroBased(ctx: *const anyopaque, page_ref: ?ObjRef) ?u32 {
