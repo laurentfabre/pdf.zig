@@ -1255,7 +1255,20 @@ pub const Document = struct {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 return extractor;
             };
-            self.doc.ensurePageFonts(page_idx);
+            // Codex review v1.2-rc4 PR-3 round 3 [P2]: previously
+            // called `self.doc.ensurePageFonts(page_idx)` which is a
+            // void-returning function that silently swallows OOM
+            // internally (its inner `catch continue` / `catch {}`
+            // sites mask allocator failures). Pass A's MCID text
+            // extraction would then degrade to raw-byte text under
+            // OOM with no signal. Skip the font-cache warm-up
+            // entirely here: extractContentStream's text decoders
+            // fall back to raw bytes when a font is uncached, which
+            // is correct for ASCII / WinAnsi (the common case in
+            // tagged tables). For multi-byte CMap-encoded text the
+            // result is partially-decoded; that's a known
+            // limitation tracked for a v1.x follow-up where
+            // ensurePageFonts becomes errorable.
             var nw: NullWriter = .{};
             extractContentStream(
                 content,

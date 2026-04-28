@@ -221,11 +221,21 @@ fn walkForTables(
     if (isTableElement(elem.struct_type)) {
         if (try buildTableFromElement(allocator, elem, page_lookup_ctx, page_lookup_fn, mcid_text_lookup_ctx, mcid_text_lookup_fn)) |raw| {
             var tbl = raw;
+            // Codex review v1.2-rc4 PR-3 round 3 [P2]: guard the
+            // built-but-not-yet-appended table against OOM in the
+            // intervening per_page_counter.put. Without this, an
+            // OOM there leaks the table's cells + cell texts.
+            var appended = false;
+            errdefer if (!appended) {
+                for (tbl.cells) |c| if (c.text) |txt| allocator.free(txt);
+                allocator.free(tbl.cells);
+            };
             const pg_zero_based: u32 = if (tbl.page == 0) 0 else tbl.page - 1;
             const next_id = per_page_counter.get(pg_zero_based) orelse 0;
             tbl.id = next_id;
             try per_page_counter.put(pg_zero_based, next_id + 1);
             try out.append(allocator, tbl);
+            appended = true;
         }
         // Don't recurse into nested tables yet; v1.2.W2 follow-up.
         return;
@@ -257,7 +267,15 @@ fn buildTableFromElement(
     var n_cols: u32 = 0;
     var header_rows: u32 = 0;
     var cells: std.ArrayList(Cell) = .empty;
-    errdefer cells.deinit(allocator);
+    // Codex review v1.2-rc4 PR-3 round 3 [P2]: PR-3 populates Cell.text
+    // with caller-allocator-owned slices. The previous bare
+    // `cells.deinit(allocator)` errdefer leaked every prior cell's
+    // text on a downstream OOM (later append, mcid lookup, or
+    // toOwnedSlice). Free per-cell text before the deinit.
+    errdefer {
+        for (cells.items) |c| if (c.text) |txt| allocator.free(txt);
+        cells.deinit(allocator);
+    }
 
     // Per-row column counter, accounting for spans propagated from previous rows.
     var col_carry: [128]u32 = undefined; // rowspan-carry per column; capped at 128 cols
