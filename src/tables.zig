@@ -124,6 +124,17 @@ fn collectMcidText(
         switch (child) {
             .element => |sub| try collectMcidText(allocator, sub, my_page, lookup_ctx, lookup, out, depth + 1),
             .mcid => |mcr| {
+                // Codex review v1.2-rc4 PR-3 round 5 [P2]: an MCR
+                // with a non-null /Stm refers to a marked-content
+                // sequence inside a Form XObject's content stream,
+                // not the page's. Looking it up against the page-
+                // content extractor would either miss or — worse —
+                // collide with a page-content MCID that happens to
+                // share the same integer. Skip these for now;
+                // resolving /Stm content streams is a v1.x follow-up
+                // (the lookup needs to key on (page, stream) pairs
+                // and parse the referenced stream).
+                if (mcr.stream_ref != null) continue;
                 const page_ref = mcr.page_ref orelse my_page;
                 const mcid_text = (try lookup(lookup_ctx, page_ref, mcr.mcid)) orelse continue;
                 if (mcid_text.len == 0) continue;
