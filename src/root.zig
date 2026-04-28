@@ -1176,6 +1176,7 @@ pub const Document = struct {
                 if (!conflictsExisting(combined.items, t)) {
                     try combined.append(allocator, t);
                 } else {
+                    for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
                     allocator.free(t.cells);
                 }
             }
