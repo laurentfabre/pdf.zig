@@ -27,9 +27,72 @@
 const std = @import("std");
 const interpreter = @import("interpreter.zig");
 const tables = @import("tables.zig");
+const parser = @import("parser.zig");
+const pagetree = @import("pagetree.zig");
+const decompress = @import("decompress.zig");
+const xref_mod = @import("xref.zig");
 
 const COORD_TOLERANCE: f64 = 1.0; // 1 pt (≈0.35 mm)
 const MIN_STROKE_LEN: f64 = 4.0; // ignore strokes shorter than 4 pt
+
+/// Hard cap on Form XObject `Do` recursion. Mirrors the constant used by
+/// the text-extraction path in root.zig (`ExtractionContext.MAX_DEPTH`).
+/// PDF spec allows nested XObjects; 10 frames is comfortably above any
+/// realistic template nesting and below the point where stack pressure
+/// matters.
+pub const MAX_XOBJECT_DEPTH: u8 = 10;
+
+/// Document-level state needed to resolve indirect references when
+/// recursing into Form XObjects. All fields point at long-lived storage
+/// owned by the `Document`; lattice never frees them.
+pub const DocState = struct {
+    /// Allocator the parser uses for resolved object dictionaries that
+    /// land in `object_cache`. Must outlive the recursion.
+    parse_allocator: std.mem.Allocator,
+    /// Allocator for transient buffers (decompressed Form content).
+    /// Freed by `collectStrokes` before returning.
+    scratch_allocator: std.mem.Allocator,
+    /// Raw PDF bytes — parser reads object data straight from this.
+    data: []const u8,
+    xref_table: *const xref_mod.XRefTable,
+    object_cache: *std.AutoHashMap(u32, parser.Object),
+};
+
+/// Optional context for `collectStrokes`. Default is the legacy
+/// page-content-only behaviour: `Do` operators are ignored.
+///
+/// Provide `resources` + `doc` to opt into Form XObject recursion.
+pub const CollectContext = struct {
+    /// Currently in-scope Resources dict — the page's at the outermost
+    /// call, or the resolved Form Resources dict during recursion.
+    /// Used to resolve `/XObject/<name>` for `Do` operators in the
+    /// content stream being walked.
+    resources: ?parser.Object.Dict = null,
+    /// The PAGE Resources dict — preserved across recursion frames.
+    /// Per ISO 32000-1 §7.8.3, when a Form XObject omits its own
+    /// `/Resources` (or sets it to .null per §7.3.9), the fallback
+    /// is the resources of the page on which the form appears,
+    /// NOT the calling form's resources. PDFBox and MuPDF agree.
+    /// Defaults to `resources` when set by the outermost caller via
+    /// `collectStrokesIn` (see initializer there); recursion preserves
+    /// it explicitly.
+    page_resources: ?parser.Object.Dict = null,
+    /// Document-level state for indirect-reference resolution.
+    /// Must be non-null whenever `resources` is set; both are required
+    /// for recursion to fire.
+    doc: ?DocState = null,
+    /// Current recursion depth. The public entry point starts at 0;
+    /// each `Do` increments by 1. Recursion stops at MAX_XOBJECT_DEPTH.
+    depth: u8 = 0,
+    /// Initial CTM applied before walking `content`. Default identity.
+    /// Used to inject the parent's CTM × the Form's `/Matrix` when
+    /// recursing.
+    initial_ctm: Mat = .{},
+    /// Visited set (object numbers) for cycle detection across the
+    /// whole recursion. The outermost call passes `null`; the worker
+    /// allocates a local set and threads it through.
+    visited: ?*std.AutoHashMap(u32, void) = null,
+};
 
 pub const Stroke = struct {
     /// Two endpoints in user-space.
@@ -72,20 +135,100 @@ const Mat = struct {
             .f = self.e * other.b + self.f * other.d + other.f,
         };
     }
+    /// Compute the inverse of this affine matrix. Returns null when
+    /// the matrix is singular (det ≈ 0). PDF user-space matrices that
+    /// fall through here are rotation / scale / shear / translation
+    /// composites; non-singular by construction in well-formed PDFs.
+    fn inverse(self: Mat) ?Mat {
+        const det = self.a * self.d - self.b * self.c;
+        if (!std.math.isFinite(det)) return null;
+        if (@abs(det) < 1e-12) return null;
+        const inv_det = 1.0 / det;
+        return Mat{
+            .a = self.d * inv_det,
+            .b = -self.b * inv_det,
+            .c = -self.c * inv_det,
+            .d = self.a * inv_det,
+            .e = (self.c * self.f - self.d * self.e) * inv_det,
+            .f = (self.b * self.e - self.a * self.f) * inv_det,
+        };
+    }
+    fn isFinite(self: Mat) bool {
+        return std.math.isFinite(self.a) and std.math.isFinite(self.b) and
+            std.math.isFinite(self.c) and std.math.isFinite(self.d) and
+            std.math.isFinite(self.e) and std.math.isFinite(self.f);
+    }
 };
 
 /// Walk a content stream and return every horizontal/vertical stroke
 /// in user-space, ignoring text + colour + clip ops. Caller frees.
+///
+/// This is the legacy entry point: `Do` operators are silently ignored,
+/// so any tables drawn inside Form XObjects are invisible. Use
+/// `collectStrokesIn` to opt into Form XObject recursion.
 pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stroke {
+    return collectStrokesIn(allocator, content, .{});
+}
+
+/// Resource-aware variant of `collectStrokes`.
+///
+/// When `ctx.resources` AND `ctx.doc` are both set, `Do` operators
+/// resolve the named XObject from the page Resources, push the parent
+/// CTM × the Form's `/Matrix` onto the graphics state, and recurse into
+/// the Form content stream. Recursion is depth-capped at
+/// `MAX_XOBJECT_DEPTH` and cycle-guarded via a visited set keyed on
+/// indirect-reference object numbers.
+///
+/// All recursion errors are swallowed — a corrupt or unsupported
+/// XObject must not poison the surrounding stroke collection.
+pub fn collectStrokesIn(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    ctx: CollectContext,
+) ![]Stroke {
+    var strokes: std.ArrayList(Stroke) = .empty;
+    errdefer strokes.deinit(allocator);
+
+    // The outermost call owns the visited set; nested calls borrow it.
+    var owned_visited: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(allocator);
+    defer if (ctx.visited == null) owned_visited.deinit();
+    const visited = ctx.visited orelse &owned_visited;
+
+    // Default `page_resources` to the caller's in-scope resources when
+    // unset. The outermost caller passes the page's resources via
+    // `ctx.resources`; the page IS the page in that frame, so they
+    // are equal at depth 0. Recursive frames preserve the original
+    // page_resources so a deeply nested Form's absent/null
+    // /Resources still falls back to the page, not its callers.
+    var seeded_ctx = ctx;
+    if (seeded_ctx.page_resources == null) seeded_ctx.page_resources = ctx.resources;
+
+    try collectStrokesWalk(allocator, content, seeded_ctx, visited, &strokes);
+    return strokes.toOwnedSlice(allocator);
+}
+
+/// Inner worker. Walks a single content stream and appends to `out`.
+/// `Do` triggers a recursive call into the worker on the resolved Form
+/// XObject's content stream. CTM stack is local to this frame.
+fn collectStrokesWalk(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    ctx: CollectContext,
+    visited: *std.AutoHashMap(u32, void),
+    out: *std.ArrayList(Stroke),
+) anyerror!void {
     var lexer = interpreter.ContentLexer.init(allocator, content);
     var operands: std.ArrayList(f64) = .empty;
     defer operands.deinit(allocator);
     var ctm_stack: std.ArrayList(Mat) = .empty;
     defer ctm_stack.deinit(allocator);
-    try ctm_stack.append(allocator, Mat{});
+    try ctm_stack.append(allocator, ctx.initial_ctm);
 
-    var strokes: std.ArrayList(Stroke) = .empty;
-    errdefer strokes.deinit(allocator);
+    // Most-recent name token. PDF operators consume the immediately-
+    // preceding name (e.g. `Do`, `Tf`, `gs`). Reset after each operator
+    // so a stale name from three ops ago can't be misread as the
+    // operand of the next `Do`.
+    var last_name: []const u8 = "";
 
     var path_x: f64 = 0;
     var path_y: f64 = 0;
@@ -97,9 +240,16 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
     while (try lexer.next()) |tok| {
         switch (tok) {
             .number => |n| try operands.append(allocator, n),
-            .name, .string, .hex_string, .array => operands.clearRetainingCapacity(),
+            .name => |n| {
+                last_name = n;
+                operands.clearRetainingCapacity();
+            },
+            .string, .hex_string, .array => operands.clearRetainingCapacity(),
             .operator => |op| {
-                defer operands.clearRetainingCapacity();
+                defer {
+                    operands.clearRetainingCapacity();
+                    last_name = "";
+                }
                 if (op.len == 0) continue;
                 const ctm = ctm_stack.items[ctm_stack.items.len - 1];
 
@@ -162,7 +312,7 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
                     // Path stroked — keep horizontal+vertical segments only.
                     for (path_segments.items) |seg| {
                         if (seg.isHorizontal() or seg.isVertical()) {
-                            try strokes.append(allocator, seg);
+                            try out.append(allocator, seg);
                         }
                     }
                     path_segments.clearRetainingCapacity();
@@ -171,12 +321,638 @@ pub fn collectStrokes(allocator: std.mem.Allocator, content: []const u8) ![]Stro
                 {
                     // Unstroked path — discard segments.
                     path_segments.clearRetainingCapacity();
+                } else if (std.mem.eql(u8, op, "Do") and last_name.len > 0) {
+                    handleDoOperator(allocator, last_name, ctx, ctm, visited, out) catch |err| {
+                        // OOM must propagate; everything else is a soft
+                        // failure that should not abort outer collection.
+                        if (err == error.OutOfMemory) return err;
+                    };
                 }
             },
         }
     }
+}
 
-    return strokes.toOwnedSlice(allocator);
+/// Resolve an indirect reference, preserving `error.OutOfMemory` while
+/// converting domain errors (CorruptObject etc.) into a soft `null`
+/// return so callers can gracefully fall through.
+///
+/// Codex review v1.2-rc4 round 2 [P2]: previously each `catch return`
+/// or `catch break` masked OOM as well, downgrading allocator pressure
+/// to a silent skip. The contract for the lattice helpers is
+/// "OOM bubbles, all other errors soft-fail" — this helper enforces it.
+fn resolveRefSoft(doc: DocState, ref: parser.ObjRef) error{OutOfMemory}!?parser.Object {
+    return pagetree.resolveRef(doc.parse_allocator, doc.data, doc.xref_table, ref, doc.object_cache) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+}
+
+/// Decompress a stream's body, preserving `error.OutOfMemory` while
+/// converting domain errors (corrupt filter chain, bad params) into a
+/// `null` return.
+fn decompressStreamSoft(
+    doc: DocState,
+    body: []const u8,
+    filter: ?parser.Object,
+    params: ?parser.Object,
+) error{OutOfMemory}!?[]u8 {
+    return decompress.decompressStream(doc.scratch_allocator, body, filter, params) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+}
+
+/// Recurse into the Form XObject named `name`, appending strokes to
+/// `out` in the parent's user-space coordinate frame.
+///
+/// `error.OutOfMemory` propagates so allocator pressure can't be silently
+/// masked. All other errors (corrupt object stream, bad indirect ref,
+/// missing Subtype, decode failure, visited cycle) result in a no-op
+/// return.
+fn handleDoOperator(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    ctx: CollectContext,
+    parent_ctm: Mat,
+    visited: *std.AutoHashMap(u32, void),
+    out: *std.ArrayList(Stroke),
+) anyerror!void {
+    if (ctx.depth >= MAX_XOBJECT_DEPTH) return;
+    const resources = ctx.resources orelse return;
+    const doc = ctx.doc orelse return;
+
+    // Resolve `/XObject` dict (may be inline or an indirect reference).
+    const xobjects_obj = resources.get("XObject") orelse return;
+    const xobjects = switch (xobjects_obj) {
+        .dict => |d| d,
+        .reference => |ref| blk: {
+            const resolved = (try resolveRefSoft(doc, ref)) orelse return;
+            break :blk switch (resolved) {
+                .dict => |d| d,
+                else => return,
+            };
+        },
+        else => return,
+    };
+
+    // Look up the named XObject (also possibly a reference).
+    //
+    // Codex round 20 [P2]: PDF spec §7.3.5 lets names in the content
+    // stream use `#xx` escapes for special characters (e.g.
+    // `/Fm#31 Do` is the same name as `/Fm1`). The dictionary parser
+    // (`parser.zig::scanName`) decodes those escapes when building
+    // resource keys, but `interpreter.ContentLexer.scanName` does
+    // not — so a raw lookup with the lexer's bytes can miss a
+    // legitimate match.
+    //
+    // PDFBox, MuPDF, and pdf.js all decode at the matching boundary.
+    // Decode-then-lookup; if the name has no escapes the helper
+    // returns the input slice unchanged (no allocation).
+    var name_buf: [256]u8 = undefined;
+    const decoded_name = decodePdfName(name, &name_buf);
+    const xobj = xobjects.get(decoded_name) orelse return;
+    var xobj_ref_num: ?u32 = null;
+    const xobj_resolved = switch (xobj) {
+        .stream => |s| s,
+        .reference => |ref| blk: {
+            xobj_ref_num = ref.num;
+            // Cycle guard: if we're already inside this XObject, bail.
+            if (visited.contains(ref.num)) return;
+            const resolved = (try resolveRefSoft(doc, ref)) orelse return;
+            break :blk switch (resolved) {
+                .stream => |s| s,
+                else => return,
+            };
+        },
+        else => return,
+    };
+
+    // Form XObjects only — Image / PS XObjects don't contribute strokes.
+    // Codex review v1.2-rc4 round 10 [P2]: /Subtype, /Filter, and
+    // /DecodeParms can each be stored as an indirect reference per
+    // PDF spec §7.3.10. Resolve them through resolveRefSoft (single
+    // level) before consuming so a Form with `/Subtype 99 0 R` is
+    // still recognized and a stream with `/Filter 99 0 R` is still
+    // decoded.
+    const subtype_obj = (try dictGetResolvedSoft(xobj_resolved.dict, "Subtype", doc)) orelse return;
+    const subtype = switch (subtype_obj) {
+        .name => |n| n,
+        else => return,
+    };
+    if (!std.mem.eql(u8, subtype, "Form")) return;
+
+    // Decompress the Form content stream into scratch memory.
+    // Round 10 [P2] resolved indirect /Filter and /DecodeParms at the
+    // dict-entry level. Round 11 [P2] additionally normalizes per-
+    // element indirect refs inside their array shape so chains like
+    // `/Filter [12 0 R]` survive through the decompressor. Round 18
+    // [P2] adds inner-dict resolution for /DecodeParms — entries
+    // like `/Predictor N 0 R` or `/Columns N 0 R` are now resolved
+    // before the decompressor reads them.
+    const filter_raw = try dictGetResolvedSoft(xobj_resolved.dict, "Filter", doc);
+    const params_raw = try dictGetResolvedSoft(xobj_resolved.dict, "DecodeParms", doc);
+    const filter = try normalizeFilterChain(filter_raw, doc);
+    const params = try normalizeDecodeParms(params_raw, doc);
+    const form_content = (try decompressStreamSoft(doc, xobj_resolved.data, filter, params)) orelse return;
+    defer doc.scratch_allocator.free(form_content);
+
+    // Compose the effective CTM for the Form's own content. Per PDF
+    // spec §8.10: the Form's `/Matrix` (default identity) is applied
+    // BEFORE the parent's CTM, i.e. effective = parent_ctm × form_matrix.
+    const form_matrix = try readMatrix(xobj_resolved.dict, doc);
+    const effective_ctm = form_matrix.mul(parent_ctm);
+
+    // Form Resources lookup, four-state result:
+    //   - Key ABSENT       → fall back to PAGE resources (§7.8.3).
+    //   - Key PRESENT, .null → equivalent to absent per §7.3.9
+    //     ("specifying the null object as the value of a dictionary
+    //     entry shall be equivalent to omitting the entry entirely")
+    //     → fall back to PAGE resources.
+    //   - Key PRESENT, resolves to a Dict → use that dict.
+    //   - Key PRESENT, non-null and non-dict (or indirect ref to
+    //     non-dict / non-null) → fail closed: the Form declared its
+    //     own (broken) resource scope and must NOT silently access
+    //     the parent's /XObject map.
+    //
+    // Codex review v1.2-rc4 round 9 [P2]: parent-fallback for every
+    // non-Dict shape was too permissive — fixed.
+    // Round 16 [P2]: round-9 over-corrected by including .null;
+    // spec §7.3.9 says .null == absent. Fixed.
+    // Round 17 [P2]: when Form Resources is absent/null, the spec-
+    // correct fallback is the PAGE Resources (preserved as
+    // ctx.page_resources), not the calling Form's resources.
+    // PDFBox and MuPDF agree. Previously we used `resources`
+    // (= calling frame's), which differed only for nested Forms
+    // where the outer Form shadowed page-level /XObject names.
+    const page_fallback = ctx.page_resources orelse resources;
+    const form_resources: ?parser.Object.Dict = blk: {
+        const obj = xobj_resolved.dict.get("Resources") orelse break :blk page_fallback;
+        break :blk switch (obj) {
+            .dict => |d| d,
+            .null => page_fallback,
+            .reference => |ref| ref_blk: {
+                const resolved = (try resolveRefSoft(doc, ref)) orelse break :ref_blk page_fallback;
+                break :ref_blk switch (resolved) {
+                    .dict => |d| d,
+                    .null => page_fallback,
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    };
+
+    // Mark this XObject visited for the duration of the recursion so
+    // that mutual references can't loop.
+    if (xobj_ref_num) |n| try visited.put(n, {});
+    defer {
+        if (xobj_ref_num) |n| _ = visited.remove(n);
+    }
+
+    const child_ctx = CollectContext{
+        .resources = form_resources,
+        .page_resources = ctx.page_resources, // preserved across recursion
+        .doc = doc,
+        .depth = ctx.depth + 1,
+        .initial_ctm = effective_ctm,
+        .visited = visited,
+    };
+
+    // Codex review v1.2-rc4 round 4 [P2]: per PDF spec §8.10, a Form
+    // XObject's `/BBox` is a *mandatory* clip region — content drawn
+    // outside is invisible to the rasterizer. Lattice ignored this
+    // and counted out-of-BBox strokes, which could surface phantom
+    // tables that never render.
+    //
+    // Snapshot the stroke list length, run the recursion, then drop
+    // strokes that fall entirely outside the BBox transformed into
+    // user-space. Strokes crossing the boundary are kept (partial
+    // visibility still contributes to row/column clusters).
+    const snapshot = out.items.len;
+    try collectStrokesWalk(allocator, form_content, child_ctx, visited, out);
+
+    if (try readBBox(xobj_resolved.dict, doc)) |bbox_form| {
+        // Codex review v1.2-rc4 round 6 [P2]: clipping against the
+        // user-space AABB of a transformed /BBox is conservative —
+        // for non-orthogonal CTMs (rotation, shear) it admits strokes
+        // that fall outside the true rotated quadrilateral. Round-trip
+        // each user-space stroke back to form-space via inverse_ctm,
+        // clip against the form-space (axis-aligned) /BBox there, then
+        // map clipped endpoints back to user-space.
+        //
+        // When effective_ctm is singular (det ≈ 0) we fall back to the
+        // user-space AABB approach: the form is degenerate (collapsed
+        // to a line or point), so any clipping policy will produce
+        // collinear strokes that downstream filters drop anyway.
+        if (effective_ctm.inverse()) |inv_ctm| {
+            var write: usize = snapshot;
+            var read: usize = snapshot;
+            while (read < out.items.len) : (read += 1) {
+                if (clipStrokeInFormSpace(out.items[read], bbox_form, inv_ctm, effective_ctm)) |clipped| {
+                    out.items[write] = clipped;
+                    write += 1;
+                }
+            }
+            out.shrinkRetainingCapacity(write);
+        } else {
+            const clip_user = transformBBox(bbox_form, effective_ctm);
+            var write: usize = snapshot;
+            var read: usize = snapshot;
+            while (read < out.items.len) : (read += 1) {
+                if (clipStrokeToBox(out.items[read], clip_user)) |clipped| {
+                    out.items[write] = clipped;
+                    write += 1;
+                }
+            }
+            out.shrinkRetainingCapacity(write);
+        }
+    }
+}
+
+/// Round-trip a user-space stroke into form-space, clip against the
+/// axis-aligned form-space /BBox, then map back to user-space.
+///
+/// A form-space rotated `/BBox` is exact for any non-singular CTM —
+/// strokes that touch the visible quadrilateral survive (with their
+/// out-of-quad portions trimmed); strokes fully outside drop. After
+/// the round-trip, axis-aligned strokes in form-space remain axis-
+/// aligned in user-space too (the CTM is invertible affine), so
+/// downstream `isHorizontal`/`isVertical` filters still apply.
+fn clipStrokeInFormSpace(
+    s: Stroke,
+    bbox_form: [4]f64,
+    inv_ctm: Mat,
+    fwd_ctm: Mat,
+) ?Stroke {
+    // User-space → form-space.
+    const a_form = inv_ctm.apply(s.x0, s.y0);
+    const b_form = inv_ctm.apply(s.x1, s.y1);
+    if (!std.math.isFinite(a_form.x) or !std.math.isFinite(a_form.y) or
+        !std.math.isFinite(b_form.x) or !std.math.isFinite(b_form.y)) return null;
+
+    const form_stroke = Stroke{
+        .x0 = a_form.x, .y0 = a_form.y,
+        .x1 = b_form.x, .y1 = b_form.y,
+    };
+    const clipped_form = clipStrokeToBox(form_stroke, bbox_form) orelse return null;
+
+    // Form-space → user-space via the forward CTM.
+    const a_back = fwd_ctm.apply(clipped_form.x0, clipped_form.y0);
+    const b_back = fwd_ctm.apply(clipped_form.x1, clipped_form.y1);
+    if (!std.math.isFinite(a_back.x) or !std.math.isFinite(a_back.y) or
+        !std.math.isFinite(b_back.x) or !std.math.isFinite(b_back.y)) return null;
+
+    return Stroke{
+        .x0 = a_back.x, .y0 = a_back.y,
+        .x1 = b_back.x, .y1 = b_back.y,
+    };
+}
+
+/// Decode PDF name escapes (`#xx` → byte 0xXX) per ISO 32000-1
+/// §7.3.5. The output is written into `out_buf`; if the input
+/// contains no `#` byte the input slice is returned as-is (no
+/// copy). On invalid escapes (truncated, non-hex), copies the raw
+/// `#` byte through — same conservative recovery PDFBox uses.
+///
+/// Codex review v1.2-rc4 round 20 [P2]: ContentLexer.scanName does
+/// not decode escapes, but parser.zig::scanName does, so dict keys
+/// like `/Fm1` won't match a content-stream name like `/Fm#31`.
+/// Apply this decoder at the lookup boundary.
+fn decodePdfName(name: []const u8, out_buf: []u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, name, '#') == null) return name;
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < name.len and w < out_buf.len) : (w += 1) {
+        if (name[i] == '#' and i + 2 < name.len) {
+            const hi = std.fmt.charToDigit(name[i + 1], 16) catch {
+                out_buf[w] = name[i];
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(name[i + 2], 16) catch {
+                out_buf[w] = name[i];
+                i += 1;
+                continue;
+            };
+            out_buf[w] = (hi << 4) | lo;
+            i += 3;
+        } else {
+            out_buf[w] = name[i];
+            i += 1;
+        }
+    }
+    return out_buf[0..w];
+}
+
+/// Look up `key` in `dict`, following one level of indirect reference.
+/// Returns null when the key is absent or the indirect target can't be
+/// resolved. Codex review v1.2-rc4 round 10 [P2]: PDF dictionary
+/// values like `/Subtype`, `/Filter`, `/DecodeParms` can legally be
+/// indirect refs; this helper unifies the resolution policy.
+fn dictGetResolvedSoft(dict: parser.Object.Dict, key: []const u8, doc: DocState) error{OutOfMemory}!?parser.Object {
+    const obj = dict.get(key) orelse return null;
+    return switch (obj) {
+        .reference => |ref| try resolveRefSoft(doc, ref),
+        else => obj,
+    };
+}
+
+/// Normalize a filter-chain Object into a shape `decompress.decompressStream`
+/// can consume — every member resolved through one level of indirect
+/// reference.
+///
+/// Codex review v1.2-rc4 round 11 [P2]: `/Filter` and `/DecodeParms`
+/// can be `[N 0 R N 0 R ...]` arrays where each element is itself an
+/// indirect reference. Round-10 only resolved the outer dict entry;
+/// any array members stayed as `.reference` and decompressStream
+/// silently dropped them.
+///
+/// Allocates a fresh array on `doc.scratch_allocator` only when needed
+/// (i.e. an indirect array member is found). Direct `.name` arrays
+/// pass through unchanged.
+fn normalizeFilterChain(obj: ?parser.Object, doc: DocState) error{OutOfMemory}!?parser.Object {
+    const o = obj orelse return null;
+    return switch (o) {
+        .array => |arr| blk: {
+            // First pass: do any elements need resolving?
+            var needs_alloc = false;
+            for (arr) |el| {
+                if (el == .reference) {
+                    needs_alloc = true;
+                    break;
+                }
+            }
+            if (!needs_alloc) break :blk o;
+
+            // Second pass: build a new array with resolved elements.
+            const out = doc.scratch_allocator.alloc(parser.Object, arr.len) catch return error.OutOfMemory;
+            for (arr, 0..) |el, i| {
+                out[i] = switch (el) {
+                    .reference => |ref| (try resolveRefSoft(doc, ref)) orelse parser.Object{ .null = {} },
+                    else => el,
+                };
+            }
+            break :blk parser.Object{ .array = out };
+        },
+        else => o,
+    };
+}
+
+/// Like `normalizeFilterChain`, but for `/DecodeParms`. Each member
+/// of a `/DecodeParms` is itself a dict (e.g. FlateDecode params:
+/// `<< /Predictor N /Columns N /Colors N /BitsPerComponent N >>`).
+/// Per ISO 32000-1 §7.3.10, those inner entry values may legally be
+/// indirect references. PDFBox dereferences them via FilterParameters;
+/// pdf.js dereferences via parser auto-resolution; MuPDF documents
+/// the same.
+///
+/// Codex review v1.2-rc4 round 18 [P2]: previously the lattice path
+/// resolved the outer `/DecodeParms` and any wrapping array members
+/// but left dict entries unresolved, so `decompressStream()`
+/// (which reads `Predictor`/`Columns`/etc. with direct-only get)
+/// silently used wrong values, post-predictor bytes leaked into
+/// the parser, and tables were missed.
+///
+/// Allocations are scratch-allocated only when at least one inner
+/// reference needs resolving. Direct-only inputs pass through
+/// unchanged (slice ptr identity preserved).
+fn normalizeDecodeParms(obj: ?parser.Object, doc: DocState) error{OutOfMemory}!?parser.Object {
+    const o = obj orelse return null;
+    return switch (o) {
+        .dict => |d| try normalizeParamsDict(d, doc),
+        .array => |arr| blk: {
+            // Walk array; if any member is a dict that needs
+            // normalization, build a fresh array with each dict
+            // (recursively) normalized.
+            var needs_alloc = false;
+            for (arr) |el| {
+                switch (el) {
+                    .dict => |d| {
+                        if (paramsDictNeedsAlloc(d)) {
+                            needs_alloc = true;
+                            break;
+                        }
+                    },
+                    .reference => {
+                        needs_alloc = true;
+                        break;
+                    },
+                    else => {},
+                }
+            }
+            if (!needs_alloc) break :blk o;
+
+            const out = doc.scratch_allocator.alloc(parser.Object, arr.len) catch return error.OutOfMemory;
+            for (arr, 0..) |el, i| {
+                out[i] = switch (el) {
+                    .reference => |ref| ref_blk: {
+                        // Round 19 [P2]: when an array member resolves
+                        // to a dict, normalize THAT dict's entries too
+                        // so inner /Predictor N 0 R etc. don't survive.
+                        const resolved = (try resolveRefSoft(doc, ref)) orelse break :ref_blk parser.Object{ .null = {} };
+                        break :ref_blk switch (resolved) {
+                            .dict => |d| try normalizeParamsDict(d, doc),
+                            else => resolved,
+                        };
+                    },
+                    .dict => |d| try normalizeParamsDict(d, doc),
+                    else => el,
+                };
+            }
+            break :blk parser.Object{ .array = out };
+        },
+        else => o,
+    };
+}
+
+fn paramsDictNeedsAlloc(d: parser.Object.Dict) bool {
+    for (d.entries) |e| if (e.value == .reference) return true;
+    return false;
+}
+
+fn normalizeParamsDict(d: parser.Object.Dict, doc: DocState) error{OutOfMemory}!parser.Object {
+    if (!paramsDictNeedsAlloc(d)) return parser.Object{ .dict = d };
+
+    const new_entries = doc.scratch_allocator.alloc(parser.Object.Dict.Entry, d.entries.len) catch return error.OutOfMemory;
+    for (d.entries, 0..) |e, i| {
+        new_entries[i] = .{
+            .key = e.key,
+            .value = switch (e.value) {
+                .reference => |ref| (try resolveRefSoft(doc, ref)) orelse parser.Object{ .null = {} },
+                else => e.value,
+            },
+        };
+    }
+    return parser.Object{ .dict = .{ .entries = new_entries } };
+}
+
+/// Resolve a numeric Object element to f64, following one level of
+/// indirect reference. Returns null on non-numeric / non-finite /
+/// missing target. Codex review v1.2-rc4 round 8 [P2]: PDF arrays
+/// can legally contain indirect numeric refs (e.g. `/BBox [11 0 R
+/// 12 0 R 13 0 R 14 0 R]`). Both `readBBox` and `readMatrix` now
+/// route per-element through this helper.
+fn readNumberMaybeIndirect(obj: parser.Object, doc: DocState) error{OutOfMemory}!?f64 {
+    const concrete = switch (obj) {
+        .real, .integer => obj,
+        .reference => |ref| (try resolveRefSoft(doc, ref)) orelse return null,
+        else => return null,
+    };
+    const v: f64 = switch (concrete) {
+        .real => |r| r,
+        .integer => |n| @floatFromInt(n),
+        else => return null,
+    };
+    if (!std.math.isFinite(v)) return null;
+    return v;
+}
+
+/// Read a Form XObject's `/BBox` entry. Same indirect-ref + OOM
+/// discipline as `readMatrix`. Returns null when missing or malformed
+/// (treated as "no clip" — same as inline page content).
+fn readBBox(dict: parser.Object.Dict, doc: DocState) error{OutOfMemory}!?[4]f64 {
+    const obj = dict.get("BBox") orelse return null;
+    const arr = switch (obj) {
+        .array => |a| a,
+        .reference => |ref| blk: {
+            const resolved = (try resolveRefSoft(doc, ref)) orelse return null;
+            break :blk switch (resolved) {
+                .array => |a| a,
+                else => return null,
+            };
+        },
+        else => return null,
+    };
+    if (arr.len < 4) return null;
+    var v: [4]f64 = undefined;
+    for (0..4) |i| {
+        v[i] = (try readNumberMaybeIndirect(arr[i], doc)) orelse return null;
+    }
+    // Normalize to [x_min, y_min, x_max, y_max] — PDF spec doesn't
+    // require any particular corner ordering.
+    return [4]f64{
+        @min(v[0], v[2]),
+        @min(v[1], v[3]),
+        @max(v[0], v[2]),
+        @max(v[1], v[3]),
+    };
+}
+
+/// Transform a form-space bbox by the effective CTM into user-space.
+/// All four corners are mapped (CTM may rotate), then the AABB is
+/// returned. Conservative — a rotated form's true clip region is a
+/// tilted rectangle, but treating it as the AABB is sound (it only
+/// preserves *more* strokes than strictly needed, never drops a
+/// visible one).
+fn transformBBox(bb: [4]f64, ctm: Mat) [4]f64 {
+    const c0 = ctm.apply(bb[0], bb[1]);
+    const c1 = ctm.apply(bb[2], bb[1]);
+    const c2 = ctm.apply(bb[2], bb[3]);
+    const c3 = ctm.apply(bb[0], bb[3]);
+    return [4]f64{
+        @min(@min(c0.x, c1.x), @min(c2.x, c3.x)),
+        @min(@min(c0.y, c1.y), @min(c2.y, c3.y)),
+        @max(@max(c0.x, c1.x), @max(c2.x, c3.x)),
+        @max(@max(c0.y, c1.y), @max(c2.y, c3.y)),
+    };
+}
+
+/// True iff the stroke's AABB is fully outside the user-space clip box.
+fn strokeOutsideBox(s: Stroke, box: [4]f64) bool {
+    const min_x = @min(s.x0, s.x1);
+    const max_x = @max(s.x0, s.x1);
+    const min_y = @min(s.y0, s.y1);
+    const max_y = @max(s.y0, s.y1);
+    return max_x < box[0] or min_x > box[2] or
+        max_y < box[1] or min_y > box[3];
+}
+
+/// Clip an arbitrary line segment to an axis-aligned box using the
+/// Liang–Barsky algorithm. Returns null if the segment is fully
+/// outside; otherwise returns the visible portion.
+///
+/// Codex review v1.2-rc4 round 7 [P2]: the previous axis-aligned-only
+/// clipper handled horizontal/vertical strokes correctly but left
+/// diagonal segments untouched. After the form-space round-trip
+/// (round 6) a user-space axis-aligned stroke can become a diagonal
+/// form-space segment that crosses the /BBox boundary; the old
+/// helper would keep it at full length, leaking invisible tails back
+/// into user-space and inflating the detected table bbox.
+///
+/// Liang–Barsky handles arbitrary line orientations against an AABB
+/// in O(1) and falls through to a clean axis-aligned clamp when
+/// `dx` or `dy` is zero (parallel-to-edge case).
+fn clipStrokeToBox(s: Stroke, box: [4]f64) ?Stroke {
+    const dx = s.x1 - s.x0;
+    const dy = s.y1 - s.y0;
+    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return null;
+    var t0: f64 = 0.0;
+    var t1: f64 = 1.0;
+
+    // p[i] is the directional gradient against edge i; q[i] is the
+    // signed distance from the start point to edge i. The four edges
+    // are: left (xmin), right (xmax), bottom (ymin), top (ymax).
+    const p = [4]f64{ -dx, dx, -dy, dy };
+    const q = [4]f64{
+        s.x0 - box[0],
+        box[2] - s.x0,
+        s.y0 - box[1],
+        box[3] - s.y0,
+    };
+
+    inline for (0..4) |i| {
+        if (p[i] == 0.0) {
+            // Line is parallel to this edge AND start point is outside.
+            if (q[i] < 0.0) return null;
+        } else {
+            const t = q[i] / p[i];
+            if (p[i] < 0.0) {
+                if (t > t1) return null;
+                if (t > t0) t0 = t;
+            } else {
+                if (t < t0) return null;
+                if (t < t1) t1 = t;
+            }
+        }
+    }
+    if (t0 > t1) return null;
+
+    return Stroke{
+        .x0 = s.x0 + t0 * dx,
+        .y0 = s.y0 + t0 * dy,
+        .x1 = s.x0 + t1 * dx,
+        .y1 = s.y0 + t1 * dy,
+    };
+}
+
+/// Read a Form XObject's `/Matrix` entry into a `Mat`.
+/// Falls back to identity when missing or malformed.
+///
+/// Codex review v1.2-rc4 round 1 [P2]: `/Matrix` is legally allowed to
+/// be an indirect reference (e.g. `/Matrix 8 0 R`). Round 2 [P2]: the
+/// indirect-ref resolution must propagate `error.OutOfMemory` rather
+/// than masking it as a soft identity-fallback. Returns an error
+/// union now; the caller `try`s.
+fn readMatrix(dict: parser.Object.Dict, doc: DocState) error{OutOfMemory}!Mat {
+    const obj = dict.get("Matrix") orelse return Mat{};
+    const arr = switch (obj) {
+        .array => |a| a,
+        .reference => |ref| blk: {
+            const resolved = (try resolveRefSoft(doc, ref)) orelse return Mat{};
+            break :blk switch (resolved) {
+                .array => |a| a,
+                else => return Mat{},
+            };
+        },
+        else => return Mat{},
+    };
+    if (arr.len < 6) return Mat{};
+    var v: [6]f64 = undefined;
+    for (0..6) |i| {
+        v[i] = (try readNumberMaybeIndirect(arr[i], doc)) orelse return Mat{};
+    }
+    return Mat{ .a = v[0], .b = v[1], .c = v[2], .d = v[3], .e = v[4], .f = v[5] };
 }
 
 const Cluster = struct { coord: f64, members: std.ArrayList(Stroke) };
@@ -413,4 +1189,278 @@ test "extractFromStrokes returns no table when fewer than 2 cluster lines on eit
     const out = try extractFromStrokes(a, &strokes, 1);
     defer tables.freeTables(a, out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+// ----- Form XObject Do recursion (PR-1) -----
+
+test "collectStrokes (legacy entry) ignores Do operator without context" {
+    // Backward-compat guard: the no-ctx public entry must treat `Do`
+    // as a silent no-op so existing callers see zero behavioural change.
+    const a = std.testing.allocator;
+    const content = "10 100 m 200 100 l S\n/Foo Do\n";
+    const got = try collectStrokes(a, content);
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expect(got[0].isHorizontal());
+}
+
+test "collectStrokesIn with empty context ignores Do" {
+    // ctx = .{} ⇒ resources = null and doc = null; the Do handler must
+    // bail before doing any allocation or lookup.
+    const a = std.testing.allocator;
+    const content = "/Foo Do\n10 100 m 200 100 l S\n";
+    const got = try collectStrokesIn(a, content, .{});
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+}
+
+test "collectStrokesIn with empty content returns no strokes and no leak" {
+    const a = std.testing.allocator;
+    const got = try collectStrokesIn(a, "", .{});
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "Do without a preceding name is ignored" {
+    // last_name is reset after every operator, so a bare `Do` with no
+    // preceding /Name has nothing to look up. Must not crash, must not
+    // leak a partial entry into the visited set.
+    const a = std.testing.allocator;
+    const content = "Do\n10 100 m 200 100 l S\n";
+    const got = try collectStrokesIn(a, content, .{});
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+}
+
+test "MAX_XOBJECT_DEPTH is non-zero" {
+    // Sanity guard against accidental zeroing — depth cap = 0 would
+    // disable Form XObject recursion entirely.
+    try std.testing.expect(MAX_XOBJECT_DEPTH >= 1);
+}
+
+// ----- clipStrokeToBox (Liang–Barsky, PR-1 round 7 [P2] regression) -----
+
+test "clipStrokeToBox axis-aligned horizontal stroke fully inside" {
+    const s = Stroke{ .x0 = 50, .y0 = 100, .x1 = 200, .y1 = 100 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 300, 300 }) orelse unreachable;
+    try std.testing.expectEqual(@as(f64, 50), r.x0);
+    try std.testing.expectEqual(@as(f64, 200), r.x1);
+}
+
+test "clipStrokeToBox axis-aligned horizontal stroke crossing right edge" {
+    const s = Stroke{ .x0 = 50, .y0 = 100, .x1 = 500, .y1 = 100 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 300, 300 }) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 50), r.x0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 300), r.x1, 1e-9);
+}
+
+test "clipStrokeToBox axis-aligned vertical stroke crossing both edges" {
+    const s = Stroke{ .x0 = 50, .y0 = -10, .x1 = 50, .y1 = 400 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 300, 300 }) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.y0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 300), r.y1, 1e-9);
+}
+
+test "clipStrokeToBox stroke fully outside box returns null" {
+    const s = Stroke{ .x0 = -50, .y0 = -50, .x1 = -10, .y1 = -10 };
+    try std.testing.expect(clipStrokeToBox(s, .{ 0, 0, 100, 100 }) == null);
+}
+
+test "clipStrokeToBox diagonal stroke crossing box clamps both endpoints" {
+    // Codex round-7 counterexample: form-space segment (0,0)→(100,100)
+    // clipped against /BBox [0,0,50,50] should yield (0,0)→(50,50).
+    const s = Stroke{ .x0 = 0, .y0 = 0, .x1 = 100, .y1 = 100 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 50, 50 }) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.x0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.y0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50), r.x1, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50), r.y1, 1e-9);
+}
+
+test "clipStrokeToBox diagonal stroke trimmed at near and far edges" {
+    // (-50, -50) → (150, 150) intersects [0,0,100,100] at (0,0) and (100,100).
+    const s = Stroke{ .x0 = -50, .y0 = -50, .x1 = 150, .y1 = 150 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 100, 100 }) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.x0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), r.y0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), r.x1, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), r.y1, 1e-9);
+}
+
+test "clipStrokeToBox diagonal stroke entirely outside (parallel-but-displaced)" {
+    // 45° line above the box.
+    const s = Stroke{ .x0 = 200, .y0 = 250, .x1 = 250, .y1 = 300 };
+    try std.testing.expect(clipStrokeToBox(s, .{ 0, 0, 100, 100 }) == null);
+}
+
+test "clipStrokeToBox horizontal-on-edge stroke survives" {
+    // Stroke runs ON the bottom edge — q[i] == 0 path.
+    const s = Stroke{ .x0 = 10, .y0 = 0, .x1 = 90, .y1 = 0 };
+    const r = clipStrokeToBox(s, .{ 0, 0, 100, 100 }) orelse unreachable;
+    try std.testing.expectEqual(@as(f64, 10), r.x0);
+    try std.testing.expectEqual(@as(f64, 90), r.x1);
+}
+
+test "clipStrokeToBox NaN endpoint returns null" {
+    const s = Stroke{ .x0 = std.math.nan(f64), .y0 = 0, .x1 = 100, .y1 = 100 };
+    try std.testing.expect(clipStrokeToBox(s, .{ 0, 0, 100, 100 }) == null);
+}
+
+// ----- Mat.inverse (PR-1 round 6 [P2] regression) -----
+
+test "Mat.inverse on identity returns identity" {
+    const m = Mat{};
+    const inv = m.inverse() orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 1), inv.a, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), inv.b, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), inv.c, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), inv.d, 1e-12);
+}
+
+test "Mat.inverse round-trip on translation+rotation" {
+    // 90° CCW + translate (e=10, f=20).
+    const m = Mat{ .a = 0, .b = 1, .c = -1, .d = 0, .e = 10, .f = 20 };
+    const inv = m.inverse() orelse unreachable;
+    const p = m.apply(5, 7);
+    const back = inv.apply(p.x, p.y);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), back.x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 7), back.y, 1e-9);
+}
+
+test "Mat.inverse on singular matrix returns null" {
+    // Two columns linearly dependent → det = 0.
+    const m = Mat{ .a = 1, .b = 2, .c = 2, .d = 4, .e = 0, .f = 0 };
+    try std.testing.expect(m.inverse() == null);
+}
+
+// ----- CTM concatenation invariant (PR-1 round 15) -----
+//
+// Per PDF Reference §4.2.3 / PDF 2.0 §8.3.2: the cm operator
+// concatenates a matrix to the CTM such that the new CTM is
+// `M × CTM_old`, where M is the operand. In row-vector form
+// (used by PDF and `Mat.apply`), this means subsequent points are
+// transformed as `x × M × CTM_old` — the most-recent cm is applied
+// FIRST to the local coordinates, the earlier CTM is applied
+// SECOND. PDFBox, MuPDF, and pdf.js all use this convention.
+//
+// Codex round 15 [P2] claimed `m.mul(ctm)` was reversed; that
+// finding was REJECTED as a spec misread. This test locks in
+// the correct semantics.
+test "CTM concatenation: scale then translate maps x=0 to 100" {
+    var ctm = Mat{}; // identity
+    // First cm: scale by 2.
+    const m1 = Mat{ .a = 2, .b = 0, .c = 0, .d = 2, .e = 0, .f = 0 };
+    ctm = m1.mul(ctm);
+    // Second cm: translate by +50 in x.
+    const m2 = Mat{ .a = 1, .b = 0, .c = 0, .d = 1, .e = 50, .f = 0 };
+    ctm = m2.mul(ctm);
+    // Local origin (0, 0) → device:
+    //   apply translate first: (0,0) → (50,0)
+    //   apply scale second:    (50,0) → (100,0)
+    const p = ctm.apply(0, 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), p.x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), p.y, 1e-9);
+}
+
+// ----- decodePdfName (PR-1 round 20 [P2] regression) -----
+
+test "decodePdfName passes plain names unchanged (no allocation)" {
+    var buf: [16]u8 = undefined;
+    const out = decodePdfName("Fm1", &buf);
+    // Slice identity: result points at the input, no copy.
+    try std.testing.expect(out.ptr == "Fm1".ptr);
+    try std.testing.expectEqualStrings("Fm1", out);
+}
+
+test "decodePdfName decodes #xx hex escapes" {
+    var buf: [16]u8 = undefined;
+    // #31 = 0x31 = '1' → "Fm1"
+    try std.testing.expectEqualStrings("Fm1", decodePdfName("Fm#31", &buf));
+    // #20 = 0x20 = ' ' → "A B"
+    try std.testing.expectEqualStrings("A B", decodePdfName("A#20B", &buf));
+    // ## sequence → "#" (decodes #23 = '#')
+    try std.testing.expectEqualStrings("#", decodePdfName("#23", &buf));
+}
+
+test "decodePdfName tolerates malformed trailing escape" {
+    var buf: [16]u8 = undefined;
+    // Truncated `#3` (missing second hex digit) — pass # through.
+    const out = decodePdfName("Fm#3", &buf);
+    try std.testing.expectEqualStrings("Fm#3", out);
+}
+
+test "decodePdfName tolerates non-hex escape" {
+    var buf: [16]u8 = undefined;
+    // `#zz` — invalid hex → pass # through and continue.
+    try std.testing.expectEqualStrings("F#zz", decodePdfName("F#zz", &buf));
+}
+
+test "CTM concatenation: distinct point shows scale applied after translate" {
+    var ctm = Mat{};
+    const m1 = Mat{ .a = 2, .b = 0, .c = 0, .d = 2, .e = 0, .f = 0 };
+    ctm = m1.mul(ctm);
+    const m2 = Mat{ .a = 1, .b = 0, .c = 0, .d = 1, .e = 50, .f = 0 };
+    ctm = m2.mul(ctm);
+    // Local x=10 → translate gives 60 → scale gives 120.
+    const p = ctm.apply(10, 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 120), p.x, 1e-9);
+}
+
+// ----- normalizeFilterChain (PR-1 round 11 [P2] regression) -----
+
+test "normalizeFilterChain passes null through" {
+    var cache = std.AutoHashMap(u32, parser.Object).init(std.testing.allocator);
+    defer cache.deinit();
+    var xref = xref_mod.XRefTable.init(std.testing.allocator);
+    defer xref.deinit();
+    const doc = DocState{
+        .parse_allocator = std.testing.allocator,
+        .scratch_allocator = std.testing.allocator,
+        .data = "",
+        .xref_table = &xref,
+        .object_cache = &cache,
+    };
+    try std.testing.expect(try normalizeFilterChain(null, doc) == null);
+}
+
+test "normalizeFilterChain leaves a direct .name unchanged" {
+    var cache = std.AutoHashMap(u32, parser.Object).init(std.testing.allocator);
+    defer cache.deinit();
+    var xref = xref_mod.XRefTable.init(std.testing.allocator);
+    defer xref.deinit();
+    const doc = DocState{
+        .parse_allocator = std.testing.allocator,
+        .scratch_allocator = std.testing.allocator,
+        .data = "",
+        .xref_table = &xref,
+        .object_cache = &cache,
+    };
+    const inp = parser.Object{ .name = "FlateDecode" };
+    const out = (try normalizeFilterChain(inp, doc)) orelse unreachable;
+    try std.testing.expect(out == .name);
+    try std.testing.expectEqualStrings("FlateDecode", out.name);
+}
+
+test "normalizeFilterChain leaves a direct-only .array unchanged" {
+    var cache = std.AutoHashMap(u32, parser.Object).init(std.testing.allocator);
+    defer cache.deinit();
+    var xref = xref_mod.XRefTable.init(std.testing.allocator);
+    defer xref.deinit();
+    const doc = DocState{
+        .parse_allocator = std.testing.allocator,
+        .scratch_allocator = std.testing.allocator,
+        .data = "",
+        .xref_table = &xref,
+        .object_cache = &cache,
+    };
+    var arr = [_]parser.Object{
+        .{ .name = "ASCII85Decode" },
+        .{ .name = "FlateDecode" },
+    };
+    const inp = parser.Object{ .array = &arr };
+    const out = (try normalizeFilterChain(inp, doc)) orelse unreachable;
+    try std.testing.expect(out == .array);
+    // No allocation needed → the returned array slice points at the
+    // same storage as the input.
+    try std.testing.expect(out.array.ptr == &arr);
 }

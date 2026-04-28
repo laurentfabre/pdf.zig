@@ -998,3 +998,366 @@ test "superscript positioning does not insert spurious newline" {
     // superscript is below the threshold max(7,12)*0.7=8.4 (Fix 8)
     try std.testing.expect(std.mem.indexOf(u8, output.items, "\n") == null);
 }
+
+// PR-1 — Pass B (lattice) recurses into Form XObject `Do` operator,
+// walking the XObject's content stream with its own CTM stack so ruled
+// tables drawn inside reusable templates are detected.
+//
+// Fixture: testpdf.generateFormXObjectTablePdf produces a single page
+// whose only top-level operator is `/TableForm Do`. The Form XObject
+// draws a 3×3 ruled grid (outer 300×300 rect + 2 interior horizontals
+// + 2 interior verticals) at user-space [100, 400, 400, 700]. Without
+// resource-aware recursion, lattice walks an effectively empty page
+// stream and returns 0 tables. With recursion, lattice resolves the
+// XObject, decompresses its content, and detects exactly one 3×3
+// table.
+test "lattice pass B recurses form xobject" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // At least one 3×3 table on page 1, lattice-detected.
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3) {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    // Bbox in user-space matches the gold rectangle within ±2 pt.
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    try std.testing.expectApproxEqAbs(@as(f64, 100), bb[0], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[2], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+}
+
+// Codex review v1.2-rc4 [P2] regression: lattice must resolve indirect
+// references in BOTH `/Matrix` and `/Resources` before consuming them.
+//
+// Round 2 strengthening: the outer form delegates to a nested
+// /InnerForm reachable ONLY via the indirect `/Resources 7 0 R`. So
+// the test exercises both fixes at once:
+//   - indirect Matrix: must resolve `/Matrix 6 0 R` to translate by
+//     +50pt; otherwise bbox lands at [100,...] not [150,...].
+//   - indirect Resources: must resolve `/Resources 7 0 R` to find
+//     /InnerForm; otherwise the nested Do is a no-op and zero
+//     strokes are collected (no table at all).
+test "lattice pass B resolves indirect Matrix and Resources refs" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectIndirectRefsPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3) {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    // Matrix [1 0 0 1 50 0] shifts the form-space x by +50.
+    try std.testing.expectApproxEqAbs(@as(f64, 150), bb[0], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 450), bb[2], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+}
+
+// Codex review v1.2-rc4 round 10 [P2]: indirect /Subtype on a Form
+// XObject. Lattice must resolve `/Subtype N 0 R` before checking for
+// "Form"; otherwise the form is silently rejected and zero strokes
+// land in the table list.
+test "lattice pass B resolves indirect /Subtype on Form XObject" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectIndirectSubtypePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var lattice_count: usize = 0;
+    for (detected) |t| {
+        if (t.engine == zpdf.tables.Engine.lattice and
+            t.n_rows == 3 and t.n_cols == 3) lattice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lattice_count);
+}
+
+// Codex round 20 [P2]: PDF spec §7.3.5 allows `#xx` hex escapes in
+// content-stream names. Lattice must decode at the XObject lookup
+// boundary (`/Fm#31 Do` ↔ `/Fm1` in Resources). Without the decoder,
+// the lookup misses entirely and the form is not invoked.
+test "lattice pass B decodes escaped Form XObject names (Fm#31 -> Fm1)" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectEscapedNamePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var lattice_count: usize = 0;
+    for (detected) |t| {
+        if (t.engine == zpdf.tables.Engine.lattice and
+            t.n_rows == 3 and t.n_cols == 3) lattice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lattice_count);
+}
+
+// Codex round 17 [P2]: nested Form /Resources fallback uses the
+// PAGE Resources, not the calling Form's. Per ISO 32000-1 §7.8.3.
+// Three-level chain: page → OuterForm → MidForm. OuterForm shadows
+// /InnerGrid with a 4x4 grid; MidForm has /Resources null and calls
+// /InnerGrid. Spec-conform fallback resolves to the page's 3x3 grid;
+// pre-fix caller-fallback would have resolved to OuterForm's 4x4
+// shadow.
+test "lattice pass B nested-Form null Resources falls back to page (not caller)" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectShadowedXObjectPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var has_3x3: bool = false;
+    var has_4x4: bool = false;
+    for (detected) |t| {
+        if (t.engine != zpdf.tables.Engine.lattice) continue;
+        if (t.n_rows == 3 and t.n_cols == 3) has_3x3 = true;
+        if (t.n_rows == 4 and t.n_cols == 4) has_4x4 = true;
+    }
+    // Spec-conform: page's 3x3 wins; OuterForm's 4x4 shadow doesn't fire.
+    try std.testing.expect(has_3x3);
+    try std.testing.expect(!has_4x4);
+}
+
+// Codex round 16 [P2]: per PDF 32000-1 §7.3.9, a `null` dictionary
+// value is equivalent to omitting the entry, so /Resources null on
+// a Form must inherit parent resources rather than fail closed.
+// The fixture sets /Resources null on the outer form and exposes
+// /InnerGrid via the page-level Resources. With spec-conform
+// inheritance, /InnerGrid resolves and produces a 3x3 lattice
+// table.
+test "lattice pass B treats Form /Resources null as inherited" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectNullResourcesPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var lattice_count: usize = 0;
+    for (detected) |t| {
+        if (t.engine == zpdf.tables.Engine.lattice and
+            t.n_rows == 3 and t.n_cols == 3) lattice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lattice_count);
+}
+
+// Round-9 [P2] + round-16 [P2]: a Form with a present-but-malformed
+// /Resources (NOT including .null, which is spec-equivalent to
+// absent) must NOT inherit from its parent. The fixture sets
+// /Resources to integer 42 and lets the page expose /InnerGrid at
+// the page-level Resources. A buggy walker would inherit page
+// Resources, find /InnerGrid, draw its 3x3 grid; the correct walker
+// fails closed at the first nested Do.
+test "lattice pass B fails closed on malformed Form /Resources" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectMalformedResourcesPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // Zero lattice tables expected: outer form's malformed /Resources
+    // prevents the nested /InnerGrid Do from resolving; the inner
+    // grid never gets drawn, no strokes collected.
+    var lattice_count: usize = 0;
+    for (detected) |t| {
+        if (t.engine == zpdf.tables.Engine.lattice) lattice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), lattice_count);
+}
+
+// Codex review v1.2-rc4 round 8 [P2]: indirect numeric elements in
+// /BBox and /Matrix arrays. Both arrays are expressed as `[N 0 R ...]`;
+// readBBox/readMatrix must resolve each element through resolveRefSoft.
+// Matrix translates by +30 in x; the form-space 3x3 grid at
+// [100,400,400,700] should land in user-space at [130,400,430,700].
+// Without indirect-element resolution: BBox null + Matrix identity →
+// bbox at [100,400,400,700] (the regression we're catching).
+test "lattice pass B resolves indirect-element /BBox and /Matrix arrays" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectIndirectArrayElementsPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3 and
+            t.engine == zpdf.tables.Engine.lattice)
+        {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    // Translation +30: x should be in the [130, 430] range.
+    try std.testing.expectApproxEqAbs(@as(f64, 130), bb[0], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 430), bb[2], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+}
+
+// Codex review v1.2-rc4 [P2] /BBox clipping (round 4 + round 5).
+// The form draws an oversized inside grid that extends past the BBox
+// right edge AND a separate fully-outside grid. Lattice must:
+//   round-4: drop fully-outside strokes (the y=50..350 grid)
+//   round-5: clamp boundary-crossing strokes so the detected table's
+//            bbox doesn't extend past the BBox edge at x=400
+test "lattice pass B clips strokes to Form XObject /BBox" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectBBoxClippedPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // Exactly one 3x3 lattice table on page 1: the inside grid clamped
+    // to the BBox. Without round-4 clipping we'd see 2 tables; without
+    // round-5 partial clipping the surviving table's bbox would have
+    // x1 ≈ 700 instead of ≈ 400.
+    var lattice_matches: usize = 0;
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3 and
+            t.engine == zpdf.tables.Engine.lattice)
+        {
+            lattice_matches += 1;
+            match_idx = i;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), lattice_matches);
+
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    // Inside-BBox region: y must be >= 400 (no leak from outside grid).
+    try std.testing.expectApproxEqAbs(@as(f64, 400), bb[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+    // Round-5: boundary strokes clamped to BBox right edge ≈ 400.
+    // Without per-stroke clipping the bbox would be ≈ 700.
+    try std.testing.expect(bb[2] <= 405.0);
+}
+
+// Cycle guard: a Form XObject that invokes itself via `Do` must not
+// hang or stack-overflow lattice. The first invocation collects the
+// outer rect (1 stroke set); the recursive Do is rejected by the
+// visited-set guard. getTables completes successfully.
+test "lattice pass B handles self-referencing Form XObject without hanging" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormXObjectSelfReferencingPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    // Must return without hanging or panicking. The single rect drawn
+    // by the form has only 4 strokes so lattice produces no table
+    // (needs >= 2 cluster lines on each axis); the test is the
+    // *non-hang* itself.
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+    // No stronger assertion — the success of `getTables` returning is
+    // the only invariant the cycle guard guarantees.
+}
+
+// Subtype filter: an /Image XObject must not be walked as a content
+// stream. The page draws a real 3x3 table inline, then invokes the
+// Image XObject; lattice detects exactly one table from the inline
+// strokes and ignores the image.
+test "lattice pass B ignores non-Form XObject Subtypes" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateImageXObjectIgnoredByLatticePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.page == 1 and t.n_rows == 3 and t.n_cols == 3) {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+    // bbox of the inline table — same as generateFormXObjectTablePdf
+    // because the strokes are drawn directly in the page content
+    // stream, no Matrix involved.
+    const t = detected[match_idx.?];
+    try std.testing.expect(t.bbox != null);
+    const bb = t.bbox.?;
+    try std.testing.expectApproxEqAbs(@as(f64, 100), bb[0], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
+}

@@ -1286,6 +1286,1017 @@ pub fn generateImagePdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Generate a single-page PDF whose only page-level content stream
+/// emits `/TableForm Do`, where `TableForm` is a Form XObject that
+/// draws a 3×3 ruled table using stroke ops on absolute coordinates.
+///
+/// Used by the lattice Pass-B Form-XObject-recursion test. The
+/// expected detection is one table with `n_rows = 3`, `n_cols = 3`
+/// and `bbox ≈ [100, 400, 400, 700]` in user-space.
+pub fn generateFormXObjectTablePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    // Object 1 — Catalog
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // Object 2 — Pages
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Object 3 — Page (references the Form XObject in /Resources)
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /TableForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Object 4 — page content stream: just invoke the Form XObject.
+    const page_content = "/TableForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // Object 5 — Form XObject. Identity matrix, BBox covers the table.
+    // Content draws a 3x3 grid: outer 300x300 rect at (100,400) plus
+    // 2 interior horizontals at y=500/600 and 2 interior verticals at
+    // x=200/300. Each path is stroked with `S` so lattice picks up
+    // every segment.
+    const form_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // XRef
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF whose Form XObject stores `/Subtype` as an indirect
+/// reference (`/Subtype 7 0 R` → 7 0 obj /Form endobj). Codex review
+/// v1.2-rc4 round 10 [P2]: lattice must resolve `/Subtype` through
+/// `resolveRefSoft` before checking for "Form"; otherwise the form is
+/// rejected and its 3x3 grid never surfaces as a detected table.
+pub fn generateFormXObjectIndirectSubtypePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /TableForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/TableForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const form_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype 6 0 R /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n/Form\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 7\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+
+    try writer.writeAll("trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF whose content invokes a Form XObject by an escaped
+/// name (`/Fm#31 Do` for `/Fm1`). Per ISO 32000-1 §7.3.5, names in
+/// content streams may use `#` + 2 hex digits to escape characters.
+/// The dictionary parser decodes name keys but the content-stream
+/// lexer does not, so lattice must decode at the lookup boundary
+/// (Codex review v1.2-rc4 round 20 [P2]).
+pub fn generateFormXObjectEscapedNamePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Page Resources expose `/Fm1` (decoded form). Page content
+    // invokes `/Fm#31 Do` (escaped).
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /Fm1 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/Fm#31 Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const form_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Three-level Form XObject nesting that exercises ISO 32000-1
+/// §7.8.3 page-resource fallback (Codex review v1.2-rc4 round 17 [P2]).
+///
+/// Layout:
+///   - Page /Resources/XObject: { OuterForm 5, InnerGrid 6 }
+///       (page-level /InnerGrid is a 3x3 grid)
+///   - OuterForm /Resources/XObject: { MidForm 7, InnerGrid 8 }
+///       (OuterForm shadows /InnerGrid with a 4x4 grid in obj 8)
+///   - OuterForm content: `/MidForm Do`
+///   - MidForm /Resources: null   ← absent per §7.3.9
+///   - MidForm content: `/InnerGrid Do`
+///
+/// When MidForm executes `/InnerGrid Do`, the spec requires falling
+/// back to the PAGE Resources (not OuterForm's shadowed map), so
+/// /InnerGrid resolves to obj 6 — the 3x3 grid. With the OLD
+/// caller-fallback behavior the resolution would chase OuterForm's
+/// shadow (obj 8) and produce a 4x4 grid instead.
+///
+/// PDFBox and MuPDF both implement page-fallback; pdf.js historically
+/// did not. This fixture proves pdf.zig matches the spec.
+///
+/// Object map:
+///   1. Catalog
+///   2. Pages
+///   3. Page (XObject /OuterForm 5 + /InnerGrid 6)
+///   4. Page content stream (`/OuterForm Do`)
+///   5. OuterForm — Resources/XObject /MidForm 7 + /InnerGrid 8
+///   6. Page-level /InnerGrid — 3x3 grid (the SPEC-CORRECT detection)
+///   7. MidForm — /Resources null, content `/InnerGrid Do`
+///   8. OuterForm-shadow /InnerGrid — 4x4 grid (the WRONG detection)
+pub fn generateFormXObjectShadowedXObjectPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /OuterForm 5 0 R /InnerGrid 6 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/OuterForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // OuterForm has its OWN /Resources that shadows /InnerGrid with
+    // obj 8 (a 4x4 grid). It also exposes /MidForm = obj 7. Body
+    // calls MidForm.
+    const outer_content = "/MidForm Do\n";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] " ++
+        "/Resources << /XObject << /MidForm 7 0 R /InnerGrid 8 0 R >> >> " ++
+        "/Length {} >>\n",
+        .{outer_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(outer_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // Page-level /InnerGrid: a 3x3 grid — what the SPEC says we
+    // should detect (page-fallback).
+    const page_inner =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{page_inner.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(page_inner);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // MidForm: /Resources null (so resolution must fall back somewhere).
+    // Body invokes /InnerGrid. With round-17 page-fallback this
+    // resolves to obj 6 (page); with the old caller-fallback it would
+    // resolve to obj 8 (OuterForm shadow).
+    const mid_content = "/InnerGrid Do\n";
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources null " ++
+        "/Length {} >>\n",
+        .{mid_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(mid_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // OuterForm-shadow /InnerGrid: a 4x4 grid — the WRONG detection
+    // (would only fire if MidForm's null /Resources fell back to
+    // OuterForm's resources instead of the page's).
+    const shadow_inner =
+        \\100 400 300 300 re S
+        \\100 475 m 400 475 l S
+        \\100 550 m 400 550 l S
+        \\100 625 m 400 625 l S
+        \\175 400 m 175 700 l S
+        \\250 400 m 250 700 l S
+        \\325 400 m 325 700 l S
+        \\
+    ;
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{shadow_inner.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(shadow_inner);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 9\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+
+    try writer.writeAll("trailer\n<< /Size 9 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF where the outer Form XObject sets `/Resources null`.
+/// Per PDF 32000-1 §7.3.9, a `null` dictionary value is equivalent to
+/// the entry being absent, so the form INHERITS its parent's
+/// resources (the page-level /XObject map). The nested /InnerGrid
+/// Do should resolve and produce a 3x3 lattice table.
+///
+/// Codex review v1.2-rc4 round 16 [P2]: spec-conform behavior for
+/// `null`-valued /Resources.
+pub fn generateFormXObjectNullResourcesPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /OuterForm 5 0 R /InnerGrid 6 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/OuterForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const outer_content = "/InnerGrid Do\n";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources null " ++
+        "/Length {} >>\n",
+        .{outer_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(outer_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const inner_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{inner_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(inner_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 7\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+
+    try writer.writeAll("trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF where the outer Form XObject sets `/Resources 42`
+/// (a non-null, non-dict, non-reference malformed value). Per PDF
+/// 32000-1 §7.3.9, `null` is equivalent to "entry omitted" so it
+/// would correctly inherit; this fixture instead uses an integer to
+/// exercise the genuine fail-closed leg. Round 9 [P2] introduced
+/// fail-closed for any non-dict; round 16 [P2] narrowed it to
+/// non-null-non-dict per spec.
+///
+/// Layout:
+///   1. Catalog
+///   2. Pages
+///   3. Page (XObject map exposes /OuterForm 5 0 R AND /InnerGrid 6 0 R)
+///   4. Page content (`/OuterForm Do`)
+///   5. OuterForm — /Resources 42 (integer, non-dict, non-null).
+///      Content invokes `/InnerGrid Do`.
+///      A buggy walker would inherit page Resources and find
+///      /InnerGrid 6 0 R there, drawing its 3x3 grid. The correct
+///      walker fails closed at the first nested Do.
+///   6. InnerGrid — draws a 3x3 grid in user-space [100, 400, 400, 700].
+///
+/// Expected: zero detected tables on page 1.
+pub fn generateFormXObjectMalformedResourcesPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /OuterForm 5 0 R /InnerGrid 6 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/OuterForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // OuterForm with non-null malformed /Resources (integer 42). A
+    // correct walker must NOT inherit page-level /XObject ->
+    // /InnerGrid here. Note: a `null` value would be spec-equivalent
+    // to omitting /Resources, which DOES inherit; that's a separate
+    // test case ("treats /Resources null as inherited").
+    const outer_content = "/InnerGrid Do\n";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources 42 " ++
+        "/Length {} >>\n",
+        .{outer_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(outer_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // InnerGrid draws a 3x3 grid. Reachable from page Resources but
+    // NOT from a malformed-Resources form.
+    const inner_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{inner_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(inner_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 7\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+
+    try writer.writeAll("trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF where the Form XObject's `/BBox` and `/Matrix` arrays
+/// contain INDIRECT element references — e.g. `/BBox [11 0 R 12 0 R
+/// 13 0 R 14 0 R]`. Per PDF spec §7.3.10, indirect references are legal
+/// inside numeric arrays. Lattice's readBBox / readMatrix must resolve
+/// each element through `resolveRefSoft` before consuming.
+///
+/// Object layout:
+///   1. Catalog
+///   2. Pages
+///   3. Page (XObject /TableForm 5 0 R)
+///   4. Page content stream (`/TableForm Do`)
+///   5. Form — /BBox built from refs 6/7/8/9; /Matrix from refs 10–15
+///      Content draws 3x3 grid at form-space [100, 400, 400, 700].
+///   6. integer 100 (BBox x_min)
+///   7. integer 400 (BBox y_min)
+///   8. integer 400 (BBox x_max)
+///   9. integer 700 (BBox y_max)
+///   10. real 1.0  (Matrix a)
+///   11. real 0.0  (Matrix b)
+///   12. real 0.0  (Matrix c)
+///   13. real 1.0  (Matrix d)
+///   14. integer 30 (Matrix e — translates +30 in x)
+///   15. integer 0  (Matrix f)
+///
+/// Detected bbox (post-translation): [130, 400, 430, 700].
+/// Without indirect-element resolution: BBox returns null (no clip)
+/// AND Matrix returns identity, so bbox lands at [100, 400, 400, 700]
+/// — that's the regression we're catching.
+pub fn generateFormXObjectIndirectArrayElementsPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /TableForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/TableForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const form_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [6 0 R 7 0 R 8 0 R 9 0 R] " ++
+        "/Matrix [10 0 R 11 0 R 12 0 R 13 0 R 14 0 R 15 0 R] " ++
+        "/Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n100\nendobj\n");
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n400\nendobj\n");
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n400\nendobj\n");
+    const obj9_offset = pdf.items.len;
+    try writer.writeAll("9 0 obj\n700\nendobj\n");
+    const obj10_offset = pdf.items.len;
+    try writer.writeAll("10 0 obj\n1.0\nendobj\n");
+    const obj11_offset = pdf.items.len;
+    try writer.writeAll("11 0 obj\n0.0\nendobj\n");
+    const obj12_offset = pdf.items.len;
+    try writer.writeAll("12 0 obj\n0.0\nendobj\n");
+    const obj13_offset = pdf.items.len;
+    try writer.writeAll("13 0 obj\n1.0\nendobj\n");
+    const obj14_offset = pdf.items.len;
+    try writer.writeAll("14 0 obj\n30\nendobj\n");
+    const obj15_offset = pdf.items.len;
+    try writer.writeAll("15 0 obj\n0\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 16\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj10_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj11_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj12_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj13_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj14_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj15_offset});
+
+    try writer.writeAll("trailer\n<< /Size 16 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF whose Form XObject draws a 3x3 ruled grid that
+/// extends WAY past its declared `/BBox`, plus a separate fully-out-of-
+/// BBox grid. Tests two clipping behaviours:
+///
+/// 1. The fully-outside grid (y=50..350) must be DROPPED entirely.
+/// 2. The boundary-crossing strokes of the inside grid must be CLAMPED
+///    to the BBox so the detected table's bbox doesn't extend past the
+///    visible region.
+///
+/// Inside grid: outer rect at [100, 400, 700, 700] — 600pt wide, but
+/// the BBox is only [100, 400, 400, 700]. Without per-stroke clipping
+/// the detected bbox would have x1 ≈ 700; with proper clipping it
+/// must be ≤ ~402 (BBox right edge + tolerance).
+///
+/// Outside grid: a separate 3x3 at y=50..350 — must produce 0 tables.
+pub fn generateFormXObjectBBoxClippedPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /TableForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/TableForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // Inside grid: clean 300x300 outer rect at the BBox extent
+    // [100,400,400,700]. The two interior horizontal separators are
+    // drawn OVERSIZED — from x=100 to x=700, way past the BBox right
+    // edge. Round-5 clipping must clamp them to x=400 so the table's
+    // detected bbox doesn't extend past the visible region.
+    //
+    // Two interior verticals at x=200, x=300. The result post-clip is
+    // a 3x3 grid bounded at [100, 400, 400, 700].
+    //
+    // Outside grid: separate 3x3 at y=50..350, entirely below the
+    // BBox bottom. Round-4 clipping must drop it whole.
+    const form_content =
+        \\100 400 300 300 re S
+        \\100 500 m 700 500 l S
+        \\100 600 m 700 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\100 50 300 300 re S
+        \\100 150 m 400 150 l S
+        \\100 250 m 400 250 l S
+        \\200 50 m 200 350 l S
+        \\300 50 m 300 350 l S
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF where Form XObject A's content stream invokes itself
+/// via `/SelfForm Do`. The cycle guard in lattice.collectStrokesIn must
+/// catch this and bail before stack overflow / hang.
+///
+/// The Form draws a single rect so we can also verify that the FIRST
+/// invocation (depth 0) successfully collects strokes before the cycle
+/// is detected on the recursive Do.
+pub fn generateFormXObjectSelfReferencingPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /SelfForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/SelfForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // SelfForm — content stream draws ONE rect, then invokes itself.
+    // The Form's own Resources expose itself as /SelfForm so the
+    // recursive `Do` resolves back to the same XObject (object 5).
+    const form_content =
+        \\100 400 300 300 re S
+        \\/SelfForm Do
+        \\
+    ;
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] " ++
+        "/Resources << /XObject << /SelfForm 5 0 R >> >> " ++
+        "/Length {} >>\n",
+        .{form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF where the page references an XObject whose Subtype
+/// is `/Image` (NOT `/Form`). Lattice must NOT recurse into image
+/// XObjects; non-Form subtypes are silently ignored.
+pub fn generateImageXObjectIgnoredByLatticePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /Im1 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Page draws a real ruled table inline AND invokes the Image XObject.
+    const page_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\/Im1 Do
+        \\
+    ;
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // /Im1 is an Image XObject. If lattice mistakenly recursed into the
+    // body it would parse the random image bytes as a content stream;
+    // we keep the body short and harmless.
+    const image_data = "fake-image-bytes";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 " ++
+        "/ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\n",
+        .{image_data.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(image_data);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Like `generateFormXObjectTablePdf`, but the outer Form XObject stores
+/// both `/Matrix` and `/Resources` as indirect references rather than
+/// inline objects. The outer form delegates the actual table drawing to
+/// a NESTED Form XObject (`/InnerForm`), reachable ONLY via the indirect
+/// `/Resources` lookup. This makes the indirect-ref Resources path
+/// load-bearing: if lattice fails to resolve `/Resources 7 0 R`, the
+/// nested `/InnerForm Do` cannot be resolved and zero strokes are
+/// collected, which the integration test catches.
+///
+/// Object layout:
+///   1. Catalog
+///   2. Pages
+///   3. Page (Resources/XObject -> 5 0 R inline)
+///   4. Page content stream (`/TableForm Do`)
+///   5. Outer Form — /Matrix 6 0 R, /Resources 7 0 R, content invokes
+///      `/InnerForm Do`. NO strokes drawn directly.
+///   6. The Matrix array — [1 0 0 1 50 0] translates by +50pt in x.
+///   7. The Resources dict — { /XObject << /InnerForm 8 0 R >> }
+///   8. Inner Form — identity Matrix, content draws the 3x3 grid.
+///
+/// End-to-end: page invokes outer; outer must resolve indirect Matrix
+/// to translate by +50pt; outer must resolve indirect Resources to find
+/// /InnerForm; inner draws the grid. Detected bbox: [150, 400, 450, 700].
+pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R ");
+    try writer.writeAll("/Resources << /XObject << /TableForm 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    const page_content = "/TableForm Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{page_content.len});
+    try writer.writeAll(page_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // Outer form delegates to the nested form via `/InnerForm Do`. The
+    // /InnerForm name resolves ONLY through the indirect /Resources 7 0 R,
+    // so reverting the indirect-Resources fix would make this test fail.
+    const outer_form_content = "/InnerForm Do\n";
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix 6 0 R /Resources 7 0 R " ++
+        "/Length {} >>\n",
+        .{outer_form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(outer_form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    // Matrix object — [1 0 0 1 50 0] translates the form by +50pt in x.
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n[1 0 0 1 50 0]\nendobj\n");
+
+    // Resources object — exposes /InnerForm so the nested Do resolves.
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /XObject << /InnerForm 8 0 R >> >>\nendobj\n");
+
+    // Inner form — draws the 3x3 ruled grid in form-space.
+    const inner_form_content =
+        \\100 400 300 300 re S
+        \\100 500 m 400 500 l S
+        \\100 600 m 400 600 l S
+        \\200 400 m 200 700 l S
+        \\300 400 m 300 700 l S
+        \\
+    ;
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n");
+    try writer.print(
+        "<< /Type /XObject /Subtype /Form /FormType 1 " ++
+        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+        .{inner_form_content.len},
+    );
+    try writer.writeAll("stream\n");
+    try writer.writeAll(inner_form_content);
+    try writer.writeAll("endstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 9\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+
+    try writer.writeAll("trailer\n<< /Size 9 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
 /// Generate a PDF with UTF-16BE encoded metadata and outline title
 pub fn generateUtf16BePdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
