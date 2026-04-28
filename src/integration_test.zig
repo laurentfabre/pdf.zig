@@ -1527,3 +1527,13 @@ test "continuation link accepts true near-boundary chain" {
     try std.testing.expect(b.continued_from != null);
     try std.testing.expectEqual(@as(u32, 1), b.continued_from.?.page);
 }
+
+// PR-4 stub — see docs/ROADMAP.md PR-4.
+// Pass B (lattice) must populate per-cell text by intersecting
+// extractTextWithBounds spans (glyph centers) against the detected
+// cell bbox. Mirrors stream_table.zig's buildCellsWithText pattern.
+// Implementation lands in follow-up commits on this branch alongside
+// a synth fixture (4×3 ruled table with positioned text per cell).
+test "lattice pass B populates cell text via glyph-center intersection" {
+    return error.SkipZigTest;
+}
