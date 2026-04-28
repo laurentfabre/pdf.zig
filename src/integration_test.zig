@@ -1362,13 +1362,55 @@ test "lattice pass B ignores non-Form XObject Subtypes" {
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
 
-// PR-3 stub — see docs/ROADMAP.md PR-3.
-// Pass A (tagged-path table extraction) must populate per-cell text by
-// walking each TD's MCID list, looking up each MCID's bbox via a new
-// upstream `MarkedContentExtractor.getMcidBoundingBox(page_idx, mcid)`
-// API, and concatenating the glyph spans whose centers fall inside.
-// Implementation lands in follow-up commits on this branch alongside
-// the audit/tables-gold/tagged-2x3.pdf fixture.
+// PR-3 — Pass A (tagged-path) populates per-cell text by walking each
+// TD's MCID list and concatenating each MCID's accumulated text via
+// the existing `structtree.MarkedContentExtractor.getTextForMcid`.
+//
+// The fixture (`testpdf.generateTaggedTablePdf`) emits a single-page
+// tagged 2×3 table. Each /TD has one MCID; the page content stream
+// wraps each glyph run in `/TD <</MCID N>> BDC ... EMC`. After
+// `getTables`, every cell's `text` should match the gold values.
+//
+// Architectural note: PR-3 originally proposed bbox-intersection
+// (per-MCID bbox lookup → glyph span filter). The implementation
+// instead uses the existing direct text-by-MCID pathway — same
+// answer, no glyph-bbox prerequisite, no false positives from
+// glyph centers landing inside an MCID's bbox without being tagged.
 test "tagged table extracts cell text" {
-    return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // Exactly one Pass A (tagged) table with 2 rows × 3 cols.
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.engine == zpdf.tables.Engine.tagged and
+            t.n_rows == 2 and t.n_cols == 3)
+        {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    const t = detected[match_idx.?];
+    // Build a 2x3 grid of expected texts and assert each cell.
+    const gold = [2][3][]const u8{
+        .{ "A1", "B1", "C1" },
+        .{ "A2", "B2", "C2" },
+    };
+
+    for (t.cells) |c| {
+        try std.testing.expect(c.r < 2 and c.c < 3);
+        try std.testing.expect(c.text != null);
+        try std.testing.expectEqualStrings(gold[c.r][c.c], c.text.?);
+    }
+    try std.testing.expectEqual(@as(usize, 6), t.cells.len);
 }
