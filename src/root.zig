@@ -1079,8 +1079,32 @@ pub const Document = struct {
                 @ptrCast(&mcid_lookup),
                 mcidTextLookup,
             );
-            for (pass_a) |t| try combined.append(allocator, t);
-            allocator.free(pass_a); // we copied each element above (cells are still owned by the original elements; transfer)
+            // Codex review v1.2-rc4 PR-3 round 4 [P2]: ownership
+            // transfer from `pass_a` to `combined` happens table-by-
+            // table. If combined.append fails partway, the remainder
+            // of pass_a (and the outer slice itself) was previously
+            // leaked. The errdefer below covers both:
+            //   - tail [transfer_idx..]: tables not yet moved into
+            //     combined; free their cells + per-cell text.
+            //   - outer pass_a slice: always freed.
+            // `pass_a_owned` is the one-shot guard so the success
+            // path's `allocator.free(pass_a)` doesn't double-free
+            // when a LATER step (Pass B/C) errors and re-fires the
+            // errdefer.
+            var transfer_idx: usize = 0;
+            var pass_a_owned = true;
+            errdefer if (pass_a_owned) {
+                for (pass_a[transfer_idx..]) |t| {
+                    for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+                    allocator.free(t.cells);
+                }
+                allocator.free(pass_a);
+            };
+            while (transfer_idx < pass_a.len) : (transfer_idx += 1) {
+                try combined.append(allocator, pass_a[transfer_idx]);
+            }
+            allocator.free(pass_a);
+            pass_a_owned = false;
         }
         // We transferred the cells slices; re-own via pass_a's allocator path.
         // (Above `allocator.free(pass_a)` only freed the outer slice; cells move
