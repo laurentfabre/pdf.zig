@@ -2604,3 +2604,144 @@ pub fn generateTaggedTableNestedPdf(allocator: std.mem.Allocator) ![]u8 {
 
     return pdf.toOwnedSlice(allocator);
 }
+
+/// PR-2: a 2-page PDF with one ruled 3x3 table per page, BOTH placed
+/// in the vertical middle of their respective pages — neither sits
+/// near the page-boundary band that linkContinuations now requires.
+/// Without the bbox-y constraint these would be linked (col counts
+/// match, table_b is first on its page); with the constraint they
+/// stay independent.
+///
+/// Page dimensions: 612 x 792 (US Letter).
+/// Both tables: 300 x 100 with outer rect at y=350 (≈ middle).
+///   - For page 1: a.bbox.y0=350, gap to media_box.y_min=0 is 350.
+///     20% of 792 = 158.4. Gap > band → not near bottom → no link.
+///   - For page 2: b.bbox.y1=450, gap to media_box.y_max=792 is 342.
+///     Same reason — not near top.
+pub fn generateTwoUnrelatedTablesPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n");
+
+    // Both tables: 3x3 ruled grid, 300 wide × 100 tall, at y0=350.
+    const table_content =
+        \\100 350 300 100 re S
+        \\100 383 m 400 383 l S
+        \\100 416 m 400 416 l S
+        \\200 350 m 200 450 l S
+        \\300 350 m 300 450 l S
+        \\
+    ;
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{table_content.len});
+    try writer.writeAll(table_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>\nendobj\n");
+
+    const obj6_offset = pdf.items.len;
+    try writer.print("6 0 obj\n<< /Length {} >>\nstream\n", .{table_content.len});
+    try writer.writeAll(table_content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 7\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+
+    try writer.writeAll("trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// PR-2 positive case: a 2-page PDF with one ruled 3x3 table per page,
+/// BOTH placed in their respective near-boundary band — table_a is
+/// at the bottom of page 1, table_b is at the top of page 2. With
+/// matching column counts and the new bbox-y constraint satisfied,
+/// linkContinuations chains them.
+///
+/// Page dimensions: 612 x 792 (US Letter); 20% band = 158.4.
+///   - table_a: outer rect at y=20, height 100 → y0=20 (gap 20 from
+///     page bottom 0). Gap < 158.4 → near bottom → ok.
+///   - table_b: outer rect at y=672, height 100 → y1=772 (gap 20
+///     from page top 792). Gap < 158.4 → near top → ok.
+pub fn generateLinkedContinuationTablesPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n");
+
+    // table_a — bottom of page 1: y0=20, y1=120.
+    const table_a =
+        \\100 20 300 100 re S
+        \\100 53 m 400 53 l S
+        \\100 86 m 400 86 l S
+        \\200 20 m 200 120 l S
+        \\300 20 m 300 120 l S
+        \\
+    ;
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{table_a.len});
+    try writer.writeAll(table_a);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>\nendobj\n");
+
+    // table_b — top of page 2: y0=672, y1=772.
+    const table_b =
+        \\100 672 300 100 re S
+        \\100 705 m 400 705 l S
+        \\100 738 m 400 738 l S
+        \\200 672 m 200 772 l S
+        \\300 672 m 300 772 l S
+        \\
+    ;
+    const obj6_offset = pdf.items.len;
+    try writer.print("6 0 obj\n<< /Length {} >>\nstream\n", .{table_b.len});
+    try writer.writeAll(table_b);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 7\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+
+    try writer.writeAll("trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
