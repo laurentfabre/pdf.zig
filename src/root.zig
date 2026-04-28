@@ -1046,7 +1046,31 @@ pub const Document = struct {
         if (tree_opt) |*tree| {
             defer tree.deinit();
             const ctx = self;
-            const pass_a = try tables.extractTaggedTables(allocator, tree, @ptrCast(ctx), pageRefToZeroBased, null, null);
+
+            // PR-3 [feat]: build a lazy per-page MCID-text lookup so
+            // tagged tables get their `Cell.text` populated by walking
+            // each TD's MCID children. The arena holds one
+            // `MarkedContentExtractor` per page that touches a /Table;
+            // it lives only for this getTables call (cell.text is
+            // duplicated to the user-supplied allocator inside
+            // extractTaggedTables, so the arena can be torn down
+            // immediately after).
+            var mcid_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer mcid_arena.deinit();
+            var mcid_lookup = McidLookupCtx{
+                .doc = self,
+                .arena = mcid_arena.allocator(),
+                .extractors = std.AutoHashMap(usize, *structtree.MarkedContentExtractor).init(mcid_arena.allocator()),
+            };
+
+            const pass_a = try tables.extractTaggedTables(
+                allocator,
+                tree,
+                @ptrCast(ctx),
+                pageRefToZeroBased,
+                @ptrCast(&mcid_lookup),
+                mcidTextLookup,
+            );
             for (pass_a) |t| try combined.append(allocator, t);
             allocator.free(pass_a); // we copied each element above (cells are still owned by the original elements; transfer)
         }
@@ -1177,6 +1201,66 @@ pub const Document = struct {
             if (pg.ref.eql(ref)) return @intCast(i);
         }
         return null;
+    }
+
+    // PR-3: per-page MCID-text lookup context, owned by getTables.
+    const McidLookupCtx = struct {
+        doc: *Document,
+        arena: std.mem.Allocator,
+        extractors: std.AutoHashMap(usize, *structtree.MarkedContentExtractor),
+
+        /// Lazy: build a MarkedContentExtractor for `page_idx` the
+        /// first time it's queried, cache the result. All allocations
+        /// live in `arena` and are reclaimed when the arena is
+        /// torn down at the end of `getTables`.
+        fn ensurePage(self: *McidLookupCtx, page_idx: usize) ?*structtree.MarkedContentExtractor {
+            const gop = self.extractors.getOrPut(page_idx) catch return null;
+            if (gop.found_existing) return gop.value_ptr.*;
+
+            const extractor = self.arena.create(structtree.MarkedContentExtractor) catch {
+                _ = self.extractors.remove(page_idx);
+                return null;
+            };
+            extractor.* = structtree.MarkedContentExtractor.init(self.arena);
+
+            // Decode the page's content stream and run it through
+            // extractContentStream in `.structured` mode. Same pattern
+            // root.zig:692 already uses for cached-reading-order text
+            // extraction. Errors here are soft: a corrupt page stream
+            // simply returns an empty extractor, which makes Pass A's
+            // cell.text fall back to null for that page.
+            const content = pagetree.getPageContents(
+                self.arena,
+                self.arena,
+                self.doc.data,
+                &self.doc.xref_table,
+                self.doc.pages.items[page_idx],
+                &self.doc.object_cache,
+            ) catch {
+                gop.value_ptr.* = extractor;
+                return extractor;
+            };
+            self.doc.ensurePageFonts(page_idx);
+            var nw: NullWriter = .{};
+            extractContentStream(
+                content,
+                .{ .structured = extractor },
+                &self.doc.font_cache,
+                page_idx,
+                self.arena,
+                &nw,
+            ) catch {};
+
+            gop.value_ptr.* = extractor;
+            return extractor;
+        }
+    };
+
+    fn mcidTextLookup(ctx_ptr: *anyopaque, page_ref: ?ObjRef, mcid: i32) ?[]const u8 {
+        const ctx: *McidLookupCtx = @ptrCast(@alignCast(ctx_ptr));
+        const page_idx_u32 = pageRefToZeroBased(@ptrCast(ctx.doc), page_ref) orelse return null;
+        const extractor = ctx.ensurePage(page_idx_u32) orelse return null;
+        return extractor.getTextForMcid(mcid);
     }
 
     // =========================================================================
