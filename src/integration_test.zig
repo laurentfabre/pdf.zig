@@ -1361,3 +1361,102 @@ test "lattice pass B ignores non-Form XObject Subtypes" {
     try std.testing.expectApproxEqAbs(@as(f64, 100), bb[0], 2.0);
     try std.testing.expectApproxEqAbs(@as(f64, 700), bb[3], 2.0);
 }
+
+// PR-3 — Pass A (tagged-path) populates per-cell text by walking each
+// TD's MCID list and concatenating each MCID's accumulated text via
+// the existing `structtree.MarkedContentExtractor.getTextForMcid`.
+//
+// The fixture (`testpdf.generateTaggedTablePdf`) emits a single-page
+// tagged 2×3 table. Each /TD has one MCID; the page content stream
+// wraps each glyph run in `/TD <</MCID N>> BDC ... EMC`. After
+// `getTables`, every cell's `text` should match the gold values.
+//
+// Architectural note: PR-3 originally proposed bbox-intersection
+// (per-MCID bbox lookup → glyph span filter). The implementation
+// instead uses the existing direct text-by-MCID pathway — same
+// answer, no glyph-bbox prerequisite, no false positives from
+// glyph centers landing inside an MCID's bbox without being tagged.
+test "tagged table extracts cell text" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // Exactly one Pass A (tagged) table with 2 rows × 3 cols.
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.engine == zpdf.tables.Engine.tagged and
+            t.n_rows == 2 and t.n_cols == 3)
+        {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    const t = detected[match_idx.?];
+    // Build a 2x3 grid of expected texts and assert each cell.
+    const gold = [2][3][]const u8{
+        .{ "A1", "B1", "C1" },
+        .{ "A2", "B2", "C2" },
+    };
+
+    for (t.cells) |c| {
+        try std.testing.expect(c.r < 2 and c.c < 3);
+        try std.testing.expect(c.text != null);
+        try std.testing.expectEqualStrings(gold[c.r][c.c], c.text.?);
+    }
+    try std.testing.expectEqual(@as(usize, 6), t.cells.len);
+    // Codex round 1 [P2]: the fixture attaches /Pg only to leaf TDs;
+    // Pass A page-resolution must walk descendants and emit page=1.
+    try std.testing.expectEqual(@as(u32, 1), t.page);
+}
+
+// Codex review v1.2-rc4 PR-3 round 1 [P2]: cells whose MCIDs are
+// nested inside child structure elements (e.g. <TD><P>...MCID
+// ...</P></TD>) — common in real tagged PDFs per ISO 32000-1
+// §14.7.4. Pass A's cell-text walker must descend through structure
+// elements, not stop at direct .mcid children. Fixture mirrors the
+// flat-MCID test but inserts /P elements between each /TD and its
+// MCID; gold texts: N1..N6.
+test "tagged table extracts cell text from nested MCID children" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateTaggedTableNestedPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var match_idx: ?usize = null;
+    for (detected, 0..) |tbl, i| {
+        if (tbl.engine == zpdf.tables.Engine.tagged and
+            tbl.n_rows == 2 and tbl.n_cols == 3)
+        {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    const t = detected[match_idx.?];
+    const gold = [2][3][]const u8{
+        .{ "N1", "N2", "N3" },
+        .{ "N4", "N5", "N6" },
+    };
+    for (t.cells) |c| {
+        try std.testing.expect(c.text != null);
+        try std.testing.expectEqualStrings(gold[c.r][c.c], c.text.?);
+    }
+    try std.testing.expectEqual(@as(usize, 6), t.cells.len);
+    try std.testing.expectEqual(@as(u32, 1), t.page);
+}

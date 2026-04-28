@@ -2348,3 +2348,259 @@ pub fn generateUtf16BePdf(allocator: std.mem.Allocator) ![]u8 {
 
     return pdf.toOwnedSlice(allocator);
 }
+
+/// PR-3: a single-page tagged PDF with a 2-row × 3-column table.
+/// Each /TD element points at one MCID (0..5); the page content
+/// stream wraps each glyph run in `/TD <</MCID N>> BDC ... EMC` so
+/// the lattice/Pass-A path can resolve cell text by MCID lookup.
+///
+/// Cell texts (gold):
+///   r0:  "A1"  "B1"  "C1"
+///   r1:  "A2"  "B2"  "C2"
+///
+/// Object layout:
+///   1. Catalog (/StructTreeRoot 6 0 R)
+///   2. Pages
+///   3. Page (/StructParents 0)
+///   4. Page content stream — six BDC/EMC cells with Tm-positioned text
+///   5. Font /F1 (Helvetica)
+///   6. StructTreeRoot (/K [7 0 R])
+///   7. Table element (/S /Table /K [8 0 R 9 0 R])
+///   8. TR row 0 (/S /TR /K [10 0 R 11 0 R 12 0 R])
+///   9. TR row 1 (/S /TR /K [13 0 R 14 0 R 15 0 R])
+///   10..15. TD cells, each with /K [N] (MCID 0..5) and /Pg 3 0 R
+pub fn generateTaggedTablePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> ");
+    try writer.writeAll("/StructParents 0 >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Six cells: BDC per MCID, Tm absolute position, Tj single string,
+    // EMC. The text matrix is reset between cells via Tm so they don't
+    // drift relative to one another.
+    const content =
+        \\BT
+        \\/F1 12 Tf
+        \\/TD <</MCID 0>> BDC
+        \\1 0 0 1 100 700 Tm
+        \\(A1) Tj
+        \\EMC
+        \\/TD <</MCID 1>> BDC
+        \\1 0 0 1 200 700 Tm
+        \\(B1) Tj
+        \\EMC
+        \\/TD <</MCID 2>> BDC
+        \\1 0 0 1 300 700 Tm
+        \\(C1) Tj
+        \\EMC
+        \\/TD <</MCID 3>> BDC
+        \\1 0 0 1 100 680 Tm
+        \\(A2) Tj
+        \\EMC
+        \\/TD <</MCID 4>> BDC
+        \\1 0 0 1 200 680 Tm
+        \\(B2) Tj
+        \\EMC
+        \\/TD <</MCID 5>> BDC
+        \\1 0 0 1 300 680 Tm
+        \\(C2) Tj
+        \\EMC
+        \\ET
+        \\
+    ;
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.len});
+    try writer.writeAll(content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.writeAll("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    const obj6_offset = pdf.items.len;
+    // /K is a single reference (not an array). pdf.zig's
+    // parseStructElement accepts dict/ref at the root but not array;
+    // PDF spec §14.7.4 allows both forms — this fixture uses the
+    // single-ref form to match the parser's current shape.
+    try writer.writeAll("6 0 obj\n<< /Type /StructTreeRoot /K 7 0 R >>\nendobj\n");
+
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /S /Table /P 6 0 R /K [8 0 R 9 0 R] >>\nendobj\n");
+
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n<< /S /TR /P 7 0 R /K [10 0 R 11 0 R 12 0 R] >>\nendobj\n");
+
+    const obj9_offset = pdf.items.len;
+    try writer.writeAll("9 0 obj\n<< /S /TR /P 7 0 R /K [13 0 R 14 0 R 15 0 R] >>\nendobj\n");
+
+    var td_offsets: [6]u64 = undefined;
+    inline for (0..6) |i| {
+        td_offsets[i] = pdf.items.len;
+        try writer.print(
+            "{} 0 obj\n<< /S /TD /P {} 0 R /Pg 3 0 R /K [{}] >>\nendobj\n",
+            .{ 10 + i, if (i < 3) @as(u32, 8) else @as(u32, 9), i },
+        );
+    }
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 16\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
+    inline for (0..6) |i| {
+        try writer.print("{d:0>10} 00000 n \n", .{td_offsets[i]});
+    }
+
+    try writer.writeAll("trailer\n<< /Size 16 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// PR-3 [P2 round 1]: tagged 2x3 table whose TD cells nest their
+/// content under /P (Paragraph) elements rather than placing MCIDs
+/// directly on the TD. Per ISO 32000-1 §14.7.4 this is legal and
+/// common; Pass A's cell-text walker must descend into structure
+/// elements, not just leaf .mcid children.
+///
+/// Layout matches generateTaggedTablePdf except each TD has /K [P 0 R]
+/// (a single child element ref) and the P element has /K [N] for the
+/// MCID. Object range: 1..21 (six TDs + six Ps).
+pub fn generateTaggedTableNestedPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> ");
+    try writer.writeAll("/StructParents 0 >>\n");
+    try writer.writeAll("endobj\n");
+
+    const content =
+        \\BT
+        \\/F1 12 Tf
+        \\/P <</MCID 0>> BDC
+        \\1 0 0 1 100 700 Tm
+        \\(N1) Tj
+        \\EMC
+        \\/P <</MCID 1>> BDC
+        \\1 0 0 1 200 700 Tm
+        \\(N2) Tj
+        \\EMC
+        \\/P <</MCID 2>> BDC
+        \\1 0 0 1 300 700 Tm
+        \\(N3) Tj
+        \\EMC
+        \\/P <</MCID 3>> BDC
+        \\1 0 0 1 100 680 Tm
+        \\(N4) Tj
+        \\EMC
+        \\/P <</MCID 4>> BDC
+        \\1 0 0 1 200 680 Tm
+        \\(N5) Tj
+        \\EMC
+        \\/P <</MCID 5>> BDC
+        \\1 0 0 1 300 680 Tm
+        \\(N6) Tj
+        \\EMC
+        \\ET
+        \\
+    ;
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.len});
+    try writer.writeAll(content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n<< /Type /StructTreeRoot /K 7 0 R >>\nendobj\n");
+
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /S /Table /P 6 0 R /K [8 0 R 9 0 R] >>\nendobj\n");
+
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n<< /S /TR /P 7 0 R /K [10 0 R 11 0 R 12 0 R] >>\nendobj\n");
+
+    const obj9_offset = pdf.items.len;
+    try writer.writeAll("9 0 obj\n<< /S /TR /P 7 0 R /K [13 0 R 14 0 R 15 0 R] >>\nendobj\n");
+
+    // TDs 10..15 each point at one P (16..21). TDs carry no MCID
+    // directly; the P holds it. /Pg is on the TD level so descendant
+    // page-ref fallback can find page=1.
+    var td_offsets: [6]u64 = undefined;
+    inline for (0..6) |i| {
+        td_offsets[i] = pdf.items.len;
+        try writer.print(
+            "{} 0 obj\n<< /S /TD /P {} 0 R /Pg 3 0 R /K [{} 0 R] >>\nendobj\n",
+            .{ 10 + i, if (i < 3) @as(u32, 8) else @as(u32, 9), 16 + i },
+        );
+    }
+
+    // Ps 16..21 each hold the actual MCID for their cell.
+    var p_offsets: [6]u64 = undefined;
+    inline for (0..6) |i| {
+        p_offsets[i] = pdf.items.len;
+        try writer.print(
+            "{} 0 obj\n<< /S /P /P {} 0 R /K [{}] >>\nendobj\n",
+            .{ 16 + i, 10 + i, i },
+        );
+    }
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 22\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
+    inline for (0..6) |i| {
+        try writer.print("{d:0>10} 00000 n \n", .{td_offsets[i]});
+    }
+    inline for (0..6) |i| {
+        try writer.print("{d:0>10} 00000 n \n", .{p_offsets[i]});
+    }
+
+    try writer.writeAll("trailer\n<< /Size 22 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}

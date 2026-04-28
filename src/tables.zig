@@ -97,26 +97,123 @@ pub fn freeTables(allocator: std.mem.Allocator, tables: []Table) void {
     allocator.free(tables);
 }
 
+/// Hard cap on Cell-text MCID-walk depth. The PDF structure tree has
+/// no formal limit, but well-formed Tables nest <= 4 levels deep
+/// (TD → P → Span → mcid). 8 frames absorbs realistic nesting and
+/// caps adversarial recursion.
+const CELL_MCID_DEPTH_CAP: u8 = 8;
+
+/// Codex review v1.2-rc4 PR-3 round 1 [P2]: walk ALL MCID descendants
+/// of a Cell, not just its direct .mcid children. Tagged tables
+/// frequently nest content under /P, /Span, etc. (ISO 32000-1 §14.7.4).
+/// `inherited_page` is the page_ref carried down from ancestors;
+/// inner elements may override it via their own .page_ref.
+fn collectMcidText(
+    allocator: std.mem.Allocator,
+    elem: *const structtree.StructElement,
+    inherited_page: ?ObjRef,
+    lookup_ctx: *anyopaque,
+    lookup: McidTextLookupFn,
+    out: *std.ArrayList(u8),
+    depth: u8,
+) anyerror!void {
+    if (depth >= CELL_MCID_DEPTH_CAP) return;
+    const my_page = elem.page_ref orelse inherited_page;
+
+    for (elem.children) |child| {
+        switch (child) {
+            .element => |sub| try collectMcidText(allocator, sub, my_page, lookup_ctx, lookup, out, depth + 1),
+            .mcid => |mcr| {
+                // Codex review v1.2-rc4 PR-3 round 5 [P2]: an MCR
+                // with a non-null /Stm refers to a marked-content
+                // sequence inside a Form XObject's content stream,
+                // not the page's. Looking it up against the page-
+                // content extractor would either miss or — worse —
+                // collide with a page-content MCID that happens to
+                // share the same integer. Skip these for now;
+                // resolving /Stm content streams is a v1.x follow-up
+                // (the lookup needs to key on (page, stream) pairs
+                // and parse the referenced stream).
+                if (mcr.stream_ref != null) continue;
+                const page_ref = mcr.page_ref orelse my_page;
+                const mcid_text = (try lookup(lookup_ctx, page_ref, mcr.mcid)) orelse continue;
+                if (mcid_text.len == 0) continue;
+                if (out.items.len > 0) try out.append(allocator, ' ');
+                try out.appendSlice(allocator, mcid_text);
+            },
+        }
+    }
+}
+
+/// Walk all MCID descendants of `elem` and yield the first non-null
+/// `.page_ref` on either an inner element OR an inner MCID. Used as
+/// a fallback when the table itself and its rows don't carry /Pg —
+/// some producers attach /Pg only to the leaf TD/TH or the MCID
+/// itself (Codex round 1 [P2]).
+fn firstDescendantPageRef(
+    elem: *const structtree.StructElement,
+    depth: u8,
+) ?ObjRef {
+    if (depth >= CELL_MCID_DEPTH_CAP) return null;
+    if (elem.page_ref) |p| return p;
+    for (elem.children) |child| {
+        switch (child) {
+            .element => |sub| if (firstDescendantPageRef(sub, depth + 1)) |p| return p,
+            .mcid => |mcr| if (mcr.page_ref) |p| return p,
+        }
+    }
+    return null;
+}
+
+/// Lookup signature for resolving an MCID's accumulated text on a given
+/// page. The text returned is borrowed (owned by the lookup's backing
+/// store, e.g. a `MarkedContentExtractor`); `extractTaggedTables`
+/// `dupe`s it before placing it into `Cell.text` so the cell owns its
+/// allocation.
+///
+/// Codex review v1.2-rc4 PR-3 round 2 [P2]: errorable signature so
+/// allocator failure during the lookup (e.g. lazy per-page extractor
+/// build) surfaces at the public `getTables` boundary instead of
+/// being collapsed into a missing-text null. Domain errors (corrupt
+/// page stream, missing font) still soft-fail to null.
+pub const McidTextLookupFn = *const fn (
+    ctx: *anyopaque,
+    page_ref: ?ObjRef,
+    mcid: i32,
+) error{OutOfMemory}!?[]const u8;
+
 /// Walk the structure tree and emit one `Table` record per `/Table`
 /// element. `page_lookup` maps an `/Pg` ObjRef to the document's
 /// 0-based page index; pass `null` to skip page resolution (the
 /// emitted `page` field will be 0, useful only for unit tests).
+///
+/// `mcid_text_lookup` is used to populate `Cell.text` on Pass A
+/// (tagged path). When provided, each TD/TH's MCID children are
+/// resolved via the lookup; their texts are concatenated with single-
+/// space separators. Codex review v1.2-rc4 PR-3 [P2 deferred from
+/// rc4 roadmap]: this closes the v1.2-rc1 "Pass A leaves text=null"
+/// known limitation.
 pub fn extractTaggedTables(
     allocator: std.mem.Allocator,
     tree: *const structtree.StructTree,
     page_lookup_ctx: ?*const anyopaque,
     page_lookup_fn: ?*const fn (ctx: *const anyopaque, page_ref: ?ObjRef) ?u32,
+    mcid_text_lookup_ctx: ?*anyopaque,
+    mcid_text_lookup_fn: ?McidTextLookupFn,
 ) ![]Table {
     var out: std.ArrayList(Table) = .empty;
     errdefer {
-        for (out.items) |t| allocator.free(t.cells);
+        for (out.items) |t| {
+            for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+            allocator.free(t.cells);
+        }
         out.deinit(allocator);
     }
 
     if (tree.root) |root| {
         var per_page_counter = std.AutoHashMap(u32, u32).init(allocator);
         defer per_page_counter.deinit();
-        try walkForTables(allocator, root, &out, &per_page_counter, page_lookup_ctx, page_lookup_fn);
+        try walkForTables(allocator, root, &out, &per_page_counter, page_lookup_ctx, page_lookup_fn, mcid_text_lookup_ctx, mcid_text_lookup_fn);
     }
 
     return out.toOwnedSlice(allocator);
@@ -129,15 +226,27 @@ fn walkForTables(
     per_page_counter: *std.AutoHashMap(u32, u32),
     page_lookup_ctx: ?*const anyopaque,
     page_lookup_fn: ?*const fn (ctx: *const anyopaque, page_ref: ?ObjRef) ?u32,
+    mcid_text_lookup_ctx: ?*anyopaque,
+    mcid_text_lookup_fn: ?McidTextLookupFn,
 ) anyerror!void {
     if (isTableElement(elem.struct_type)) {
-        if (try buildTableFromElement(allocator, elem, page_lookup_ctx, page_lookup_fn)) |raw| {
+        if (try buildTableFromElement(allocator, elem, page_lookup_ctx, page_lookup_fn, mcid_text_lookup_ctx, mcid_text_lookup_fn)) |raw| {
             var tbl = raw;
+            // Codex review v1.2-rc4 PR-3 round 3 [P2]: guard the
+            // built-but-not-yet-appended table against OOM in the
+            // intervening per_page_counter.put. Without this, an
+            // OOM there leaks the table's cells + cell texts.
+            var appended = false;
+            errdefer if (!appended) {
+                for (tbl.cells) |c| if (c.text) |txt| allocator.free(txt);
+                allocator.free(tbl.cells);
+            };
             const pg_zero_based: u32 = if (tbl.page == 0) 0 else tbl.page - 1;
             const next_id = per_page_counter.get(pg_zero_based) orelse 0;
             tbl.id = next_id;
             try per_page_counter.put(pg_zero_based, next_id + 1);
             try out.append(allocator, tbl);
+            appended = true;
         }
         // Don't recurse into nested tables yet; v1.2.W2 follow-up.
         return;
@@ -145,7 +254,7 @@ fn walkForTables(
 
     for (elem.children) |child| {
         switch (child) {
-            .element => |sub| try walkForTables(allocator, sub, out, per_page_counter, page_lookup_ctx, page_lookup_fn),
+            .element => |sub| try walkForTables(allocator, sub, out, per_page_counter, page_lookup_ctx, page_lookup_fn, mcid_text_lookup_ctx, mcid_text_lookup_fn),
             .mcid => {},
         }
     }
@@ -156,6 +265,8 @@ fn buildTableFromElement(
     table_elem: *const structtree.StructElement,
     page_lookup_ctx: ?*const anyopaque,
     page_lookup_fn: ?*const fn (ctx: *const anyopaque, page_ref: ?ObjRef) ?u32,
+    mcid_text_lookup_ctx: ?*anyopaque,
+    mcid_text_lookup_fn: ?McidTextLookupFn,
 ) !?Table {
     // Collect rows: walk children, treating /TR nodes as rows.
     // The PDF spec also allows /THead /TBody /TFoot as wrappers — flatten them.
@@ -167,7 +278,15 @@ fn buildTableFromElement(
     var n_cols: u32 = 0;
     var header_rows: u32 = 0;
     var cells: std.ArrayList(Cell) = .empty;
-    errdefer cells.deinit(allocator);
+    // Codex review v1.2-rc4 PR-3 round 3 [P2]: PR-3 populates Cell.text
+    // with caller-allocator-owned slices. The previous bare
+    // `cells.deinit(allocator)` errdefer leaked every prior cell's
+    // text on a downstream OOM (later append, mcid lookup, or
+    // toOwnedSlice). Free per-cell text before the deinit.
+    errdefer {
+        for (cells.items) |c| if (c.text) |txt| allocator.free(txt);
+        cells.deinit(allocator);
+    }
 
     // Per-row column counter, accounting for spans propagated from previous rows.
     var col_carry: [128]u32 = undefined; // rowspan-carry per column; capped at 128 cols
@@ -196,13 +315,53 @@ fn buildTableFromElement(
             const rowspan: u32 = 1; // span attribute parsing deferred
             const colspan: u32 = 1;
 
+            // PR-3 [feat]: populate cell text by walking the cell's
+            // MCID descendants (recursive — Codex round 1 [P2]:
+            // valid tagged PDFs nest structure elements like
+            // <TD><P><Span> ... MCID ... </Span></P></TD>; ISO
+            // 32000-1 §14.7.2/§14.7.4 allow structure-element kids
+            // alongside content-item kids under /K).
+            //
+            // Concatenates each MCID's accumulated text via the
+            // optional lookup. Falls back to text=null when the
+            // lookup is absent (legacy behavior preserved for
+            // unit-test call sites). Each MCID's text is separated
+            // by a single space; consecutive empty MCIDs collapse
+            // cleanly.
+            var cell_text: ?[]u8 = null;
+            errdefer if (cell_text) |t| allocator.free(t);
+            if (mcid_text_lookup_fn) |lookup| {
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                try collectMcidText(
+                    allocator,
+                    cell_elem,
+                    cell_elem.page_ref orelse table_elem.page_ref,
+                    mcid_text_lookup_ctx.?,
+                    lookup,
+                    &buf,
+                    0,
+                );
+                if (buf.items.len > 0) {
+                    cell_text = try buf.toOwnedSlice(allocator);
+                } else {
+                    buf.deinit(allocator);
+                }
+            }
+
             try cells.append(allocator, .{
                 .r = @intCast(ri),
                 .c = col,
                 .rowspan = rowspan,
                 .colspan = colspan,
                 .is_header = is_header,
+                .text = cell_text,
             });
+            // Cell now owns the text slice; clear our local handle so
+            // the errdefer above doesn't double-free if a later append
+            // fails (toOwnedSlice already prevented buf.deinit from
+            // freeing the slice, but cell_text still aliases it).
+            cell_text = null;
             row_has_any_cell = true;
             if (!is_header) row_is_all_header = false;
 
@@ -221,17 +380,25 @@ fn buildTableFromElement(
     }
 
     // Resolve page number via callback (1-based for emission).
+    //
+    // Codex round 1 [P2]: producers often attach /Pg only to leaf
+    // TD/TH or the MCID itself, not the table or rows. Walk
+    // descendants when the table+rows path comes back empty.
     var page1: u32 = 0;
     if (page_lookup_fn) |f| {
         const ctx = page_lookup_ctx.?;
         if (f(ctx, table_elem.page_ref)) |p0| page1 = p0 + 1;
         if (page1 == 0) {
-            // Inherit from first child whose page_ref resolves.
             for (rows.items) |row| {
                 if (f(ctx, row.page_ref)) |p0| {
                     page1 = p0 + 1;
                     break;
                 }
+            }
+        }
+        if (page1 == 0) {
+            if (firstDescendantPageRef(table_elem, 0)) |p_ref| {
+                if (f(ctx, p_ref)) |p0| page1 = p0 + 1;
             }
         }
     }
@@ -281,7 +448,7 @@ test "empty struct tree → no tables" {
         .elements = &.{},
         .allocator = std.testing.allocator,
     };
-    const tables = try extractTaggedTables(std.testing.allocator, &tree, null, null);
+    const tables = try extractTaggedTables(std.testing.allocator, &tree, null, null, null, null);
     defer freeTables(std.testing.allocator, tables);
     try std.testing.expectEqual(@as(usize, 0), tables.len);
 }
@@ -343,7 +510,7 @@ test "minimal Table with 2 TR each containing 3 TD" {
         .elements = &.{},
         .allocator = a,
     };
-    const tables = try extractTaggedTables(a, &tree, null, null);
+    const tables = try extractTaggedTables(a, &tree, null, null, null, null);
     defer freeTables(a, tables);
 
     try std.testing.expectEqual(@as(usize, 1), tables.len);
@@ -396,7 +563,7 @@ test "Table with TH header row + TD rows → header_rows = 1" {
     defer a.destroy(tbl);
 
     var tree = structtree.StructTree{ .root = tbl, .elements = &.{}, .allocator = a };
-    const tables = try extractTaggedTables(a, &tree, null, null);
+    const tables = try extractTaggedTables(a, &tree, null, null, null, null);
     defer freeTables(a, tables);
 
     try std.testing.expectEqual(@as(u32, 2), tables[0].n_rows);

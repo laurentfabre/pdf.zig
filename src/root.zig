@@ -1036,7 +1036,15 @@ pub const Document = struct {
     pub fn getTables(self: *Document, allocator: std.mem.Allocator) ![]tables.Table {
         var combined: std.ArrayList(tables.Table) = .empty;
         errdefer {
-            for (combined.items) |t| allocator.free(t.cells);
+            // Codex review v1.2-rc4 PR-3 round 2 [P2]: Pass A now
+            // duplicates cell.text into the user allocator, so the
+            // errdefer must also free per-cell text — otherwise an
+            // OOM partway through Pass B/C leaks every cell's
+            // duplicated string. Mirrors tables.freeTables exactly.
+            for (combined.items) |t| {
+                for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+                allocator.free(t.cells);
+            }
             combined.deinit(allocator);
         }
 
@@ -1046,9 +1054,57 @@ pub const Document = struct {
         if (tree_opt) |*tree| {
             defer tree.deinit();
             const ctx = self;
-            const pass_a = try tables.extractTaggedTables(allocator, tree, @ptrCast(ctx), pageRefToZeroBased);
-            for (pass_a) |t| try combined.append(allocator, t);
-            allocator.free(pass_a); // we copied each element above (cells are still owned by the original elements; transfer)
+
+            // PR-3 [feat]: build a lazy per-page MCID-text lookup so
+            // tagged tables get their `Cell.text` populated by walking
+            // each TD's MCID children. The arena holds one
+            // `MarkedContentExtractor` per page that touches a /Table;
+            // it lives only for this getTables call (cell.text is
+            // duplicated to the user-supplied allocator inside
+            // extractTaggedTables, so the arena can be torn down
+            // immediately after).
+            var mcid_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer mcid_arena.deinit();
+            var mcid_lookup = McidLookupCtx{
+                .doc = self,
+                .arena = mcid_arena.allocator(),
+                .extractors = std.AutoHashMap(usize, *structtree.MarkedContentExtractor).init(mcid_arena.allocator()),
+            };
+
+            const pass_a = try tables.extractTaggedTables(
+                allocator,
+                tree,
+                @ptrCast(ctx),
+                pageRefToZeroBased,
+                @ptrCast(&mcid_lookup),
+                mcidTextLookup,
+            );
+            // Codex review v1.2-rc4 PR-3 round 4 [P2]: ownership
+            // transfer from `pass_a` to `combined` happens table-by-
+            // table. If combined.append fails partway, the remainder
+            // of pass_a (and the outer slice itself) was previously
+            // leaked. The errdefer below covers both:
+            //   - tail [transfer_idx..]: tables not yet moved into
+            //     combined; free their cells + per-cell text.
+            //   - outer pass_a slice: always freed.
+            // `pass_a_owned` is the one-shot guard so the success
+            // path's `allocator.free(pass_a)` doesn't double-free
+            // when a LATER step (Pass B/C) errors and re-fires the
+            // errdefer.
+            var transfer_idx: usize = 0;
+            var pass_a_owned = true;
+            errdefer if (pass_a_owned) {
+                for (pass_a[transfer_idx..]) |t| {
+                    for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+                    allocator.free(t.cells);
+                }
+                allocator.free(pass_a);
+            };
+            while (transfer_idx < pass_a.len) : (transfer_idx += 1) {
+                try combined.append(allocator, pass_a[transfer_idx]);
+            }
+            allocator.free(pass_a);
+            pass_a_owned = false;
         }
         // We transferred the cells slices; re-own via pass_a's allocator path.
         // (Above `allocator.free(pass_a)` only freed the outer slice; cells move
@@ -1177,6 +1233,98 @@ pub const Document = struct {
             if (pg.ref.eql(ref)) return @intCast(i);
         }
         return null;
+    }
+
+    // PR-3: per-page MCID-text lookup context, owned by getTables.
+    const McidLookupCtx = struct {
+        doc: *Document,
+        arena: std.mem.Allocator,
+        extractors: std.AutoHashMap(usize, *structtree.MarkedContentExtractor),
+
+        /// Lazy: build a MarkedContentExtractor for `page_idx` the
+        /// first time it's queried, cache the result. All allocations
+        /// live in `arena` and are reclaimed when the arena is
+        /// torn down at the end of `getTables`.
+        ///
+        /// Codex review v1.2-rc4 PR-3 round 2 [P2]: bubble OOM. The
+        /// previous version collapsed every error into null, hiding
+        /// allocator pressure as missing-text. Now: getOrPut +
+        /// arena.create propagate OOM; getPageContents +
+        /// extractContentStream domain errors still soft-fail (the
+        /// extractor stays empty for that page so Cell.text falls
+        /// back to null on those cells without aborting the doc).
+        fn ensurePage(self: *McidLookupCtx, page_idx: usize) error{OutOfMemory}!*structtree.MarkedContentExtractor {
+            const gop = try self.extractors.getOrPut(page_idx);
+            if (gop.found_existing) return gop.value_ptr.*;
+
+            const extractor = self.arena.create(structtree.MarkedContentExtractor) catch |err| {
+                _ = self.extractors.remove(page_idx);
+                return err;
+            };
+            extractor.* = structtree.MarkedContentExtractor.init(self.arena);
+            gop.value_ptr.* = extractor;
+
+            // Decode the page's content stream and run it through
+            // extractContentStream in `.structured` mode. Domain
+            // errors → leave extractor empty (cell.text falls back
+            // to null for that page).
+            //
+            // Codex review v1.2-rc4 PR-3 round 6 [P1]: parse_allocator
+            // MUST be the document's long-lived parsing_arena, not
+            // the short-lived `self.arena` (mcid_arena) — pagetree
+            // resolveRef writes resolved objects into the document's
+            // shared object_cache, and those entries would dangle
+            // after mcid_arena.deinit() at the end of getTables.
+            // scratch_allocator stays on `self.arena` because
+            // decompressed content is single-use.
+            const content = pagetree.getPageContents(
+                self.doc.parsing_arena.allocator(),
+                self.arena,
+                self.doc.data,
+                &self.doc.xref_table,
+                self.doc.pages.items[page_idx],
+                &self.doc.object_cache,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return extractor;
+            };
+            // Codex review v1.2-rc4 PR-3 round 3 [P2]: previously
+            // called `self.doc.ensurePageFonts(page_idx)` which is a
+            // void-returning function that silently swallows OOM
+            // internally (its inner `catch continue` / `catch {}`
+            // sites mask allocator failures). Pass A's MCID text
+            // extraction would then degrade to raw-byte text under
+            // OOM with no signal. Skip the font-cache warm-up
+            // entirely here: extractContentStream's text decoders
+            // fall back to raw bytes when a font is uncached, which
+            // is correct for ASCII / WinAnsi (the common case in
+            // tagged tables). For multi-byte CMap-encoded text the
+            // result is partially-decoded; that's a known
+            // limitation tracked for a v1.x follow-up where
+            // ensurePageFonts becomes errorable.
+            var nw: NullWriter = .{};
+            extractContentStream(
+                content,
+                .{ .structured = extractor },
+                &self.doc.font_cache,
+                page_idx,
+                self.arena,
+                &nw,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                // Other errors leave extractor partially populated;
+                // any MCIDs that did resolve are still useful.
+            };
+
+            return extractor;
+        }
+    };
+
+    fn mcidTextLookup(ctx_ptr: *anyopaque, page_ref: ?ObjRef, mcid: i32) error{OutOfMemory}!?[]const u8 {
+        const ctx: *McidLookupCtx = @ptrCast(@alignCast(ctx_ptr));
+        const page_idx_u32 = pageRefToZeroBased(@ptrCast(ctx.doc), page_ref) orelse return null;
+        const extractor = try ctx.ensurePage(page_idx_u32);
+        return extractor.getTextForMcid(mcid);
     }
 
     // =========================================================================
@@ -2214,9 +2362,18 @@ fn extractContentStream(
                     if (operands[0] == .name) {
                         current_font = lookupFont(font_cache, &key_buf, page_num, operands[0].name);
                     }
-                    font_size = operands[1].number;
-                    if (mode == .bounds) {
-                        mode.bounds.setFontSize(font_size);
+                    // PR-3 [fuzz]: guard against adversarial Tf with
+                    // a non-number font-size operand. The /F<n>
+                    // operand can validly be a name; the size MUST
+                    // be a number per PDF spec, but corrupt streams
+                    // can violate that and a direct .number access
+                    // panics. Skip Tf entirely when the size isn't
+                    // numeric — keeping the previous font_size.
+                    if (operands[1] == .number) {
+                        font_size = operands[1].number;
+                        if (mode == .bounds) {
+                            mode.bounds.setFontSize(font_size);
+                        }
                     }
                 },
                 'd', 'D' => if (operand_count >= 2) {
