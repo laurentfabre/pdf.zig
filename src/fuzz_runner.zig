@@ -60,6 +60,7 @@ const TARGETS = [_]Target{
     .{ .name = "tokenizer_realistic_md", .run = fuzzTokenizerRealisticMd },
     .{ .name = "lattice_content_random", .run = fuzzLatticeContentRandom },
     .{ .name = "lattice_form_xobject_mutation", .run = fuzzLatticeFormXObjectMutation },
+    .{ .name = "tagged_table_mutation", .run = fuzzTaggedTableMutation },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -363,6 +364,133 @@ fn fuzzLatticeFormXObjectMutation(rng: std.Random, allocator: std.mem.Allocator,
             }
         }
     }
+}
+
+// ============================================================================
+// Targets — Pass A (tagged-table cell text via MCID, PR-3)
+// ============================================================================
+
+/// Surgical fuzz target for PR-3's *new* surface — the McidTextLookupFn
+/// callback boundary inside `extractTaggedTables`. Builds a small
+/// synthetic StructTree by hand (Table → 1..3 TR rows → 0..4 cells per
+/// row → optional nested /P with one MCID), then drives the public
+/// `extractTaggedTables` with a stub callback that returns a random
+/// byte slice per MCID.
+///
+/// What this exercises:
+///   - the recursive `collectMcidText` descent (PR-3 round 1)
+///   - the `firstDescendantPageRef` fallback (PR-3 round 1)
+///   - the cell.text allocation + freeTables ownership transfer
+///   - errdefer cleanup on partial-build OOM
+///
+/// What this DOES NOT exercise: extractContentStream / interpreter /
+/// pagetree. Those pre-existing crash surfaces are intentionally
+/// out-of-scope for PR-3; the dedicated `pdf_open_mutation` and
+/// `pdf_extract_mutation` targets cover them.
+///
+/// Invariants:
+///   - extractTaggedTables succeeds OR returns OutOfMemory
+///   - returned cells' .text is valid UTF-8 if non-null
+///   - freeTables completes without panic / leak
+fn fuzzTaggedTableMutation(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Build TD/TH cells: random count per row, each may contain a
+    // direct mcid OR a nested /P with one mcid (round-1 path).
+    const n_rows = rng.intRangeAtMost(usize, 0, 3);
+    var rows = std.ArrayList(*zpdf.structtree.StructElement).empty;
+
+    for (0..n_rows) |_| {
+        const n_cells = rng.intRangeAtMost(usize, 0, 4);
+        var row_kids = std.ArrayList(zpdf.structtree.StructChild).empty;
+        for (0..n_cells) |_| {
+            // Optionally wrap an MCID in a nested /P element.
+            const nested = rng.boolean();
+            const mcid = rng.int(i31);
+
+            if (nested) {
+                var p_kids = std.ArrayList(zpdf.structtree.StructChild).empty;
+                try p_kids.append(aa, .{ .mcid = .{ .mcid = mcid, .page_ref = null, .stream_ref = null } });
+                const p_elem = try aa.create(zpdf.structtree.StructElement);
+                p_elem.* = .{ .struct_type = "P", .children = try p_kids.toOwnedSlice(aa), .page_ref = null };
+                var td_kids = std.ArrayList(zpdf.structtree.StructChild).empty;
+                try td_kids.append(aa, .{ .element = p_elem });
+                const td_elem = try aa.create(zpdf.structtree.StructElement);
+                td_elem.* = .{ .struct_type = "TD", .children = try td_kids.toOwnedSlice(aa), .page_ref = null };
+                try row_kids.append(aa, .{ .element = td_elem });
+            } else {
+                var td_kids = std.ArrayList(zpdf.structtree.StructChild).empty;
+                try td_kids.append(aa, .{ .mcid = .{ .mcid = mcid, .page_ref = null, .stream_ref = null } });
+                const td_elem = try aa.create(zpdf.structtree.StructElement);
+                td_elem.* = .{ .struct_type = "TD", .children = try td_kids.toOwnedSlice(aa), .page_ref = null };
+                try row_kids.append(aa, .{ .element = td_elem });
+            }
+        }
+        const tr_elem = try aa.create(zpdf.structtree.StructElement);
+        tr_elem.* = .{ .struct_type = "TR", .children = try row_kids.toOwnedSlice(aa), .page_ref = null };
+        try rows.append(aa, tr_elem);
+    }
+
+    var table_kids = std.ArrayList(zpdf.structtree.StructChild).empty;
+    for (rows.items) |tr| try table_kids.append(aa, .{ .element = tr });
+    const table_elem = try aa.create(zpdf.structtree.StructElement);
+    table_elem.* = .{ .struct_type = "Table", .children = try table_kids.toOwnedSlice(aa), .page_ref = null };
+
+    const tree = zpdf.structtree.StructTree{
+        .root = table_elem,
+        .elements = &.{},
+        .allocator = aa,
+    };
+
+    // Stub callback returns a random slice from `scratch`. Returning
+    // null on some MCIDs to exercise the empty/skip path.
+    const Stub = struct {
+        rng: *std.Random,
+        scratch: []u8,
+        fn lookup(ctx_ptr: *anyopaque, page_ref: ?zpdf.parser.ObjRef, mcid: i32) ?[]const u8 {
+            _ = page_ref;
+            _ = mcid;
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            if (self.rng.intRangeAtMost(u8, 0, 9) == 0) return null;
+            const max = @min(self.scratch.len, 32);
+            const len = self.rng.intRangeAtMost(usize, 0, max);
+            // Make sure it's valid UTF-8 by emitting only ASCII printable
+            // characters (so the invariant check below is a real check
+            // on `extractTaggedTables` not the stub).
+            for (0..len) |i| {
+                self.scratch[i] = self.rng.intRangeAtMost(u8, 0x20, 0x7E);
+            }
+            return self.scratch[0..len];
+        }
+    };
+    var stub = Stub{ .rng = @constCast(&rng), .scratch = scratch };
+
+    const detected = zpdf.tables.extractTaggedTables(
+        allocator,
+        &tree,
+        null,
+        null,
+        @ptrCast(&stub),
+        Stub.lookup,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return; // domain errors → treat as no-op
+    };
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    for (detected) |t| {
+        for (t.cells) |c| {
+            if (c.text) |txt| {
+                if (!std.unicode.utf8ValidateSlice(txt)) {
+                    return error.TaggedCellTextInvalidUtf8;
+                }
+            }
+        }
+    }
+
 }
 
 /// Best-effort persist the most recent input the parser saw, so a segfault

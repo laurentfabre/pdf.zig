@@ -2298,9 +2298,18 @@ fn extractContentStream(
                     if (operands[0] == .name) {
                         current_font = lookupFont(font_cache, &key_buf, page_num, operands[0].name);
                     }
-                    font_size = operands[1].number;
-                    if (mode == .bounds) {
-                        mode.bounds.setFontSize(font_size);
+                    // PR-3 [fuzz]: guard against adversarial Tf with
+                    // a non-number font-size operand. The /F<n>
+                    // operand can validly be a name; the size MUST
+                    // be a number per PDF spec, but corrupt streams
+                    // can violate that and a direct .number access
+                    // panics. Skip Tf entirely when the size isn't
+                    // numeric — keeping the previous font_size.
+                    if (operands[1] == .number) {
+                        font_size = operands[1].number;
+                        if (mode == .bounds) {
+                            mode.bounds.setFontSize(font_size);
+                        }
                     }
                 },
                 'd', 'D' => if (operand_count >= 2) {

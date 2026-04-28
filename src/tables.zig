@@ -97,6 +97,63 @@ pub fn freeTables(allocator: std.mem.Allocator, tables: []Table) void {
     allocator.free(tables);
 }
 
+/// Hard cap on Cell-text MCID-walk depth. The PDF structure tree has
+/// no formal limit, but well-formed Tables nest <= 4 levels deep
+/// (TD → P → Span → mcid). 8 frames absorbs realistic nesting and
+/// caps adversarial recursion.
+const CELL_MCID_DEPTH_CAP: u8 = 8;
+
+/// Codex review v1.2-rc4 PR-3 round 1 [P2]: walk ALL MCID descendants
+/// of a Cell, not just its direct .mcid children. Tagged tables
+/// frequently nest content under /P, /Span, etc. (ISO 32000-1 §14.7.4).
+/// `inherited_page` is the page_ref carried down from ancestors;
+/// inner elements may override it via their own .page_ref.
+fn collectMcidText(
+    allocator: std.mem.Allocator,
+    elem: *const structtree.StructElement,
+    inherited_page: ?ObjRef,
+    lookup_ctx: *anyopaque,
+    lookup: McidTextLookupFn,
+    out: *std.ArrayList(u8),
+    depth: u8,
+) anyerror!void {
+    if (depth >= CELL_MCID_DEPTH_CAP) return;
+    const my_page = elem.page_ref orelse inherited_page;
+
+    for (elem.children) |child| {
+        switch (child) {
+            .element => |sub| try collectMcidText(allocator, sub, my_page, lookup_ctx, lookup, out, depth + 1),
+            .mcid => |mcr| {
+                const page_ref = mcr.page_ref orelse my_page;
+                const mcid_text = lookup(lookup_ctx, page_ref, mcr.mcid) orelse continue;
+                if (mcid_text.len == 0) continue;
+                if (out.items.len > 0) try out.append(allocator, ' ');
+                try out.appendSlice(allocator, mcid_text);
+            },
+        }
+    }
+}
+
+/// Walk all MCID descendants of `elem` and yield the first non-null
+/// `.page_ref` on either an inner element OR an inner MCID. Used as
+/// a fallback when the table itself and its rows don't carry /Pg —
+/// some producers attach /Pg only to the leaf TD/TH or the MCID
+/// itself (Codex round 1 [P2]).
+fn firstDescendantPageRef(
+    elem: *const structtree.StructElement,
+    depth: u8,
+) ?ObjRef {
+    if (depth >= CELL_MCID_DEPTH_CAP) return null;
+    if (elem.page_ref) |p| return p;
+    for (elem.children) |child| {
+        switch (child) {
+            .element => |sub| if (firstDescendantPageRef(sub, depth + 1)) |p| return p,
+            .mcid => |mcr| if (mcr.page_ref) |p| return p,
+        }
+    }
+    return null;
+}
+
 /// Lookup signature for resolving an MCID's accumulated text on a given
 /// page. The text returned is borrowed (owned by the lookup's backing
 /// store, e.g. a `MarkedContentExtractor`); `extractTaggedTables`
@@ -224,28 +281,32 @@ fn buildTableFromElement(
             const colspan: u32 = 1;
 
             // PR-3 [feat]: populate cell text by walking the cell's
-            // MCID children and concatenating each MCID's accumulated
-            // text via the optional lookup. Falls back to text=null
-            // when the lookup is absent (legacy behavior preserved
-            // for unit-test call sites). Each MCID's text is
-            // separated by a single space; consecutive empty MCIDs
-            // collapse cleanly.
+            // MCID descendants (recursive — Codex round 1 [P2]:
+            // valid tagged PDFs nest structure elements like
+            // <TD><P><Span> ... MCID ... </Span></P></TD>; ISO
+            // 32000-1 §14.7.2/§14.7.4 allow structure-element kids
+            // alongside content-item kids under /K).
+            //
+            // Concatenates each MCID's accumulated text via the
+            // optional lookup. Falls back to text=null when the
+            // lookup is absent (legacy behavior preserved for
+            // unit-test call sites). Each MCID's text is separated
+            // by a single space; consecutive empty MCIDs collapse
+            // cleanly.
             var cell_text: ?[]u8 = null;
             errdefer if (cell_text) |t| allocator.free(t);
             if (mcid_text_lookup_fn) |lookup| {
                 var buf: std.ArrayList(u8) = .empty;
                 errdefer buf.deinit(allocator);
-                for (cell_elem.children) |sub| {
-                    const mcr = switch (sub) {
-                        .mcid => |m| m,
-                        .element => continue,
-                    };
-                    const page_ref = mcr.page_ref orelse cell_elem.page_ref orelse table_elem.page_ref;
-                    const mcid_text = lookup(mcid_text_lookup_ctx.?, page_ref, mcr.mcid) orelse continue;
-                    if (mcid_text.len == 0) continue;
-                    if (buf.items.len > 0) try buf.append(allocator, ' ');
-                    try buf.appendSlice(allocator, mcid_text);
-                }
+                try collectMcidText(
+                    allocator,
+                    cell_elem,
+                    cell_elem.page_ref orelse table_elem.page_ref,
+                    mcid_text_lookup_ctx.?,
+                    lookup,
+                    &buf,
+                    0,
+                );
                 if (buf.items.len > 0) {
                     cell_text = try buf.toOwnedSlice(allocator);
                 } else {
@@ -284,17 +345,25 @@ fn buildTableFromElement(
     }
 
     // Resolve page number via callback (1-based for emission).
+    //
+    // Codex round 1 [P2]: producers often attach /Pg only to leaf
+    // TD/TH or the MCID itself, not the table or rows. Walk
+    // descendants when the table+rows path comes back empty.
     var page1: u32 = 0;
     if (page_lookup_fn) |f| {
         const ctx = page_lookup_ctx.?;
         if (f(ctx, table_elem.page_ref)) |p0| page1 = p0 + 1;
         if (page1 == 0) {
-            // Inherit from first child whose page_ref resolves.
             for (rows.items) |row| {
                 if (f(ctx, row.page_ref)) |p0| {
                     page1 = p0 + 1;
                     break;
                 }
+            }
+        }
+        if (page1 == 0) {
+            if (firstDescendantPageRef(table_elem, 0)) |p_ref| {
+                if (f(ctx, p_ref)) |p0| page1 = p0 + 1;
             }
         }
     }
