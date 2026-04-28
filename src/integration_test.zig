@@ -1460,3 +1460,70 @@ test "tagged table extracts cell text from nested MCID children" {
     try std.testing.expectEqual(@as(usize, 6), t.cells.len);
     try std.testing.expectEqual(@as(u32, 1), t.page);
 }
+
+// PR-2 — bbox-y proximity constraint in linkContinuations.
+// Two ruled 3x3 tables on consecutive pages, BOTH placed in the
+// vertical middle of their respective pages — neither sits in the
+// 20% page-boundary band. With matching column counts the old rule
+// would have linked them; the new bbox-y check correctly rejects.
+test "continuation link rejects two unrelated mid-page tables" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateTwoUnrelatedTablesPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var lattice_count: usize = 0;
+    var any_continuation: bool = false;
+    for (detected) |t| {
+        if (t.engine != zpdf.tables.Engine.lattice) continue;
+        if (t.n_rows != 3 or t.n_cols != 3) continue;
+        lattice_count += 1;
+        if (t.continued_to != null or t.continued_from != null) {
+            any_continuation = true;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), lattice_count);
+    try std.testing.expect(!any_continuation);
+}
+
+// PR-2 positive case — table_a at the bottom of page 1 + table_b at
+// the top of page 2 + matching col counts → linked.
+test "continuation link accepts true near-boundary chain" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateLinkedContinuationTablesPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var page1_table: ?usize = null;
+    var page2_table: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.engine != zpdf.tables.Engine.lattice) continue;
+        if (t.n_rows != 3 or t.n_cols != 3) continue;
+        if (t.page == 1) page1_table = i;
+        if (t.page == 2) page2_table = i;
+    }
+    try std.testing.expect(page1_table != null);
+    try std.testing.expect(page2_table != null);
+
+    // page1 table → continued_to points at page2 table.
+    const a = detected[page1_table.?];
+    try std.testing.expect(a.continued_to != null);
+    try std.testing.expectEqual(@as(u32, 2), a.continued_to.?.page);
+
+    // page2 table → continued_from points at page1 table.
+    const b = detected[page2_table.?];
+    try std.testing.expect(b.continued_from != null);
+    try std.testing.expectEqual(@as(u32, 1), b.continued_from.?.page);
+}

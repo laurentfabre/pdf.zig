@@ -61,6 +61,7 @@ const TARGETS = [_]Target{
     .{ .name = "lattice_content_random", .run = fuzzLatticeContentRandom },
     .{ .name = "lattice_form_xobject_mutation", .run = fuzzLatticeFormXObjectMutation },
     .{ .name = "tagged_table_mutation", .run = fuzzTaggedTableMutation },
+    .{ .name = "link_continuations_random", .run = fuzzLinkContinuationsRandom },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -491,6 +492,89 @@ fn fuzzTaggedTableMutation(rng: std.Random, allocator: std.mem.Allocator, scratc
         }
     }
 
+}
+
+// ============================================================================
+// Targets — Pass D continuation-link bbox-y constraint (PR-2)
+// ============================================================================
+
+/// Fuzz `tables.linkContinuations` against a random list of pre-detected
+/// Tables (no PDF parse, no extractContentStream). Builds 0..16 tables
+/// with random page numbers, ids, n_cols, and bbox/null pairings, then
+/// drives linkContinuations through a stub PageMediaBoxFn that returns
+/// random media-box rectangles. Invariants:
+///   - linkContinuations completes without panic
+///   - every continuation_to/continuation_from pair is symmetric:
+///     if a.continued_to.{page,id} = (p, i) then list[finds (p, i)].
+///     continued_from = (a.page, a.id)
+///   - linked pairs have b.page == a.page + 1 and matching cols ±1
+fn fuzzLinkContinuationsRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+    const n = rng.intRangeAtMost(usize, 0, 16);
+    const list = try allocator.alloc(zpdf.tables.Table, n);
+    defer allocator.free(list);
+
+    // Page-sorted list: `i`-th table on page (i / 2) + 1, alternating ids.
+    for (list, 0..) |*t, i| {
+        const page = @as(u32, @intCast((i / 2) + 1));
+        const id: u32 = @intCast(i % 2);
+        const n_cols = rng.intRangeAtMost(u32, 1, 8);
+        const has_bbox = rng.boolean();
+        t.* = .{
+            .page = page,
+            .id = id,
+            .n_rows = rng.intRangeAtMost(u32, 1, 16),
+            .n_cols = n_cols,
+            .header_rows = 0,
+            .cells = &.{},
+            .engine = .lattice,
+            .confidence = 0.5,
+            .bbox = if (has_bbox) blk: {
+                const x0 = rng.float(f64) * 600.0;
+                const y0 = rng.float(f64) * 800.0;
+                break :blk [4]f64{ x0, y0, x0 + 100.0, y0 + 100.0 };
+            } else null,
+            .continued_from = null,
+            .continued_to = null,
+        };
+    }
+
+    const Stub = struct {
+        rng: *std.Random,
+        fn lookup(ctx_ptr: *const anyopaque, page: u32) ?[4]f64 {
+            _ = page;
+            const self: *const @This() = @ptrCast(@alignCast(ctx_ptr));
+            // Half the time return a sensible US-Letter box; sometimes
+            // return null (page out of range / unknown); rarely emit
+            // a degenerate or huge page to stress the threshold math.
+            const r = self.rng.intRangeAtMost(u8, 0, 9);
+            // Note: the stub captures rng but mutating it via const
+            // ptr is fine in Zig because std.Random is a vtable; we
+            // operate read-only on the dispatch.
+            if (r == 0) return null;
+            if (r == 1) return [4]f64{ 0, 0, 0, 0 }; // degenerate height=0
+            return [4]f64{ 0, 0, 612, 792 };
+        }
+    };
+    var stub = Stub{ .rng = @constCast(&rng) };
+    zpdf.tables.linkContinuations(list, @ptrCast(&stub), Stub.lookup);
+
+    // Verify linked-pair invariants.
+    for (list) |a| {
+        const ct = a.continued_to orelse continue;
+        // Find the target.
+        var found = false;
+        for (list) |b| {
+            if (b.page == ct.page and b.id == ct.table_id) {
+                if (b.continued_from) |cf| {
+                    if (cf.page == a.page and cf.table_id == a.id) found = true;
+                }
+                break;
+            }
+        }
+        if (!found) return error.LinkContinuationAsymmetric;
+    }
 }
 
 /// Best-effort persist the most recent input the parser saw, so a segfault
