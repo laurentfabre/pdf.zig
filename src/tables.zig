@@ -125,7 +125,7 @@ fn collectMcidText(
             .element => |sub| try collectMcidText(allocator, sub, my_page, lookup_ctx, lookup, out, depth + 1),
             .mcid => |mcr| {
                 const page_ref = mcr.page_ref orelse my_page;
-                const mcid_text = lookup(lookup_ctx, page_ref, mcr.mcid) orelse continue;
+                const mcid_text = (try lookup(lookup_ctx, page_ref, mcr.mcid)) orelse continue;
                 if (mcid_text.len == 0) continue;
                 if (out.items.len > 0) try out.append(allocator, ' ');
                 try out.appendSlice(allocator, mcid_text);
@@ -159,11 +159,17 @@ fn firstDescendantPageRef(
 /// store, e.g. a `MarkedContentExtractor`); `extractTaggedTables`
 /// `dupe`s it before placing it into `Cell.text` so the cell owns its
 /// allocation.
+///
+/// Codex review v1.2-rc4 PR-3 round 2 [P2]: errorable signature so
+/// allocator failure during the lookup (e.g. lazy per-page extractor
+/// build) surfaces at the public `getTables` boundary instead of
+/// being collapsed into a missing-text null. Domain errors (corrupt
+/// page stream, missing font) still soft-fail to null.
 pub const McidTextLookupFn = *const fn (
     ctx: *anyopaque,
     page_ref: ?ObjRef,
     mcid: i32,
-) ?[]const u8;
+) error{OutOfMemory}!?[]const u8;
 
 /// Walk the structure tree and emit one `Table` record per `/Table`
 /// element. `page_lookup` maps an `/Pg` ObjRef to the document's

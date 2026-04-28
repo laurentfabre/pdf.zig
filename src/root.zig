@@ -1036,7 +1036,15 @@ pub const Document = struct {
     pub fn getTables(self: *Document, allocator: std.mem.Allocator) ![]tables.Table {
         var combined: std.ArrayList(tables.Table) = .empty;
         errdefer {
-            for (combined.items) |t| allocator.free(t.cells);
+            // Codex review v1.2-rc4 PR-3 round 2 [P2]: Pass A now
+            // duplicates cell.text into the user allocator, so the
+            // errdefer must also free per-cell text — otherwise an
+            // OOM partway through Pass B/C leaks every cell's
+            // duplicated string. Mirrors tables.freeTables exactly.
+            for (combined.items) |t| {
+                for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+                allocator.free(t.cells);
+            }
             combined.deinit(allocator);
         }
 
@@ -1213,22 +1221,29 @@ pub const Document = struct {
         /// first time it's queried, cache the result. All allocations
         /// live in `arena` and are reclaimed when the arena is
         /// torn down at the end of `getTables`.
-        fn ensurePage(self: *McidLookupCtx, page_idx: usize) ?*structtree.MarkedContentExtractor {
-            const gop = self.extractors.getOrPut(page_idx) catch return null;
+        ///
+        /// Codex review v1.2-rc4 PR-3 round 2 [P2]: bubble OOM. The
+        /// previous version collapsed every error into null, hiding
+        /// allocator pressure as missing-text. Now: getOrPut +
+        /// arena.create propagate OOM; getPageContents +
+        /// extractContentStream domain errors still soft-fail (the
+        /// extractor stays empty for that page so Cell.text falls
+        /// back to null on those cells without aborting the doc).
+        fn ensurePage(self: *McidLookupCtx, page_idx: usize) error{OutOfMemory}!*structtree.MarkedContentExtractor {
+            const gop = try self.extractors.getOrPut(page_idx);
             if (gop.found_existing) return gop.value_ptr.*;
 
-            const extractor = self.arena.create(structtree.MarkedContentExtractor) catch {
+            const extractor = self.arena.create(structtree.MarkedContentExtractor) catch |err| {
                 _ = self.extractors.remove(page_idx);
-                return null;
+                return err;
             };
             extractor.* = structtree.MarkedContentExtractor.init(self.arena);
+            gop.value_ptr.* = extractor;
 
             // Decode the page's content stream and run it through
-            // extractContentStream in `.structured` mode. Same pattern
-            // root.zig:692 already uses for cached-reading-order text
-            // extraction. Errors here are soft: a corrupt page stream
-            // simply returns an empty extractor, which makes Pass A's
-            // cell.text fall back to null for that page.
+            // extractContentStream in `.structured` mode. Domain
+            // errors → leave extractor empty (cell.text falls back
+            // to null for that page).
             const content = pagetree.getPageContents(
                 self.arena,
                 self.arena,
@@ -1236,8 +1251,8 @@ pub const Document = struct {
                 &self.doc.xref_table,
                 self.doc.pages.items[page_idx],
                 &self.doc.object_cache,
-            ) catch {
-                gop.value_ptr.* = extractor;
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 return extractor;
             };
             self.doc.ensurePageFonts(page_idx);
@@ -1249,17 +1264,20 @@ pub const Document = struct {
                 page_idx,
                 self.arena,
                 &nw,
-            ) catch {};
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                // Other errors leave extractor partially populated;
+                // any MCIDs that did resolve are still useful.
+            };
 
-            gop.value_ptr.* = extractor;
             return extractor;
         }
     };
 
-    fn mcidTextLookup(ctx_ptr: *anyopaque, page_ref: ?ObjRef, mcid: i32) ?[]const u8 {
+    fn mcidTextLookup(ctx_ptr: *anyopaque, page_ref: ?ObjRef, mcid: i32) error{OutOfMemory}!?[]const u8 {
         const ctx: *McidLookupCtx = @ptrCast(@alignCast(ctx_ptr));
         const page_idx_u32 = pageRefToZeroBased(@ptrCast(ctx.doc), page_ref) orelse return null;
-        const extractor = ctx.ensurePage(page_idx_u32) orelse return null;
+        const extractor = try ctx.ensurePage(page_idx_u32);
         return extractor.getTextForMcid(mcid);
     }
 

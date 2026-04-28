@@ -450,7 +450,7 @@ fn fuzzTaggedTableMutation(rng: std.Random, allocator: std.mem.Allocator, scratc
     const Stub = struct {
         rng: *std.Random,
         scratch: []u8,
-        fn lookup(ctx_ptr: *anyopaque, page_ref: ?zpdf.parser.ObjRef, mcid: i32) ?[]const u8 {
+        fn lookup(ctx_ptr: *anyopaque, page_ref: ?zpdf.parser.ObjRef, mcid: i32) error{OutOfMemory}!?[]const u8 {
             _ = page_ref;
             _ = mcid;
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
