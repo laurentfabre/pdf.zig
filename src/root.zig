@@ -1143,7 +1143,20 @@ pub const Document = struct {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 break :blk &[_]lattice.Stroke{};
             };
-            const pass_b = lattice.extractFromStrokes(allocator, strokes, @intCast(page_idx + 1)) catch |err| blk: {
+
+            // PR-4 [feat]: extract spans ONCE per page (was: only
+            // before Pass C). Pass B now consumes the same span
+            // slice to populate cell.text via glyph-center
+            // intersection. Domain errors → empty slice; OOM
+            // bubbles.
+            const spans_opt: ?[]TextSpan = self.extractTextWithBounds(page_idx, allocator) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                break :blk null;
+            };
+            defer if (spans_opt) |s| Document.freeTextSpans(allocator, s);
+            const span_view: []const layout.TextSpan = if (spans_opt) |s| s else &.{};
+
+            const pass_b = lattice.extractFromStrokes(allocator, strokes, @intCast(page_idx + 1), span_view) catch |err| blk: {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 break :blk &[_]tables.Table{};
             };
@@ -1151,17 +1164,13 @@ pub const Document = struct {
                 if (!conflictsExisting(combined.items, t)) {
                     try combined.append(allocator, t);
                 } else {
+                    for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
                     allocator.free(t.cells);
                 }
             }
             allocator.free(pass_b);
 
-            // Pass C: get text spans, run stream-layout. Stick to the
-            // mutable []TextSpan returned by extractTextWithBounds so
-            // freeTextSpans can clean it up.
-            const spans_opt: ?[]TextSpan = self.extractTextWithBounds(page_idx, allocator) catch null;
-            defer if (spans_opt) |s| Document.freeTextSpans(allocator, s);
-            const span_view: []const layout.TextSpan = if (spans_opt) |s| s else &.{};
+            // Pass C: stream-layout on the same spans.
             const pass_c = stream_table.extractFromSpans(allocator, span_view, @intCast(page_idx + 1)) catch &[_]tables.Table{};
             for (pass_c) |t| {
                 if (!conflictsExisting(combined.items, t)) {
