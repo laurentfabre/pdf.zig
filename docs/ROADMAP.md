@@ -86,7 +86,7 @@ updated: 2026-04-27
   > **Test strategy.** Two new integration_test cases; rerun `audit/v1_2_eval.py`.
   > **Codex gate.** `media_box` access on pages without explicit `/MediaBox`; threshold not over-tuned to one fixture.
 
-- [ ] **PR-3 · feat: Pass A cell text via MCID-to-bbox lookup**
+- [x] **PR-3 · feat: Pass A cell text via MCID-to-bbox lookup** (merged in `483fda0`, 2026-04-28; 10 commits, 7 Codex review rounds, 1 P1 + 6 P2 findings folded; switched from bbox-intersection to direct text-by-MCID lookup)
   > [!info]- Details
   > **Files-touched envelope.** `src/structtree.zig` (expose per-MCID bbox), `src/tables.zig` (consume), `src/integration_test.zig`.
   > **Acceptance gate.**
