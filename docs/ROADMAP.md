@@ -60,7 +60,7 @@ updated: 2026-04-27
 
 ## v1.2-rc4 — closing Codex `[P2 deferred]` items
 
-- [ ] **PR-1 · feat: Form XObject `Do` recursion in lattice Pass B**
+- [x] **PR-1 · feat: Form XObject `Do` recursion in lattice Pass B** (merged in `4e66f15`, 2026-04-28; 26 commits, 21 Codex review rounds, 23 P2 + 1 P3 findings folded)
   > [!info]- Details
   > **Why.** `[[PROJECT-LOG#v1.2-rc2]]` Codex finding #6 (deferred from rc1 review) — ruled tables drawn inside `Do`-referenced templates are currently invisible to lattice detection.
   > **Files-touched envelope.** `src/lattice.zig` (primary), `src/parser.zig` (resource lookup helper), `src/integration_test.zig` (new test).
