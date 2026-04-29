@@ -3,10 +3,11 @@
 //! Creates minimal valid PDFs for testing the parser.
 //! Hand-crafted bodies migrated to the writer API cluster-by-cluster
 //! (PR-W6.1+). Migrated so far: text-only (W6.1) + metadata + /Outlines
-//! (W6.2) + /Annots links (W6.3). Fixtures still hand-rolled: AcroForm,
-//! /PageLabels, and the intentionally-malformed/specialized fixtures
-//! (CID font, incremental update, encrypted, Form XObject malformed-
-//! resources variants). Each future cluster gets its own ≤1-day PR.
+//! (W6.2) + /Annots links (W6.3) + AcroForm fields (W6.4). Fixtures
+//! still hand-rolled: /PageLabels, plus the intentionally-malformed
+//! /specialized fixtures (CID font, incremental update, encrypted,
+//! Form XObject malformed-resources variants). Each future cluster
+//! gets its own ≤1-day PR.
 
 const std = @import("std");
 const document = @import("pdf_document.zig");
@@ -557,59 +558,31 @@ pub fn generateLinkPdf(allocator: std.mem.Allocator) ![]u8 {
     return doc.write();
 }
 
-/// Generate a PDF with form fields (/AcroForm)
+/// PR-W6.4 [refactor]: AcroForm fixture via DocumentBuilder.
+/// Two top-level form fields (text + button) registered as aux
+/// objects; /AcroForm /Fields ref array spliced into /Catalog.
 pub fn generateFormFieldPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, "Form Test");
 
-    // Catalog with AcroForm
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R ");
-    try writer.writeAll("/AcroForm << /Fields [6 0 R 7 0 R] >> >>\nendobj\n");
+    const tx_field = try doc.addAuxiliaryObject(
+        "<< /FT /Tx /T (name) /V (John Doe) /Rect [100 600 300 620] >>",
+    );
+    const btn_field = try doc.addAuxiliaryObject(
+        "<< /FT /Btn /T (submit) /Rect [100 550 200 570] >>",
+    );
 
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    var extras_buf: [128]u8 = undefined;
+    try doc.setCatalogExtras(try std.fmt.bufPrint(
+        &extras_buf,
+        "/AcroForm << /Fields [{d} 0 R {d} 0 R] >>",
+        .{ tx_field, btn_field },
+    ));
 
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    const content = "BT\n/F1 12 Tf\n100 700 Td\n(Form Test) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Object 6: Text field
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /FT /Tx /T (name) /V (John Doe) ");
-    try writer.writeAll("/Rect [100 600 300 620] >>\nendobj\n");
-
-    // Object 7: Button field
-    const obj7_offset = pdf.items.len;
-    try writer.writeAll("7 0 obj\n<< /FT /Btn /T (submit) ");
-    try writer.writeAll("/Rect [100 550 200 570] >>\nendobj\n");
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 8\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
-
-    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// Generate a PDF with page labels
@@ -801,68 +774,34 @@ pub fn generateMultiLinkPdf(allocator: std.mem.Allocator) ![]u8 {
     return doc.write();
 }
 
-/// Generate a PDF with all form field types: text, button, choice, signature
+/// PR-W6.4 [refactor]: all-form-field-types fixture via DocumentBuilder.
+/// 4 top-level fields exercise the four /FT discriminants (/Tx text,
+/// /Btn button, /Ch choice, /Sig signature) — some carry a /V value,
+/// some don't.
 pub fn generateAllFormFieldsPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, "All Fields");
 
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R ");
-    try writer.writeAll("/AcroForm << /Fields [6 0 R 7 0 R 8 0 R 9 0 R] >> >>\nendobj\n");
+    const tx = try doc.addAuxiliaryObject(
+        "<< /FT /Tx /T (email) /V (user@example.com) /Rect [100 600 300 620] >>",
+    );
+    const btn = try doc.addAuxiliaryObject("<< /FT /Btn /T (ok_button) >>");
+    const ch = try doc.addAuxiliaryObject(
+        "<< /FT /Ch /T (country) /V (USA) /Rect [100 500 300 520] >>",
+    );
+    const sig = try doc.addAuxiliaryObject("<< /FT /Sig /T (signature) >>");
 
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    var extras_buf: [192]u8 = undefined;
+    try doc.setCatalogExtras(try std.fmt.bufPrint(
+        &extras_buf,
+        "/AcroForm << /Fields [{d} 0 R {d} 0 R {d} 0 R {d} 0 R] >>",
+        .{ tx, btn, ch, sig },
+    ));
 
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    const content = "BT\n/F1 12 Tf\n100 700 Td\n(All Fields) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Text field with value
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /FT /Tx /T (email) /V (user@example.com) ");
-    try writer.writeAll("/Rect [100 600 300 620] >>\nendobj\n");
-
-    // Button field (no value)
-    const obj7_offset = pdf.items.len;
-    try writer.writeAll("7 0 obj\n<< /FT /Btn /T (ok_button) >>\nendobj\n");
-
-    // Choice field with value
-    const obj8_offset = pdf.items.len;
-    try writer.writeAll("8 0 obj\n<< /FT /Ch /T (country) /V (USA) ");
-    try writer.writeAll("/Rect [100 500 300 520] >>\nendobj\n");
-
-    // Signature field (no value)
-    const obj9_offset = pdf.items.len;
-    try writer.writeAll("9 0 obj\n<< /FT /Sig /T (signature) >>\nendobj\n");
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 10\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
-
-    try writer.writeAll("trailer\n<< /Size 10 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// Generate a PDF with page labels: uppercase roman, alpha, prefix, custom start
