@@ -1642,3 +1642,85 @@ test "lattice pass B populates cell text via glyph-center intersection" {
         try std.testing.expectEqualStrings(gold[c.r][c.c], c.text.?);
     }
 }
+
+// Regression: corrupt content streams with a name-typed operand at a
+// numeric operator position used to panic with "access of union field
+// 'number' while field 'name' is active" on Td / Tm / cm. The
+// `pdf_extract_mutation` fuzz target hit this; covering it here so the
+// regression is caught at unit-test time instead of seed-lottery time.
+//
+// Each fixture uses DocumentBuilder + page.appendContent to inject a
+// hand-crafted content stream that violates the PDF spec at a single
+// well-defined point, then runs extractMarkdown end-to-end. The test
+// passes if and only if extraction completes without panicking; the
+// extractor's job is graceful degradation, not byte-exact recovery.
+
+fn buildCorruptContentPdf(allocator: std.mem.Allocator, raw_content: []const u8) ![]u8 {
+    const document = @import("pdf_document.zig");
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    const f = page.markFontUsed(.helvetica);
+    var buf: [1024]u8 = undefined;
+    const stream = try std.fmt.bufPrint(&buf, "BT\n{s} 12 Tf\n{s}\nET\n", .{ f, raw_content });
+    try page.appendContent(stream);
+    return doc.write();
+}
+
+test "extractMarkdown survives Td with a name where ty is expected" {
+    const allocator = std.testing.allocator;
+    // `100 /BadOperand Td` — ty is /BadOperand instead of a number.
+    const bytes = try buildCorruptContentPdf(allocator, "100 /BadOperand Td (Hello) Tj");
+    defer allocator.free(bytes);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    const md = try doc.extractMarkdown(0, allocator);
+    defer allocator.free(md);
+    // No assertion on content — the gate is "did not panic".
+}
+
+test "extractMarkdown survives Tm with a name where the matrix expects a number" {
+    const allocator = std.testing.allocator;
+    // `1 0 0 1 100 /BadOperand Tm` — f (ty) is /BadOperand instead of a number.
+    const bytes = try buildCorruptContentPdf(allocator, "1 0 0 1 100 /BadOperand Tm (Hello) Tj");
+    defer allocator.free(bytes);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    const md = try doc.extractMarkdown(0, allocator);
+    defer allocator.free(md);
+}
+
+test "getPageImages survives cm with a name in the matrix" {
+    const allocator = std.testing.allocator;
+    // `1 0 /Garbage 1 0 0 cm` — c is /Garbage instead of a number.
+    // The `cm` handler lives in `getPageImages` (the layout-aware
+    // image-rect walker); `extractMarkdown`'s content-stream extractor
+    // doesn't track CTM, so we exercise the panicking path directly.
+    const bytes = try buildCorruptContentPdf(allocator, "1 0 /Garbage 1 0 0 cm (Hello) Tj");
+    defer allocator.free(bytes);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    const images = try doc.getPageImages(0, allocator);
+    defer allocator.free(images);
+    // No assertion on image count — the gate is "did not panic".
+}
+
+test "extractMarkdown survives BDC with non-name property dict (MCID extraction)" {
+    const allocator = std.testing.allocator;
+    // `42 /Tag BDC` — first operand should be /Tag (name), second is the
+    // property dict / name. We keep the shape valid here but flip the
+    // property operand into a number to exercise the MCID extractor's
+    // tag-checked path. The fuzz target found ReleaseSafe inlining that
+    // misattributed the panic to this BDC site; the real fix is in cm/Td/Tm
+    // but a regression test pinning BDC's tag-checked behaviour is cheap.
+    const bytes = try buildCorruptContentPdf(allocator, "/Span 42 BDC (Hello) Tj EMC");
+    defer allocator.free(bytes);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    const md = try doc.extractMarkdown(0, allocator);
+    defer allocator.free(md);
+}
