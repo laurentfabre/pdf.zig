@@ -93,6 +93,30 @@ pub const BuiltinFont = enum(u4) {
     pub fn usesWinAnsi(self: BuiltinFont) bool {
         return self != .symbol and self != .zapf_dingbats;
     }
+
+    /// PR-W6.1 [feat]: resource name as it appears in the auto-emitted
+    /// `/Resources/Font` dict. Matches the `/F<index>` form that
+    /// `emitAutoResources` writes — callers injecting raw content
+    /// streams (TJ, Tm) via `page.appendContent` must use this exact
+    /// name in their `Tf` operator. Also used by `markFontUsed`.
+    pub fn resourceName(self: BuiltinFont) []const u8 {
+        return switch (self) {
+            .helvetica => "/F0",
+            .helvetica_bold => "/F1",
+            .helvetica_oblique => "/F2",
+            .helvetica_bold_oblique => "/F3",
+            .times_roman => "/F4",
+            .times_bold => "/F5",
+            .times_italic => "/F6",
+            .times_bold_italic => "/F7",
+            .courier => "/F8",
+            .courier_bold => "/F9",
+            .courier_oblique => "/F10",
+            .courier_bold_oblique => "/F11",
+            .symbol => "/F12",
+            .zapf_dingbats => "/F13",
+        };
+    }
 };
 
 pub const NUM_BUILTIN_FONTS: comptime_int = @typeInfo(BuiltinFont).@"enum".fields.len;
@@ -175,6 +199,17 @@ pub const PageBuilder = struct {
     /// destinations, outline /Dest entries, /AcroForm fields, etc.
     pub fn objNum(self: *const PageBuilder) u32 {
         return self.obj_num;
+    }
+
+    /// PR-W6.1 [feat]: register `font` in this page's auto-resources
+    /// set and return its resource name (`/F0`..`/F13`) for use in a
+    /// content-stream `Tf` operator. Use this when you need to call
+    /// `appendContent` with a hand-written content stream and want
+    /// the auto-emitted `/Resources/Font` dict to define the font
+    /// name your stream references.
+    pub fn markFontUsed(self: *PageBuilder, font: BuiltinFont) []const u8 {
+        self.fonts_used[@intFromEnum(font)] = true;
+        return font.resourceName();
     }
 
     /// PR-W3 [feat]: emit `BT /Fk size Tf x y Td (escaped) Tj ET`

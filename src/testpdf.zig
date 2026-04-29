@@ -10,7 +10,10 @@ const document = @import("pdf_document.zig");
 
 /// PR-W6.1 [refactor]: text-only fixture, now built via DocumentBuilder.
 /// Byte-different from the previous hand-rolled output but
-/// semantically equivalent (same pageCount, font ref, extractable text).
+/// semantically equivalent for printable-ASCII inputs (same pageCount,
+/// font ref, extractable text). Non-ASCII bytes are silently dropped
+/// by `drawText`'s WinAnsi filter, where the old hand-rolled fixture
+/// would have inlined them verbatim.
 pub fn generateMinimalPdf(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var doc = document.DocumentBuilder.init(allocator);
     defer doc.deinit();
@@ -22,7 +25,9 @@ pub fn generateMinimalPdf(allocator: std.mem.Allocator, text: []const u8) ![]u8 
 /// PR-W6.1 [refactor]: multi-page text fixture via DocumentBuilder.
 /// Each input string lands as a single 12pt Helvetica `Tj` at (100, 700)
 /// on its own /Page. The page tree is balanced (PR-W2) — for ≤10
-/// pages it stays flat, matching the old hand-rolled shape.
+/// pages it stays flat, matching the old hand-rolled shape. Non-ASCII
+/// bytes are dropped by `drawText`'s WinAnsi filter (printable-ASCII
+/// only), unlike the old verbatim-inlining hand-rolled fixture.
 pub fn generateMultiPagePdf(allocator: std.mem.Allocator, pages_text: []const []const u8) ![]u8 {
     var doc = document.DocumentBuilder.init(allocator);
     defer doc.deinit();
@@ -36,14 +41,21 @@ pub fn generateMultiPagePdf(allocator: std.mem.Allocator, pages_text: []const []
 /// Generate a PDF with TJ operator (array-based text)
 /// PR-W6.1 [refactor]: TJ-operator (kerned text-show) fixture via
 /// DocumentBuilder. Direct content-stream injection because the writer
-/// only models `Tj`; we register `helvetica` in the font set manually
-/// so the auto-resources block emits `/F1`.
+/// only models `Tj`. `markFontUsed` returns the resource name (`/F0`
+/// for Helvetica) so the `Tf` operator references whatever the
+/// auto-resources block actually emits.
 pub fn generateTJPdf(allocator: std.mem.Allocator) ![]u8 {
     var doc = document.DocumentBuilder.init(allocator);
     defer doc.deinit();
     const page = try doc.addPage(.{ 0, 0, 612, 792 });
-    page.fonts_used[@intFromEnum(document.BuiltinFont.helvetica)] = true;
-    try page.appendContent("BT\n/F1 12 Tf\n100 700 Td\n[(Hello) -200 (World)] TJ\nET\n");
+    const f = page.markFontUsed(.helvetica);
+    var content_buf: [128]u8 = undefined;
+    const content = try std.fmt.bufPrint(
+        &content_buf,
+        "BT\n{s} 12 Tf\n100 700 Td\n[(Hello) -200 (World)] TJ\nET\n",
+        .{f},
+    );
+    try page.appendContent(content);
     return doc.write();
 }
 
@@ -249,20 +261,24 @@ pub fn generateSuperscriptPdf(allocator: std.mem.Allocator) ![]u8 {
     var doc = document.DocumentBuilder.init(allocator);
     defer doc.deinit();
     const page = try doc.addPage(.{ 0, 0, 612, 792 });
-    page.fonts_used[@intFromEnum(document.BuiltinFont.helvetica)] = true;
-    try page.appendContent(
+    const f = page.markFontUsed(.helvetica);
+    var content_buf: [512]u8 = undefined;
+    const content = try std.fmt.bufPrint(
+        &content_buf,
         "BT\n" ++
-            "/F1 12 Tf\n" ++
+            "{[f]s} 12 Tf\n" ++
             "1 0 0 1 100 700 Tm\n" ++
             "(Hello) Tj\n" ++
-            "/F1 7 Tf\n" ++
+            "{[f]s} 7 Tf\n" ++
             "1 0 0 1 110 707 Tm\n" ++
             "(2) Tj\n" ++
-            "/F1 12 Tf\n" ++
+            "{[f]s} 12 Tf\n" ++
             "1 0 0 1 120 700 Tm\n" ++
             "( World) Tj\n" ++
             "ET\n",
+        .{ .f = f },
     );
+    try page.appendContent(content);
     return doc.write();
 }
 
