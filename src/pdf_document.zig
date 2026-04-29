@@ -314,7 +314,15 @@ fn buildBalancedTree(
             const end = @min(i + PAGE_TREE_FANOUT, current_level_kids.items.len);
             const chunk_len = end - i;
             const chunk_objs = try allocator.alloc(u32, chunk_len);
-            errdefer allocator.free(chunk_objs);
+            // codex r1 P1: ownership-transfer guard. chunk_objs is
+            // owned by this local until `internal_nodes.append`
+            // succeeds; after that, the outer `internal_nodes`
+            // errdefer owns it via node.kids. Without the flag the
+            // two errdefers double-free chunk_objs when a later
+            // alloc in this iteration (next_kids.append /
+            // next_counts.append) fails.
+            var chunk_objs_owned = true;
+            errdefer if (chunk_objs_owned) allocator.free(chunk_objs);
             @memcpy(chunk_objs, current_level_kids.items[i..end]);
 
             const node_obj = try w.allocObjectNum();
@@ -356,6 +364,7 @@ fn buildBalancedTree(
                 .kids = chunk_objs,
                 .subtree_page_count = subtree,
             });
+            chunk_objs_owned = false;
             try next_kids.append(allocator, node_obj);
             try next_counts.append(allocator, subtree);
             i = end;
@@ -476,6 +485,77 @@ test "DocumentBuilder writes 3-page flat tree" {
     var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
     defer d.close();
     try std.testing.expectEqual(@as(usize, 3), d.pageCount());
+}
+
+// PR-W2 codex r1 P2: the existing reader walks /Kids and ignores
+// /Count / /Parent, so `pageCount() == N` doesn't actually verify
+// the tree shape. This helper greps the emitted bytes for the
+// tree-shape invariants directly:
+//   - Every internal /Pages node has /Count
+//   - Internal nodes (except root) have /Parent
+//   - Leaf /Page objects have /Parent (always)
+fn assertPageTreeShape(bytes: []const u8, expected_pages: usize) !void {
+    // Total /Page objects must equal expected_pages.
+    const page_marker = "/Type /Page ";
+    var pos: usize = 0;
+    var page_count: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, pos, page_marker)) |idx| {
+        // Discriminate /Page vs /Pages: next char after "/Type /Page" must be ' ' (already in marker) and the byte at marker[end] should NOT be 's'.
+        page_count += 1;
+        pos = idx + page_marker.len;
+    }
+    try std.testing.expectEqual(expected_pages, page_count);
+
+    // Every /Page should have /Parent.
+    var leaves_with_parent: usize = 0;
+    pos = 0;
+    while (std.mem.indexOfPos(u8, bytes, pos, page_marker)) |idx| {
+        // Look ahead up to 200 bytes for /Parent.
+        const search_end = @min(idx + 200, bytes.len);
+        if (std.mem.indexOfPos(u8, bytes[0..search_end], idx, "/Parent ") != null) {
+            leaves_with_parent += 1;
+        }
+        pos = idx + page_marker.len;
+    }
+    try std.testing.expectEqual(expected_pages, leaves_with_parent);
+
+    // Every /Type /Pages node should have /Count.
+    const pages_marker = "/Type /Pages ";
+    pos = 0;
+    var internal_nodes_count: usize = 0;
+    var internal_with_count: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, pos, pages_marker)) |idx| {
+        internal_nodes_count += 1;
+        const search_end = @min(idx + 4096, bytes.len);
+        if (std.mem.indexOfPos(u8, bytes[0..search_end], idx, "/Count ") != null) {
+            internal_with_count += 1;
+        }
+        pos = idx + pages_marker.len;
+    }
+    try std.testing.expect(internal_nodes_count >= 1);
+    try std.testing.expectEqual(internal_nodes_count, internal_with_count);
+}
+
+test "page tree shape: /Count + /Parent on 11-page doc (codex r1 P2)" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    var i: usize = 0;
+    while (i < 11) : (i += 1) _ = try doc.addPage(.{ 0, 0, 612, 792 });
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+    try assertPageTreeShape(bytes, 11);
+}
+
+test "page tree shape: /Count + /Parent on 999-page doc (codex r1 P2)" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    var i: usize = 0;
+    while (i < 999) : (i += 1) _ = try doc.addPage(.{ 0, 0, 612, 792 });
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+    try assertPageTreeShape(bytes, 999);
 }
 
 test "DocumentBuilder writes 1000-page balanced tree (PR-W2 stress gate)" {
