@@ -272,8 +272,9 @@ pub const DocumentBuilder = struct {
     allocator: std.mem.Allocator,
     /// PR-W6 [feat]: writer is now long-lived so `addPage` and
     /// `addAuxiliaryObject` can reserve object numbers eagerly. The
-    /// builder is single-use: `write()` consumes the writer and
-    /// invalidates further mutating calls.
+    /// builder is single-use: `write()` consumes the writer and sets
+    /// `written` to true; further mutating calls return
+    /// `error.DocumentAlreadyWritten`.
     writer: pdf_writer.Writer,
     /// Pages in document order. Each pointer is heap-owned; freed by
     /// `deinit`.
@@ -290,13 +291,20 @@ pub const DocumentBuilder = struct {
     /// `/Pages X 0 R` and the closing `>>` (e.g. `/Outlines N 0 R
     /// /PageLabels << ... >>`).
     catalog_extras_raw: std.ArrayList(u8),
+    /// PR-W6 [feat]: single-use guard. Set true at the end of `write`;
+    /// further mutating calls return `error.DocumentAlreadyWritten`.
+    written: bool = false,
 
     const AuxObject = struct {
         obj_num: u32,
-        payload: []u8,
+        /// `null` means "reserved but unfilled" — caller must call
+        /// `setAuxiliaryPayload` before `write()`. Emitted as an empty
+        /// `<< >>` dict if left unfilled, which keeps the PDF
+        /// structurally valid but semantically meaningless.
+        payload: ?[]u8,
     };
 
-    pub const Error = pdf_writer.Writer.Error || error{NoPages};
+    pub const Error = pdf_writer.Writer.Error || error{ NoPages, DocumentAlreadyWritten, UnknownAuxObject };
 
     pub fn init(allocator: std.mem.Allocator) DocumentBuilder {
         return .{
@@ -315,17 +323,22 @@ pub const DocumentBuilder = struct {
             self.allocator.destroy(p);
         }
         self.pages.deinit(self.allocator);
-        for (self.aux_objects.items) |a| self.allocator.free(a.payload);
+        for (self.aux_objects.items) |a| if (a.payload) |p| self.allocator.free(p);
         self.aux_objects.deinit(self.allocator);
         self.info_payload.deinit(self.allocator);
         self.catalog_extras_raw.deinit(self.allocator);
         self.writer.deinit();
     }
 
+    /// PR-W6 [feat]: failure-atomicity contract for the mutating
+    /// methods below. On any error other than `DocumentAlreadyWritten`
+    /// (e.g. OOM mid-call), the builder may have partially-reserved
+    /// object numbers in the underlying writer; the caller MUST treat
+    /// the builder as poisoned and call `deinit` without reattempting
+    /// the operation. The page-tree assembly in `write()` would
+    /// otherwise trip `error.DanglingObjectAllocation`.
     pub fn addPage(self: *DocumentBuilder, media_box: [4]f64) !*PageBuilder {
-        // Reserve the leaf /Page object number AND its content stream
-        // up-front so other auxiliary objects (annotations, outlines,
-        // form fields) can reference the page before `write()` runs.
+        if (self.written) return error.DocumentAlreadyWritten;
         const page_num = try self.writer.allocObjectNum();
         const content_num = try self.writer.allocObjectNum();
         const page = try self.allocator.create(PageBuilder);
@@ -337,16 +350,42 @@ pub const DocumentBuilder = struct {
         return page;
     }
 
-    /// PR-W6 [feat]: register an auxiliary indirect object. The
-    /// `payload` bytes are duplicated and emitted verbatim between
-    /// `<num> 0 obj` and `endobj` during `write()`. Returns the
-    /// allocated object number for the caller to use in refs.
+    /// PR-W6 [feat]: register an auxiliary indirect object with its
+    /// payload set in one shot. Returns the allocated object number
+    /// for the caller to use in refs. Equivalent to `reserveAuxiliary
+    /// Object` + `setAuxiliaryPayload`.
     pub fn addAuxiliaryObject(self: *DocumentBuilder, payload: []const u8) !u32 {
-        const num = try self.writer.allocObjectNum();
-        const owned = try self.allocator.dupe(u8, payload);
-        errdefer self.allocator.free(owned);
-        try self.aux_objects.append(self.allocator, .{ .obj_num = num, .payload = owned });
+        const num = try self.reserveAuxiliaryObject();
+        try self.setAuxiliaryPayload(num, payload);
         return num;
+    }
+
+    /// PR-W6 [feat]: reserve an auxiliary object number without
+    /// supplying the payload yet. Used when two aux objects must
+    /// reference each other (e.g. /Outlines /First → item, item
+    /// /Parent → /Outlines). Caller MUST call `setAuxiliaryPayload`
+    /// before `write()`; an unfilled aux object emits as `<< >>`.
+    pub fn reserveAuxiliaryObject(self: *DocumentBuilder) !u32 {
+        if (self.written) return error.DocumentAlreadyWritten;
+        const num = try self.writer.allocObjectNum();
+        try self.aux_objects.append(self.allocator, .{ .obj_num = num, .payload = null });
+        return num;
+    }
+
+    /// PR-W6 [feat]: fill in (or replace) the payload of a previously
+    /// reserved aux object. The bytes are duplicated; subsequent
+    /// callers may free the original buffer immediately.
+    pub fn setAuxiliaryPayload(self: *DocumentBuilder, obj_num: u32, payload: []const u8) !void {
+        if (self.written) return error.DocumentAlreadyWritten;
+        for (self.aux_objects.items) |*aux| {
+            if (aux.obj_num == obj_num) {
+                const owned = try self.allocator.dupe(u8, payload);
+                if (aux.payload) |old| self.allocator.free(old);
+                aux.payload = owned;
+                return;
+            }
+        }
+        return error.UnknownAuxObject;
     }
 
     /// PR-W6 [feat]: set the /Info dict payload. The payload must be
@@ -355,6 +394,7 @@ pub const DocumentBuilder = struct {
     /// returned so the caller may reference it (e.g. as an /Encrypt
     /// peer); subsequent calls only update the payload.
     pub fn setInfoDict(self: *DocumentBuilder, payload: []const u8) !u32 {
+        if (self.written) return error.DocumentAlreadyWritten;
         if (self.info_obj_num == null) {
             self.info_obj_num = try self.writer.allocObjectNum();
         }
@@ -367,13 +407,16 @@ pub const DocumentBuilder = struct {
     /// spliced in *before* the closing `>>`). Pass empty to clear.
     /// Caller is responsible for well-formed PDF tokens.
     pub fn setCatalogExtras(self: *DocumentBuilder, raw: []const u8) !void {
+        if (self.written) return error.DocumentAlreadyWritten;
         self.catalog_extras_raw.clearRetainingCapacity();
         try self.catalog_extras_raw.appendSlice(self.allocator, raw);
     }
 
     /// Assemble the document and return owned bytes. Caller frees with
-    /// `allocator.free(bytes)`. Single-use: don't call twice.
+    /// `allocator.free(bytes)`. Single-use: a second call returns
+    /// `error.DocumentAlreadyWritten`.
     pub fn write(self: *DocumentBuilder) ![]u8 {
+        if (self.written) return error.DocumentAlreadyWritten;
         if (self.pages.items.len == 0) return error.NoPages;
 
         const w = &self.writer;
@@ -462,9 +505,12 @@ pub const DocumentBuilder = struct {
         // 3e. Auxiliary objects (outline items, annotations, form
         // fields, page-label trees, …). Each payload is the complete
         // dict / stream body — emitted verbatim between obj/endobj.
+        // A reserved-but-unfilled aux object emits as `<< >>` so the
+        // PDF stays structurally valid even if the caller forgot to
+        // call `setAuxiliaryPayload`.
         for (self.aux_objects.items) |aux| {
             try w.beginObject(aux.obj_num, 0);
-            try w.writeRaw(aux.payload);
+            try w.writeRaw(aux.payload orelse "<< >>");
             try w.endObject();
         }
 
@@ -477,7 +523,9 @@ pub const DocumentBuilder = struct {
 
         const xref_off = try w.writeXref();
         try w.writeTrailer(xref_off, catalog, self.info_obj_num);
-        return try w.finalize();
+        const bytes = try w.finalize();
+        self.written = true;
+        return bytes;
     }
 };
 
@@ -1262,13 +1310,13 @@ test "DocumentBuilder.addAuxiliaryObject + setCatalogExtras link from /Catalog" 
     var doc = DocumentBuilder.init(allocator);
     defer doc.deinit();
 
-    // Reserve a small auxiliary object (a /Names dict in this test
-    // would be more realistic, but a /Metadata stream is simpler to
-    // build by hand).
-    const aux_num = try doc.addAuxiliaryObject("<< /Type /Metadata /Subtype /XML >>");
+    // We use a marker name (`/Pdfzigtest`) that only appears in the
+    // splice we're verifying. /Metadata, /Names, /OpenAction etc. would
+    // all alias with PDF spec keywords and could trip false positives.
+    const aux_num = try doc.addAuxiliaryObject("<< /Type /Pdfzigtest /Marker (auxbody) >>");
 
     var extras_buf: [128]u8 = undefined;
-    const extras = try std.fmt.bufPrint(&extras_buf, "/Metadata {d} 0 R", .{aux_num});
+    const extras = try std.fmt.bufPrint(&extras_buf, "/Pdfzigtest {d} 0 R", .{aux_num});
     try doc.setCatalogExtras(extras);
 
     const page = try doc.addPage(.{ 0, 0, 612, 792 });
@@ -1276,10 +1324,85 @@ test "DocumentBuilder.addAuxiliaryObject + setCatalogExtras link from /Catalog" 
     const bytes = try doc.write();
     defer allocator.free(bytes);
 
-    // The catalog string contains both the aux object's body AND the
-    // /Metadata ref pointing at it.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Type /Metadata") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Metadata ") != null);
+    // Exact catalog-ref pattern proves the splice — would not match
+    // the aux body (which has `/Type /Pdfzigtest` not `/Pdfzigtest N 0 R`).
+    var expected_ref_buf: [64]u8 = undefined;
+    const expected_ref = try std.fmt.bufPrint(&expected_ref_buf, "/Pdfzigtest {d} 0 R", .{aux_num});
+    try std.testing.expect(std.mem.indexOf(u8, bytes, expected_ref) != null);
+    // Aux body marker is independent of the catalog splice.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "(auxbody)") != null);
+}
+
+test "DocumentBuilder rejects mutations after write (single-use guard)" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "x");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.write());
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.addPage(.{ 0, 0, 612, 792 }));
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.addAuxiliaryObject("<< >>"));
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.reserveAuxiliaryObject());
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.setAuxiliaryPayload(0, "<< >>"));
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.setInfoDict("<< >>"));
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.setCatalogExtras(""));
+}
+
+test "DocumentBuilder reserve/set supports cyclic aux refs (outline shape)" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "x");
+
+    // Reserve before filling — needed to express /Outlines /First → item
+    // and item /Parent → /Outlines (circular).
+    const outlines = try doc.reserveAuxiliaryObject();
+    const item = try doc.reserveAuxiliaryObject();
+
+    var outlines_buf: [256]u8 = undefined;
+    const outlines_payload = try std.fmt.bufPrint(
+        &outlines_buf,
+        "<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count 1 >>",
+        .{ item, item },
+    );
+    try doc.setAuxiliaryPayload(outlines, outlines_payload);
+
+    var item_buf: [256]u8 = undefined;
+    const item_payload = try std.fmt.bufPrint(
+        &item_buf,
+        "<< /Title (Top) /Parent {d} 0 R /Dest [{d} 0 R /Fit] >>",
+        .{ outlines, page.objNum() },
+    );
+    try doc.setAuxiliaryPayload(item, item_payload);
+
+    var extras_buf: [64]u8 = undefined;
+    try doc.setCatalogExtras(try std.fmt.bufPrint(&extras_buf, "/Outlines {d} 0 R", .{outlines}));
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // Both refs survive the round-trip — proves cyclic graph holds together.
+    var expected_first_buf: [32]u8 = undefined;
+    const expected_first = try std.fmt.bufPrint(&expected_first_buf, "/First {d} 0 R", .{item});
+    try std.testing.expect(std.mem.indexOf(u8, bytes, expected_first) != null);
+
+    var expected_parent_buf: [32]u8 = undefined;
+    const expected_parent = try std.fmt.bufPrint(&expected_parent_buf, "/Parent {d} 0 R", .{outlines});
+    try std.testing.expect(std.mem.indexOf(u8, bytes, expected_parent) != null);
+}
+
+test "DocumentBuilder.setAuxiliaryPayload rejects unknown obj_num" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    try std.testing.expectError(error.UnknownAuxObject, doc.setAuxiliaryPayload(99, "<< >>"));
 }
 
 test "PageBuilder.setPageExtras splices into leaf /Page dict" {
