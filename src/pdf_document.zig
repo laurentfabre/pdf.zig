@@ -487,53 +487,169 @@ test "DocumentBuilder writes 3-page flat tree" {
     try std.testing.expectEqual(@as(usize, 3), d.pageCount());
 }
 
-// PR-W2 codex r1 P2: the existing reader walks /Kids and ignores
-// /Count / /Parent, so `pageCount() == N` doesn't actually verify
-// the tree shape. This helper greps the emitted bytes for the
-// tree-shape invariants directly:
-//   - Every internal /Pages node has /Count
-//   - Internal nodes (except root) have /Parent
-//   - Leaf /Page objects have /Parent (always)
-fn assertPageTreeShape(bytes: []const u8, expected_pages: usize) !void {
-    // Total /Page objects must equal expected_pages.
-    const page_marker = "/Type /Page ";
-    var pos: usize = 0;
-    var page_count: usize = 0;
-    while (std.mem.indexOfPos(u8, bytes, pos, page_marker)) |idx| {
-        // Discriminate /Page vs /Pages: next char after "/Type /Page" must be ' ' (already in marker) and the byte at marker[end] should NOT be 's'.
-        page_count += 1;
-        pos = idx + page_marker.len;
-    }
-    try std.testing.expectEqual(expected_pages, page_count);
+// PR-W2 codex r1+r2 P2: a real (test-only) page-tree validator that
+// parses each indirect object body and recursively verifies:
+//   - Each `/Type /Page` leaf has `/Parent N 0 R` pointing at a
+//     `/Type /Pages` node, AND that node lists this leaf in its
+//     `/Kids`.
+//   - Each `/Type /Pages` internal node's `/Count` equals the
+//     number of leaf descendants reachable through `/Kids`.
+//   - Every non-root internal `/Pages` node has `/Parent` set to a
+//     `/Pages` node that lists it in `/Kids`. The root has no
+//     `/Parent`.
+//   - The total number of `/Type /Page` leaves == `expected_pages`.
+//
+// This is a minimalist parser tailored to the bytes the writer
+// produces; it does NOT handle every PDF construct (no streams, no
+// hex names, no escapes inside strings, etc.). Sufficient as a
+// correctness oracle on the writer's own output.
+const TreeAssert = struct {
+    const ObjEntry = struct {
+        kind: enum { page, pages, other },
+        parent: ?u32,
+        count: ?u32,
+        kids: []u32,
+    };
 
-    // Every /Page should have /Parent.
-    var leaves_with_parent: usize = 0;
-    pos = 0;
-    while (std.mem.indexOfPos(u8, bytes, pos, page_marker)) |idx| {
-        // Look ahead up to 200 bytes for /Parent.
-        const search_end = @min(idx + 200, bytes.len);
-        if (std.mem.indexOfPos(u8, bytes[0..search_end], idx, "/Parent ") != null) {
-            leaves_with_parent += 1;
+    fn parseAll(allocator: std.mem.Allocator, bytes: []const u8) !std.AutoHashMap(u32, ObjEntry) {
+        var map = std.AutoHashMap(u32, ObjEntry).init(allocator);
+        errdefer {
+            var it = map.iterator();
+            while (it.next()) |e| allocator.free(e.value_ptr.kids);
+            map.deinit();
         }
-        pos = idx + page_marker.len;
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            const obj_idx = std.mem.indexOfPos(u8, bytes, pos, " 0 obj\n") orelse break;
+            // walk back to find the object number (digits)
+            var num_start = obj_idx;
+            while (num_start > 0 and std.ascii.isDigit(bytes[num_start - 1])) num_start -= 1;
+            const num = try std.fmt.parseInt(u32, bytes[num_start..obj_idx], 10);
+            const body_start = obj_idx + " 0 obj\n".len;
+            const end = std.mem.indexOfPos(u8, bytes, body_start, "\nendobj\n") orelse break;
+            const body = bytes[body_start..end];
+            const entry = try parseEntry(allocator, body);
+            try map.put(num, entry);
+            pos = end + "\nendobj\n".len;
+        }
+        return map;
     }
-    try std.testing.expectEqual(expected_pages, leaves_with_parent);
 
-    // Every /Type /Pages node should have /Count.
-    const pages_marker = "/Type /Pages ";
-    pos = 0;
-    var internal_nodes_count: usize = 0;
-    var internal_with_count: usize = 0;
-    while (std.mem.indexOfPos(u8, bytes, pos, pages_marker)) |idx| {
-        internal_nodes_count += 1;
-        const search_end = @min(idx + 4096, bytes.len);
-        if (std.mem.indexOfPos(u8, bytes[0..search_end], idx, "/Count ") != null) {
-            internal_with_count += 1;
-        }
-        pos = idx + pages_marker.len;
+    fn parseEntry(allocator: std.mem.Allocator, body: []const u8) !ObjEntry {
+        var kind: @TypeOf(@as(ObjEntry, undefined).kind) = .other;
+        if (std.mem.indexOf(u8, body, "/Type /Page ") != null or
+            std.mem.indexOf(u8, body, "/Type /Page>") != null) kind = .page;
+        if (std.mem.indexOf(u8, body, "/Type /Pages ") != null or
+            std.mem.indexOf(u8, body, "/Type /Pages>") != null) kind = .pages;
+
+        const parent = try parseOptionalRef(body, "/Parent ");
+        const count = try parseOptionalInt(body, "/Count ");
+        const kids = try parseKidsArray(allocator, body);
+        return .{ .kind = kind, .parent = parent, .count = count, .kids = kids };
     }
-    try std.testing.expect(internal_nodes_count >= 1);
-    try std.testing.expectEqual(internal_nodes_count, internal_with_count);
+
+    fn parseOptionalRef(body: []const u8, key: []const u8) !?u32 {
+        const idx = std.mem.indexOf(u8, body, key) orelse return null;
+        const p = idx + key.len;
+        var n_end = p;
+        while (n_end < body.len and std.ascii.isDigit(body[n_end])) n_end += 1;
+        if (n_end == p) return null;
+        return try std.fmt.parseInt(u32, body[p..n_end], 10);
+    }
+
+    fn parseOptionalInt(body: []const u8, key: []const u8) !?u32 {
+        const idx = std.mem.indexOf(u8, body, key) orelse return null;
+        const p = idx + key.len;
+        var n_end = p;
+        while (n_end < body.len and std.ascii.isDigit(body[n_end])) n_end += 1;
+        if (n_end == p) return null;
+        return try std.fmt.parseInt(u32, body[p..n_end], 10);
+    }
+
+    fn parseKidsArray(allocator: std.mem.Allocator, body: []const u8) ![]u32 {
+        const key = "/Kids [";
+        const idx = std.mem.indexOf(u8, body, key) orelse return try allocator.alloc(u32, 0);
+        const p = idx + key.len;
+        const close = std.mem.indexOfScalarPos(u8, body, p, ']') orelse return error.MalformedKids;
+        var out: std.ArrayList(u32) = .empty;
+        errdefer out.deinit(allocator);
+        var cursor = p;
+        while (cursor < close) {
+            // skip whitespace
+            while (cursor < close and (body[cursor] == ' ' or body[cursor] == '\t' or body[cursor] == '\n')) cursor += 1;
+            if (cursor >= close) break;
+            var num_end = cursor;
+            while (num_end < close and std.ascii.isDigit(body[num_end])) num_end += 1;
+            if (num_end == cursor) break;
+            const n = try std.fmt.parseInt(u32, body[cursor..num_end], 10);
+            try out.append(allocator, n);
+            // skip " 0 R"
+            cursor = num_end;
+            while (cursor < close and body[cursor] != 'R') cursor += 1;
+            if (cursor < close) cursor += 1;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn deinitMap(map: *std.AutoHashMap(u32, ObjEntry), allocator: std.mem.Allocator) void {
+        var it = map.iterator();
+        while (it.next()) |e| allocator.free(e.value_ptr.kids);
+        map.deinit();
+    }
+};
+
+fn assertPageTreeShape(allocator: std.mem.Allocator, bytes: []const u8, expected_pages: usize) !void {
+    var map = try TreeAssert.parseAll(allocator, bytes);
+    defer TreeAssert.deinitMap(&map, allocator);
+
+    // Find the root /Pages node — it's the only `pages` entry whose
+    // parent is null.
+    var root: ?u32 = null;
+    var page_leaves: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        switch (entry.value_ptr.kind) {
+            .page => page_leaves += 1,
+            .pages => {
+                if (entry.value_ptr.parent == null) {
+                    if (root != null) return error.MultipleRoots;
+                    root = entry.key_ptr.*;
+                }
+            },
+            .other => {},
+        }
+    }
+    try std.testing.expectEqual(expected_pages, page_leaves);
+    try std.testing.expect(root != null);
+
+    // Recursively verify counts and parent backlinks.
+    const counted = try verifyNode(&map, root.?, null);
+    try std.testing.expectEqual(@as(u32, @intCast(expected_pages)), counted);
+}
+
+/// Walk the subtree rooted at `obj`. Returns the total leaf count
+/// for that subtree (which the caller compares against /Count).
+/// Asserts:
+///   - obj exists in map
+///   - if /Pages: every kid's parent ref equals obj; recurse and
+///     verify /Count matches the recursive sum.
+///   - if /Page: returns 1 and verifies parent matches expected.
+fn verifyNode(map: *std.AutoHashMap(u32, TreeAssert.ObjEntry), obj: u32, expected_parent: ?u32) !u32 {
+    const entry = map.get(obj) orelse return error.MissingObject;
+    if (entry.parent != expected_parent) return error.ParentMismatch;
+    switch (entry.kind) {
+        .page => return 1,
+        .pages => {
+            var sum: u32 = 0;
+            for (entry.kids) |kid| {
+                sum += try verifyNode(map, kid, obj);
+            }
+            const declared = entry.count orelse return error.MissingCount;
+            if (declared != sum) return error.CountMismatch;
+            return sum;
+        },
+        .other => return error.UnexpectedObjectType,
+    }
 }
 
 test "page tree shape: /Count + /Parent on 11-page doc (codex r1 P2)" {
@@ -544,7 +660,7 @@ test "page tree shape: /Count + /Parent on 11-page doc (codex r1 P2)" {
     while (i < 11) : (i += 1) _ = try doc.addPage(.{ 0, 0, 612, 792 });
     const bytes = try doc.write();
     defer allocator.free(bytes);
-    try assertPageTreeShape(bytes, 11);
+    try assertPageTreeShape(allocator, bytes,11);
 }
 
 test "page tree shape: /Count + /Parent on 999-page doc (codex r1 P2)" {
@@ -555,7 +671,7 @@ test "page tree shape: /Count + /Parent on 999-page doc (codex r1 P2)" {
     while (i < 999) : (i += 1) _ = try doc.addPage(.{ 0, 0, 612, 792 });
     const bytes = try doc.write();
     defer allocator.free(bytes);
-    try assertPageTreeShape(bytes, 999);
+    try assertPageTreeShape(allocator, bytes,999);
 }
 
 test "DocumentBuilder writes 1000-page balanced tree (PR-W2 stress gate)" {
