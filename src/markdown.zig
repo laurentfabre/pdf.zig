@@ -146,7 +146,7 @@ pub const MarkdownRenderer = struct {
         if (spans.len == 0) return try self.allocator.alloc(u8, 0);
 
         // Analyze font sizes to determine body text size
-        self.analyzeFontSizes(spans);
+        try self.analyzeFontSizes(spans);
 
         // Analyze layout
         var layout_result = try layout.analyzeLayout(self.allocator, spans, page_width);
@@ -154,7 +154,13 @@ pub const MarkdownRenderer = struct {
 
         // Convert to semantic elements
         const elements = try self.spansToElements(layout_result.spans);
-        defer self.allocator.free(elements);
+        // PR-9 [refactor]: free per-element text. The slice was
+        // freed before but each TextElement.text was leaked on both
+        // success and error paths.
+        defer {
+            for (elements) |e| if (e.text.len > 0) self.allocator.free(e.text);
+            self.allocator.free(elements);
+        }
 
         // Render elements to Markdown
         return self.renderElements(elements);
@@ -164,16 +170,19 @@ pub const MarkdownRenderer = struct {
     pub fn renderFromLayout(self: *MarkdownRenderer, layout_result: *const LayoutResult) ![]u8 {
         if (layout_result.spans.len == 0) return try self.allocator.alloc(u8, 0);
 
-        self.analyzeFontSizes(layout_result.spans);
+        try self.analyzeFontSizes(layout_result.spans);
 
         const elements = try self.spansToElements(layout_result.spans);
-        defer self.allocator.free(elements);
+        defer {
+            for (elements) |e| if (e.text.len > 0) self.allocator.free(e.text);
+            self.allocator.free(elements);
+        }
 
         return self.renderElements(elements);
     }
 
     /// Analyze font sizes to determine body text size (most common)
-    fn analyzeFontSizes(self: *MarkdownRenderer, spans: []const TextSpan) void {
+    fn analyzeFontSizes(self: *MarkdownRenderer, spans: []const TextSpan) !void {
         if (spans.len == 0) return;
 
         // Use a histogram approach - bucket font sizes
@@ -182,7 +191,11 @@ pub const MarkdownRenderer = struct {
 
         for (spans) |span| {
             const size_key: i32 = std.math.lossyCast(i32, span.font_size * 10); // 0.1pt precision; saturates on inf/NaN
-            const entry = size_counts.getOrPut(size_key) catch continue;
+            // PR-9 [refactor]: was `catch continue` — swallowed OOM
+            // silently. getOrPut's only failure mode is OOM, so just
+            // bubble it; if the hashmap can't grow, the whole render
+            // can't proceed reliably.
+            const entry = try size_counts.getOrPut(size_key);
             if (!entry.found_existing) {
                 entry.value_ptr.* = 0;
             }
@@ -209,8 +222,16 @@ pub const MarkdownRenderer = struct {
 
     /// Convert spans to semantic elements
     fn spansToElements(self: *MarkdownRenderer, spans: []const TextSpan) ![]TextElement {
+        // PR-9 [refactor]: outer errdefer must free per-element text
+        // before the slice header. Each element owns its `.text` slice
+        // (allocated via `dupe` below) except `.line_break` whose text
+        // is the empty rodata literal `""` (.len == 0) — guarding on
+        // length keeps the rodata free a no-op.
         var elements: std.ArrayList(TextElement) = .empty;
-        errdefer elements.deinit(self.allocator);
+        errdefer {
+            for (elements.items) |e| if (e.text.len > 0) self.allocator.free(e.text);
+            elements.deinit(self.allocator);
+        }
 
         if (spans.len == 0) return elements.toOwnedSlice(self.allocator);
 
@@ -249,12 +270,18 @@ pub const MarkdownRenderer = struct {
                 // Flush current line
                 if (current_line.items.len > 0) {
                     const text = try self.allocator.dupe(u8, current_line.items);
+                    // PR-9 [refactor]: ownership transfer guard around
+                    // the append. If append OOMs, free the just-duped
+                    // text instead of leaking it.
+                    var text_owned = true;
+                    errdefer if (text_owned) self.allocator.free(text);
                     try elements.append(self.allocator, .{
                         .kind = current_kind,
                         .text = text,
                         .indent_level = self.indentLevel(current_indent),
                         .span = sorted[i - 1],
                     });
+                    text_owned = false;
                     current_line.clearRetainingCapacity();
                 }
 
@@ -322,12 +349,17 @@ pub const MarkdownRenderer = struct {
         // Flush final line
         if (current_line.items.len > 0) {
             const text = try self.allocator.dupe(u8, current_line.items);
+            // PR-9 [refactor]: same ownership-transfer guard as the
+            // mid-loop flush above.
+            var text_owned = true;
+            errdefer if (text_owned) self.allocator.free(text);
             try elements.append(self.allocator, .{
                 .kind = current_kind,
                 .text = text,
                 .indent_level = self.indentLevel(current_indent),
                 .span = if (sorted.len > 0) sorted[sorted.len - 1] else null,
             });
+            text_owned = false;
         }
 
         return elements.toOwnedSlice(self.allocator);

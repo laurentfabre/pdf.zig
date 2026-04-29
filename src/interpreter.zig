@@ -443,6 +443,11 @@ pub const SpanCollector = struct {
         if (self.text_buffer.items.len == 0) return;
 
         const text = try self.allocator.dupe(u8, self.text_buffer.items);
+        // PR-9 [refactor]: ownership transfer guard — until `spans.append`
+        // succeeds, this errdefer owns `text`; if append OOMs, free the
+        // duped slice instead of leaking it.
+        var text_owned = true;
+        errdefer if (text_owned) self.allocator.free(text);
         const width = @as(f64, @floatFromInt(text.len)) * self.current_font_size * self.avg_char_width;
         const height = self.current_font_size * 1.2;
 
@@ -454,6 +459,7 @@ pub const SpanCollector = struct {
             .text = text,
             .font_size = self.current_font_size,
         });
+        text_owned = false;
 
         self.current_x += width;
         self.text_buffer.clearRetainingCapacity();

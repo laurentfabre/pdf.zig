@@ -52,62 +52,46 @@ fn openAndMetadata(allocator: std.mem.Allocator, pdf_bytes: []const u8) !void {
     _ = doc.metadata();
 }
 
-// The three checkAllAllocationFailures tests below document upstream
-// allocation-failure leaks (Findings 001, 002, 003 in audit/fuzz_findings.md).
-// Until upstream errdefer hygiene is fixed, the tests assert the *current*
-// shape — `error.MemoryLeak` — so a regression to hard panic or to a CORRECT
-// rollback (which would be the fix landing) both fail the test loudly and
-// force a documentation update.
-//
-// To enable strict-mode assertions (i.e. "must NOT leak"), build with
-// `-Dstrict-alloc-failure=true`. Default is the documented-shape mode below.
+// PR-9 [refactor]: strict-mode assertions now active. The three
+// checkAllAllocationFailures tests below previously asserted the
+// *current* leak shape (Findings 001-003 in audit/fuzz_findings.md);
+// PR-9 added a `deinitPartial` errdefer chain on the open* paths
+// that rolls back hashmap/arena/list growth on parseDocument
+// failure, so the leaks no longer reproduce. Tests now assert
+// "must NOT leak" — `try result` propagates any unexpected error
+// (OutOfMemory at the failure index is the only expected one).
 
-test "checkAllAllocationFailures — Document.openFromMemory (Finding 001)" {
+test "checkAllAllocationFailures — Document.openFromMemory (Finding 001 RESOLVED)" {
     const seed = try testpdf.generateMinimalPdf(std.testing.allocator, SEED_TEXT);
     defer std.testing.allocator.free(seed);
 
-    // Backing: page_allocator. The FailingAllocator wraps it and runs its
-    // own alloc/free accounting (returns error.MemoryLeakDetected on leak).
-    // Using testing.allocator would *also* fire its leak checker on the
-    // upstream's partial-OOM leaks, double-counting failures.
-    const result = std.testing.checkAllAllocationFailures(
-        std.heap.page_allocator,
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
         openOnly,
         .{seed},
     );
-    try std.testing.expectError(error.MemoryLeakDetected, result);
 }
 
-test "checkAllAllocationFailures — Document.extractMarkdown (Finding 002)" {
+test "checkAllAllocationFailures — Document.extractMarkdown (Finding 002 RESOLVED)" {
     const seed = try testpdf.generateMinimalPdf(std.testing.allocator, SEED_TEXT);
     defer std.testing.allocator.free(seed);
 
-    // Backing: page_allocator. The FailingAllocator wraps it and runs its
-    // own alloc/free accounting (returns error.MemoryLeakDetected on leak).
-    // Using testing.allocator would *also* fire its leak checker on the
-    // upstream's partial-OOM leaks, double-counting failures.
-    const result = std.testing.checkAllAllocationFailures(
-        std.heap.page_allocator,
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
         openAndExtract,
         .{seed},
     );
-    try std.testing.expectError(error.MemoryLeakDetected, result);
 }
 
-test "checkAllAllocationFailures — Document.metadata (Finding 003)" {
+test "checkAllAllocationFailures — Document.metadata (Finding 003 RESOLVED)" {
     const seed = try testpdf.generateMinimalPdf(std.testing.allocator, SEED_TEXT);
     defer std.testing.allocator.free(seed);
 
-    // Backing: page_allocator. The FailingAllocator wraps it and runs its
-    // own alloc/free accounting (returns error.MemoryLeakDetected on leak).
-    // Using testing.allocator would *also* fire its leak checker on the
-    // upstream's partial-OOM leaks, double-counting failures.
-    const result = std.testing.checkAllAllocationFailures(
-        std.heap.page_allocator,
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
         openAndMetadata,
         .{seed},
     );
-    try std.testing.expectError(error.MemoryLeakDetected, result);
 }
 
 test "tokenizer.heuristicCount is allocation-free" {

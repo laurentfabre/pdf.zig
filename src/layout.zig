@@ -231,8 +231,15 @@ pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page
     const half_page = page_width / 2;
     const column_margin = page_width * 0.05; // 5% margin for column detection
 
-    // Sort all spans by Y (top to bottom), then X (left to right)
+    // Sort all spans by Y (top to bottom), then X (left to right).
+    // PR-9 [refactor]: `sorted` is a scratch buffer freed explicitly
+    // at line ~329 on success. Add an errdefer so it's also freed
+    // when an intermediate allocation fails (was leaking under
+    // FailingAllocator stress). Flag flips to false right before
+    // the existing explicit free to avoid double-free.
     const sorted = try allocator.alloc(TextSpan, spans.len);
+    var sorted_owned = true;
+    errdefer if (sorted_owned) allocator.free(sorted);
     @memcpy(sorted, spans);
 
     std.mem.sort(TextSpan, sorted, line_threshold, struct {
@@ -288,6 +295,12 @@ pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page
     const is_two_column = both_columns > total_lines / 3; // >33% of lines have both columns
 
     var result_spans = try std.ArrayList(TextSpan).initCapacity(allocator, spans.len);
+    // PR-9 [refactor]: result_spans transfers ownership to
+    // LayoutResult.spans via toOwnedSlice at the function tail. If
+    // any intermediate alloc fails between here and that transfer,
+    // result_spans was leaked.
+    var result_spans_owned = true;
+    errdefer if (result_spans_owned) result_spans.deinit(allocator);
 
     if (is_two_column) {
         // Two-column layout: output left column first, then right column
@@ -320,16 +333,45 @@ pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page
     }
 
     allocator.free(sorted);
+    sorted_owned = false;
 
-    // Build lines from the ordered spans
+    // Build lines from the ordered spans.
+    // PR-9 [refactor]: errdefer guards on every intermediate
+    // ArrayList. Each leaks under FailingAllocator stress when a
+    // later allocation fails. Per-line cleanup of TextLine internals
+    // (words, spans inside) is a deeper layer — for now we leak the
+    // line internals on partial failure but at least the outer
+    // bookkeeping ArrayLists are released.
     var lines = try std.ArrayList(TextLine).initCapacity(allocator, spans.len / 10);
+    var lines_owned = true;
+    // PR-9 [refactor]: each TextLine owns a `.words` slice (and each
+    // TextWord owns a `.spans` slice). On error free the entire
+    // tree, not just the outer ArrayList.
+    errdefer if (lines_owned) {
+        for (lines.items) |line| {
+            for (line.words) |w| allocator.free(w.spans);
+            allocator.free(line.words);
+        }
+        lines.deinit(allocator);
+    };
     var current_line_spans = try std.ArrayList(TextSpan).initCapacity(allocator, 20);
+    var current_line_spans_owned = true;
+    errdefer if (current_line_spans_owned) current_line_spans.deinit(allocator);
     current_y = if (result_spans.items.len > 0) result_spans.items[0].y0 else 0;
 
     for (result_spans.items) |span| {
         if (@abs(span.y0 - current_y) > line_threshold) {
             if (current_line_spans.items.len > 0) {
-                try lines.append(allocator, try makeLine(allocator, current_line_spans.items));
+                {
+                    const line = try makeLine(allocator, current_line_spans.items);
+                    var line_owned = true;
+                    errdefer if (line_owned) {
+                        for (line.words) |w| allocator.free(w.spans);
+                        allocator.free(line.words);
+                    };
+                    try lines.append(allocator, line);
+                    line_owned = false;
+                }
                 current_line_spans.clearRetainingCapacity();
             }
             current_y = span.y0;
@@ -337,39 +379,103 @@ pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page
         try current_line_spans.append(allocator, span);
     }
     if (current_line_spans.items.len > 0) {
-        try lines.append(allocator, try makeLine(allocator, current_line_spans.items));
+        const line = try makeLine(allocator, current_line_spans.items);
+        var line_owned = true;
+        errdefer if (line_owned) {
+            for (line.words) |w| allocator.free(w.spans);
+            allocator.free(line.words);
+        };
+        try lines.append(allocator, line);
+        line_owned = false;
     }
     current_line_spans.deinit(allocator);
+    current_line_spans_owned = false;
 
     // Build column structure
     var columns = try std.ArrayList(TextColumn).initCapacity(allocator, 1);
+    var columns_owned = true;
+    // PR-9 [refactor]: each TextColumn.lines is a duped slice; the
+    // errdefer must free the per-column slice (not the inner
+    // TextLine.words — those are also owned by `lines` ArrayList
+    // until lines.toOwnedSlice runs, so freeing them here would be
+    // a double-free).
+    errdefer if (columns_owned) {
+        for (columns.items) |c| allocator.free(c.lines);
+        columns.deinit(allocator);
+    };
     if (lines.items.len > 0) {
         const all_lines = try allocator.dupe(TextLine, lines.items);
+        var all_lines_owned = true;
+        errdefer if (all_lines_owned) allocator.free(all_lines);
         try columns.append(allocator, .{
             .bounds = mergeBounds(all_lines),
             .lines = all_lines,
             .index = 0,
         });
+        all_lines_owned = false;
     }
 
     const order = try allocator.alloc(u32, columns.items.len);
+    var order_owned = true;
+    errdefer if (order_owned) allocator.free(order);
     for (order, 0..) |*o, i| {
         o.* = @intCast(i);
     }
 
-    // Detect paragraphs
+    // Detect paragraphs.
+    // PR-9 [refactor]: each TextParagraph owns its `.lines` slice
+    // (a fresh allocation in detectParagraphs that contains shallow
+    // TextLine copies with `.words = &.{}`, so no nested cleanup
+    // needed beyond the slice itself).
     var paragraphs = try std.ArrayList(TextParagraph).initCapacity(allocator, columns.items.len * 3);
+    var paragraphs_owned = true;
+    errdefer if (paragraphs_owned) {
+        for (paragraphs.items) |p| allocator.free(p.lines);
+        paragraphs.deinit(allocator);
+    };
     for (columns.items, 0..) |col, col_idx| {
         try detectParagraphs(allocator, col.lines, @intCast(col_idx), &paragraphs);
     }
 
     const final_spans = try result_spans.toOwnedSlice(allocator);
+    result_spans_owned = false;
+    // PR-9 [refactor]: now that the slice ownership has transferred,
+    // protect it on subsequent toOwnedSlice failures.
+    errdefer allocator.free(final_spans);
+    // Ownership transfer for the LayoutResult struct: from this
+    // point the four toOwnedSlice calls below MUST all succeed for
+    // the result to own everything. The cleanest invariant is to
+    // do them sequentially, transferring ownership flag-by-flag.
+    const lines_slice = try lines.toOwnedSlice(allocator);
+    lines_owned = false;
+    // PR-9 [refactor]: lines_slice owns the TextLine tree (each
+    // line owns words, each word owns spans). Mirror the pattern
+    // used in `lines_owned` errdefer above.
+    errdefer {
+        for (lines_slice) |line| {
+            for (line.words) |w| allocator.free(w.spans);
+            allocator.free(line.words);
+        }
+        allocator.free(lines_slice);
+    }
+    const columns_slice = try columns.toOwnedSlice(allocator);
+    columns_owned = false;
+    // columns_slice elements share TextLines with lines_slice
+    // (shallow dupe). Free only the per-column .lines slice
+    // header — NOT the inner TextLines (which lines_slice owns).
+    errdefer {
+        for (columns_slice) |c| allocator.free(c.lines);
+        allocator.free(columns_slice);
+    }
+    const paragraphs_slice = try paragraphs.toOwnedSlice(allocator);
+    paragraphs_owned = false;
+    order_owned = false;
 
     return LayoutResult{
         .spans = final_spans,
-        .lines = try lines.toOwnedSlice(allocator),
-        .columns = try columns.toOwnedSlice(allocator),
-        .paragraphs = try paragraphs.toOwnedSlice(allocator),
+        .lines = lines_slice,
+        .columns = columns_slice,
+        .paragraphs = paragraphs_slice,
         .reading_order = order,
         .allocator = allocator,
     };
@@ -466,28 +572,56 @@ fn detectParagraphs(allocator: std.mem.Allocator, col_lines: []const TextLine, c
 fn makeLine(allocator: std.mem.Allocator, spans: []const TextSpan) !TextLine {
     // Estimate words as ~1 per 2-3 spans
     const estimated_words = @max(1, spans.len / 2);
+    // PR-9 [refactor]: errdefer guards for both intermediate
+    // ArrayLists. Each TextWord owns a `.spans` slice from
+    // makeWord; on partial failure (e.g. words.append fails), free
+    // every already-materialised TextWord's spans before deiniting.
     var words = try std.ArrayList(TextWord).initCapacity(allocator, estimated_words);
+    var words_owned = true;
+    errdefer if (words_owned) {
+        for (words.items) |w| allocator.free(w.spans);
+        words.deinit(allocator);
+    };
     var current_word_spans = try std.ArrayList(TextSpan).initCapacity(allocator, 8);
+    var current_word_spans_owned = true;
+    errdefer if (current_word_spans_owned) current_word_spans.deinit(allocator);
     const word_gap: f64 = 5;
 
     var prev_x1: f64 = spans[0].x0;
     for (spans) |span| {
         if (span.x0 - prev_x1 > word_gap and current_word_spans.items.len > 0) {
-            try words.append(allocator, try makeWord(allocator, current_word_spans.items));
+            {
+                // PR-9 codex r1 P1: makeWord allocates `word.spans`;
+                // guard ownership until words.append succeeds.
+                const word = try makeWord(allocator, current_word_spans.items);
+                var word_owned = true;
+                errdefer if (word_owned) allocator.free(word.spans);
+                try words.append(allocator, word);
+                word_owned = false;
+            }
             current_word_spans.clearRetainingCapacity();
         }
         try current_word_spans.append(allocator, span);
         prev_x1 = span.x1;
     }
     if (current_word_spans.items.len > 0) {
-        try words.append(allocator, try makeWord(allocator, current_word_spans.items));
+        // PR-9 codex r2 P1: same makeWord ownership-transfer guard
+        // as the mid-loop site above.
+        const word = try makeWord(allocator, current_word_spans.items);
+        var word_owned = true;
+        errdefer if (word_owned) allocator.free(word.spans);
+        try words.append(allocator, word);
+        word_owned = false;
     }
     current_word_spans.deinit(allocator);
+    current_word_spans_owned = false;
 
     const bounds = mergeSpanBounds(spans);
+    const words_slice = try words.toOwnedSlice(allocator);
+    words_owned = false;
     return TextLine{
         .bounds = bounds,
-        .words = try words.toOwnedSlice(allocator),
+        .words = words_slice,
         .baseline_y = bounds.y0,
     };
 }
