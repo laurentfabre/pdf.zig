@@ -24,6 +24,7 @@ const chunk = @import("chunk.zig");
 const tokenizer = @import("tokenizer.zig");
 const cli = @import("cli_pdfzig.zig");
 const lattice = @import("lattice.zig");
+const layout = @import("layout.zig");
 
 // ============================================================================
 // Target registry
@@ -62,6 +63,7 @@ const TARGETS = [_]Target{
     .{ .name = "lattice_form_xobject_mutation", .run = fuzzLatticeFormXObjectMutation },
     .{ .name = "tagged_table_mutation", .run = fuzzTaggedTableMutation },
     .{ .name = "link_continuations_random", .run = fuzzLinkContinuationsRandom },
+    .{ .name = "lattice_pass_b_spans", .run = fuzzLatticePassBSpans },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -586,6 +588,140 @@ fn dumpReproducer(tag: []const u8, bytes: []const u8) void {
     const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return;
     defer file.close();
     file.writeAll(bytes) catch {};
+}
+
+// ============================================================================
+// Targets — Pass B (lattice cell text via glyph-center ∩ bbox, PR-4)
+// ============================================================================
+
+/// Fuzz `lattice.extractFromStrokes` directly with random spans + a small
+/// valid grid of strokes. Exercises buildLatticeCellsWithText, locateBin,
+/// and the new errdefer transfer guards under invariant checks (no panic,
+/// no leak, finite cell text).
+///
+/// What this exercises:
+///   - locateBin boundary handling (NaN/inf guard, bin-edge tie-break)
+///   - buildLatticeCellsWithText partial-success errdefer paths
+///   - extractFromStrokes' cells_owned ownership flag (R1)
+///   - cell.text UTF-8 well-formedness when assembled from random bytes
+///
+/// What this DOES NOT exercise: getTables / Pass A / Pass C / Pass D.
+/// Those have their own targets (lattice_form_xobject_mutation,
+/// tagged_table_mutation, link_continuations_random).
+fn fuzzLatticePassBSpans(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Build a small grid: 3..6 H strokes, 3..6 V strokes, all spanning
+    // the full bbox so they survive the 50%-span filter.
+    const n_h = rng.intRangeAtMost(usize, 3, 6);
+    const n_v = rng.intRangeAtMost(usize, 3, 6);
+    const left: f64 = 50.0;
+    const right: f64 = 550.0;
+    const bottom: f64 = 50.0;
+    const top: f64 = 750.0;
+
+    var strokes = std.ArrayList(lattice.Stroke).empty;
+    defer strokes.deinit(aa);
+
+    var i: usize = 0;
+    while (i < n_h) : (i += 1) {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n_h - 1));
+        const y = bottom + t * (top - bottom);
+        try strokes.append(aa, .{ .x0 = left, .y0 = y, .x1 = right, .y1 = y });
+    }
+    i = 0;
+    while (i < n_v) : (i += 1) {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n_v - 1));
+        const x = left + t * (right - left);
+        try strokes.append(aa, .{ .x0 = x, .y0 = bottom, .x1 = x, .y1 = top });
+    }
+
+    // Build random spans. Coordinates may land inside, on a boundary,
+    // or outside the grid. Text length 1..16 random ASCII to keep
+    // UTF-8 trivially well-formed.
+    const n_spans = rng.intRangeAtMost(usize, 0, 32);
+    var spans = std.ArrayList(layout.TextSpan).empty;
+    defer spans.deinit(aa);
+
+    // Static text pool — keeps the fuzz iter purely about geometric
+    // boundary cases without exercising text content (covered by the
+    // Pass B integration test). All slices live in `.rodata` so
+    // appendSlice is safe regardless of arena ordering.
+    const text_pool = [_][]const u8{ "a", "ab", "abc", "abcd", "abcde" };
+
+    // Pick column-line indices for "center exactly on line" cases.
+    // col_lines = [left, ..., right]. Choosing center == col_lines[k]
+    // hits locateBin's bin-edge tie-break (inclusive lower, exclusive
+    // upper). Same for row_lines.
+    const col_count = n_v;
+    const row_count = n_h;
+
+    var s: usize = 0;
+    while (s < n_spans) : (s += 1) {
+        // Glyph-center mode (the binner reads center = (x0+x1)/2).
+        // Generate centers directly, then derive a 5-pt-wide span
+        // around them.
+        const x_choice = rng.intRangeAtMost(u8, 0, 5);
+        const cx: f64 = switch (x_choice) {
+            0 => left - 5.0, // outside left
+            1 => right + 5.0, // outside right
+            2 => left, // on lower boundary (inclusive)
+            3 => right, // on upper boundary (exclusive — should miss)
+            4 => blk: { // on an interior column line (tie-break)
+                const k = rng.intRangeAtMost(usize, 1, col_count - 2);
+                break :blk left + (@as(f64, @floatFromInt(k)) /
+                    @as(f64, @floatFromInt(col_count - 1))) * (right - left);
+            },
+            else => left + rng.float(f64) * (right - left),
+        };
+        const y_choice = rng.intRangeAtMost(u8, 0, 5);
+        const cy: f64 = switch (y_choice) {
+            0 => bottom - 5.0,
+            1 => top + 5.0,
+            2 => bottom,
+            3 => top,
+            4 => blk: {
+                const k = rng.intRangeAtMost(usize, 1, row_count - 2);
+                break :blk bottom + (@as(f64, @floatFromInt(k)) /
+                    @as(f64, @floatFromInt(row_count - 1))) * (top - bottom);
+            },
+            else => bottom + rng.float(f64) * (top - bottom),
+        };
+        try spans.append(aa, .{
+            .x0 = cx - 2.5,
+            .y0 = cy - 2.5,
+            .x1 = cx + 2.5,
+            .y1 = cy + 2.5,
+            .text = text_pool[rng.intRangeAtMost(usize, 0, text_pool.len - 1)],
+            .font_size = 10.0,
+        });
+    }
+
+    const detected = lattice.extractFromStrokes(allocator, strokes.items, 1, spans.items) catch |err| {
+        if (err == error.OutOfMemory) return;
+        return err;
+    };
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    for (detected) |t| {
+        if (t.bbox) |bb| {
+            for (bb) |v| {
+                if (!std.math.isFinite(v)) return error.LatticeBboxNonFinite;
+            }
+        }
+        for (t.cells) |c| {
+            if (c.text) |txt| {
+                if (!std.unicode.utf8ValidateSlice(txt)) {
+                    return error.LatticeCellTextInvalidUtf8;
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================

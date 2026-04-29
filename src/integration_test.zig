@@ -1527,3 +1527,56 @@ test "continuation link accepts true near-boundary chain" {
     try std.testing.expect(b.continued_from != null);
     try std.testing.expectEqual(@as(u32, 1), b.continued_from.?.page);
 }
+
+// PR-4 — Pass B (lattice) populates per-cell text by intersecting
+// extractTextWithBounds spans against each cell's bbox via
+// glyph-center containment. Mirrors stream_table.zig's
+// buildCellsWithText pattern but uses rectangular bbox containment
+// instead of x-anchor matching (lattice cells have explicit
+// row/col line geometry).
+//
+// Fixture: 4×3 ruled grid with each cell centred-text "RC" where
+// R is the row index (0=bottom, 3=top per existing lattice
+// convention) and C is the column index (0=left). Glyph centers
+// land squarely inside the cell bbox so the intersection is
+// unambiguous.
+test "lattice pass B populates cell text via glyph-center intersection" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateLatticeWithTextPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.engine == zpdf.tables.Engine.lattice and
+            t.n_rows == 4 and t.n_cols == 3)
+        {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+
+    const t = detected[match_idx.?];
+    try std.testing.expectEqual(@as(usize, 12), t.cells.len);
+
+    // Build a 4×3 grid of expected texts. Lattice convention: r=0
+    // is the bottom row.
+    const gold = [4][3][]const u8{
+        .{ "00", "01", "02" },
+        .{ "10", "11", "12" },
+        .{ "20", "21", "22" },
+        .{ "30", "31", "32" },
+    };
+    for (t.cells) |c| {
+        try std.testing.expect(c.r < 4 and c.c < 3);
+        try std.testing.expect(c.text != null);
+        try std.testing.expectEqualStrings(gold[c.r][c.c], c.text.?);
+    }
+}

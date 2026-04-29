@@ -2745,3 +2745,96 @@ pub fn generateLinkedContinuationTablesPdf(allocator: std.mem.Allocator) ![]u8 {
 
     return pdf.toOwnedSlice(allocator);
 }
+
+/// PR-4: a single-page PDF with a 4-row × 3-column ruled table and
+/// positioned text per cell. The lattice/Pass-B path detects the
+/// grid via stroke clustering and populates each cell's `.text`
+/// by intersecting glyph centers against the cell bbox.
+///
+/// Grid geometry (PDF user-space, y increases upward):
+///   - Outer rect: x = 100..400, y = 100..400 (300x300)
+///   - row_lines (after clusterByCoord, sorted asc): 100, 175, 250, 325, 400
+///   - col_lines: 100, 200, 300, 400
+///   - 4 rows × 3 cols = 12 cells, each 100 wide × 75 tall
+///
+/// Cell text — per the existing lattice convention (r=0 = bottom
+/// row, c=0 = left col):
+///   r=0 (y=100..175): "00" "01" "02"
+///   r=1 (y=175..250): "10" "11" "12"
+///   r=2 (y=250..325): "20" "21" "22"
+///   r=3 (y=325..400): "30" "31" "32"
+///
+/// Each glyph is positioned at the cell center via `Tm`. The
+/// extractTextWithBounds path emits a TextSpan whose bbox covers
+/// the glyph; the center lands inside the cell bbox so glyph-center
+/// intersection assigns the span correctly.
+pub fn generateLatticeWithTextPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Build content stream: outer rect + 3 interior horizontals (at
+    // y=175, 250, 325) + 2 interior verticals (at x=200, 300) + 12
+    // text chunks at cell centers.
+    var cs: std.ArrayList(u8) = .empty;
+    defer cs.deinit(allocator);
+    var csw = cs.writer(allocator);
+
+    try csw.writeAll("100 100 300 300 re S\n"); // outer rect
+    try csw.writeAll("100 175 m 400 175 l S\n");
+    try csw.writeAll("100 250 m 400 250 l S\n");
+    try csw.writeAll("100 325 m 400 325 l S\n");
+    try csw.writeAll("200 100 m 200 400 l S\n");
+    try csw.writeAll("300 100 m 300 400 l S\n");
+
+    // Cell text. Cell (r, c) center: x = 150 + c*100, y = 137.5 + r*75.
+    // Tm at center − (textWidth/2, font_size/2) so the glyph sits
+    // visually centered. With 10pt Helvetica, "00" is ~12pt wide;
+    // shift by -6 in x and -5 in y from cell center.
+    try csw.writeAll("BT /F1 10 Tf\n");
+    inline for (0..4) |r| {
+        inline for (0..3) |c| {
+            const cx: f64 = 150.0 + @as(f64, @floatFromInt(c)) * 100.0;
+            const cy: f64 = 137.5 + @as(f64, @floatFromInt(r)) * 75.0;
+            try csw.print("1 0 0 1 {d:.1} {d:.1} Tm ({d}{d}) Tj\n", .{ cx - 6, cy - 5, r, c });
+        }
+    }
+    try csw.writeAll("ET\n");
+
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{cs.items.len});
+    try writer.writeAll(cs.items);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.writeAll("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}

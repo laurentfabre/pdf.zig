@@ -31,6 +31,7 @@ const parser = @import("parser.zig");
 const pagetree = @import("pagetree.zig");
 const decompress = @import("decompress.zig");
 const xref_mod = @import("xref.zig");
+const layout = @import("layout.zig");
 
 const COORD_TOLERANCE: f64 = 1.0; // 1 pt (≈0.35 mm)
 const MIN_STROKE_LEN: f64 = 4.0; // ignore strokes shorter than 4 pt
@@ -998,16 +999,26 @@ fn clusterByCoord(
     const first_c = if (filtered.items[0].isHorizontal()) filtered.items[0].y0 else filtered.items[0].x0;
     var current_coord = first_c;
     var current = Cluster{ .coord = current_coord, .members = .empty };
+    // Codex review v1.2-rc4 PR-4 round 2 [P3 fallout]: `current` holds
+    // an in-flight ArrayList that is NOT yet owned by `out`. Without
+    // this guard, an OOM from `current.members.append` or the next
+    // `out.append(current)` leaks `current.members`'s buffer. Cleared
+    // after each successful transfer of `current` into `out`.
+    var current_owned = true;
+    errdefer if (current_owned) current.members.deinit(allocator);
     for (filtered.items) |s| {
         const c = if (s.isHorizontal()) s.y0 else s.x0;
         if (@abs(c - current_coord) > COORD_TOLERANCE) {
             try out.append(allocator, current);
+            current_owned = false;
             current_coord = c;
             current = Cluster{ .coord = c, .members = .empty };
+            current_owned = true;
         }
         try current.members.append(allocator, s);
     }
     try out.append(allocator, current);
+    current_owned = false;
     return out.toOwnedSlice(allocator);
 }
 
@@ -1016,16 +1027,132 @@ const PageGrid = struct {
     page: u32,
 };
 
+/// PR-4 [feat]: build lattice cells with per-cell text by
+/// intersecting `extractTextWithBounds` spans against each cell's
+/// bbox. Mirrors stream_table.zig::buildCellsWithText but uses
+/// rectangular bbox containment (cells have explicit bboxes from
+/// the lattice grid) instead of x-anchor matching.
+///
+/// A span is assigned to a cell iff its glyph CENTER lands inside
+/// the cell's `[col_lines[c], row_lines[r], col_lines[c+1],
+/// row_lines[r+1]]` rectangle. Glyph centers landing exactly on a
+/// boundary stick to the cell whose lower-left corner is closer
+/// (i.e. inclusive on left/bottom, exclusive on right/top) — this
+/// matches Pass C's `anchorIndex` tie-breaking.
+///
+/// Span order within each cell is the input span order (typically
+/// PDF stream order via `extractTextWithBounds`), so concatenated
+/// text reads naturally. Spans are joined by single spaces; empty
+/// cells get `text = null`.
+///
+/// Codex review v1.2-rc4 PR-4 round 0 [P2 anticipated]: spans whose
+/// centers fall outside ALL cells (i.e. between table borders or
+/// outside the table bbox) are dropped silently — they're outside
+/// the structured table's scope and would be picked up by Pass C
+/// or normal text extraction if needed.
+fn buildLatticeCellsWithText(
+    allocator: std.mem.Allocator,
+    n_rows: u32,
+    n_cols: u32,
+    row_lines: []const f64,
+    col_lines: []const f64,
+    spans: []const layout.TextSpan,
+) ![]tables.Cell {
+    const total = @as(usize, n_rows) * @as(usize, n_cols);
+    const cells = try allocator.alloc(tables.Cell, total);
+    errdefer allocator.free(cells);
+
+    // Per-cell text accumulators.
+    const bufs = try allocator.alloc(std.ArrayList(u8), total);
+    defer allocator.free(bufs);
+    for (bufs) |*b| b.* = .empty;
+    errdefer for (bufs) |*b| b.deinit(allocator);
+
+    // Assign spans to cells via glyph-center bbox containment.
+    for (spans) |span| {
+        if (!std.math.isFinite(span.x0) or !std.math.isFinite(span.y0)) continue;
+        if (!std.math.isFinite(span.x1) or !std.math.isFinite(span.y1)) continue;
+        const cx = (span.x0 + span.x1) * 0.5;
+        const cy = (span.y0 + span.y1) * 0.5;
+
+        // Find row: r such that row_lines[r] <= cy < row_lines[r+1].
+        // Inclusive on lower edge, exclusive on upper — same
+        // tie-breaking discipline as Pass C's anchorIndex.
+        const r = locateBin(row_lines, cy) orelse continue;
+        if (r >= n_rows) continue;
+        const c = locateBin(col_lines, cx) orelse continue;
+        if (c >= n_cols) continue;
+
+        const idx = @as(usize, r) * @as(usize, n_cols) + @as(usize, c);
+        if (bufs[idx].items.len > 0) try bufs[idx].append(allocator, ' ');
+        try bufs[idx].appendSlice(allocator, span.text);
+    }
+
+    // Materialise cells. Codex review v1.2-rc4 PR-4 round 1 [P2]:
+    // each successful `bufs[idx].toOwnedSlice` transfers ownership
+    // to `cells[idx].text`; if a LATER toOwnedSlice fails the
+    // already-materialised text would leak (the bufs errdefer only
+    // covers ArrayLists still holding their buffer, and the cells
+    // errdefer only frees the slice header). Track the count and
+    // free initialised cell texts on error.
+    var cells_initialised: usize = 0;
+    errdefer for (cells[0..cells_initialised]) |c| {
+        if (c.text) |txt| allocator.free(txt);
+    };
+    var idx: usize = 0;
+    var r: u32 = 0;
+    while (r < n_rows) : (r += 1) {
+        var c: u32 = 0;
+        while (c < n_cols) : (c += 1) {
+            const text = if (bufs[idx].items.len > 0) try bufs[idx].toOwnedSlice(allocator) else null;
+            if (text == null) bufs[idx].deinit(allocator);
+            cells[idx] = .{ .r = r, .c = c, .rowspan = 1, .colspan = 1, .is_header = false, .text = text };
+            idx += 1;
+            cells_initialised += 1;
+        }
+    }
+    return cells;
+}
+
+/// Locate the bin index `i` such that `lines[i] <= value < lines[i+1]`.
+/// Returns null when `value` is outside `[lines[0], lines[len-1])` or
+/// when `lines.len < 2`.
+fn locateBin(lines: []const f64, value: f64) ?u32 {
+    if (lines.len < 2) return null;
+    if (value < lines[0]) return null;
+    if (value >= lines[lines.len - 1]) return null;
+    // Linear scan — `lines.len` is bounded by the row/col count of a
+    // single table, typically ≤ 30.
+    var i: usize = 0;
+    while (i + 1 < lines.len) : (i += 1) {
+        if (value >= lines[i] and value < lines[i + 1]) return @intCast(i);
+    }
+    return null;
+}
+
 /// Detect tables in a single page's stroke set. Returns slice of Table
 /// records (engine = .lattice). Caller frees via `tables.freeTables`.
+///
+/// PR-4 [feat]: when `spans` is non-empty, every detected cell's
+/// `.text` is populated by intersecting glyph centers against the
+/// cell's bbox. Pass `&.{}` from unit tests / call sites that
+/// don't have spans (cells get text=null, the legacy v1.2-rc3
+/// behavior). `spans` are typically the result of
+/// `Document.extractTextWithBounds` on the same page; iteration
+/// order is preserved within each cell so concatenated text reads
+/// in stream order.
 pub fn extractFromStrokes(
     allocator: std.mem.Allocator,
     strokes: []const Stroke,
     page: u32,
+    spans: []const layout.TextSpan,
 ) ![]tables.Table {
     var out: std.ArrayList(tables.Table) = .empty;
     errdefer {
-        for (out.items) |t| allocator.free(t.cells);
+        for (out.items) |t| {
+            for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+            allocator.free(t.cells);
+        }
         out.deinit(allocator);
     }
     if (strokes.len < 4) return out.toOwnedSlice(allocator); // ≥2 H + ≥2 V required
@@ -1094,17 +1221,31 @@ pub fn extractFromStrokes(
     const n_rows: u32 = @intCast(row_lines.items.len - 1);
     const n_cols: u32 = @intCast(col_lines.items.len - 1);
 
-    // Build a synthetic cells array (no text yet — Pass-B-text deferred).
-    var cells = try allocator.alloc(tables.Cell, @as(usize, n_rows) * @as(usize, n_cols));
-    var idx: usize = 0;
-    var r: u32 = 0;
-    while (r < n_rows) : (r += 1) {
-        var c: u32 = 0;
-        while (c < n_cols) : (c += 1) {
-            cells[idx] = .{ .r = r, .c = c, .rowspan = 1, .colspan = 1, .is_header = false };
-            idx += 1;
-        }
-    }
+    // PR-4 [feat]: build the cells array with text from glyph-center
+    // intersection. row_lines/col_lines are sorted ascending; they
+    // come from clusterByCoord. Per the existing convention, r=0 is
+    // the BOTTOM row (smallest y), c=0 is the LEFT column (smallest
+    // x). Cell (r, c) bbox = [col_lines[c], row_lines[r],
+    // col_lines[c+1], row_lines[r+1]].
+    const cells = try buildLatticeCellsWithText(
+        allocator,
+        n_rows,
+        n_cols,
+        row_lines.items,
+        col_lines.items,
+        spans,
+    );
+    // Codex review v1.2-rc4 PR-4 round 1 [P1]: ownership transfer
+    // guard. Until `out.append` succeeds, this errdefer owns
+    // `cells`; after, ownership lives in `out.items` and the outer
+    // errdefer (which now also frees per-cell text) is the sole
+    // owner. Without the flag, an OOM from `out.toOwnedSlice` would
+    // double-free `cells`.
+    var cells_owned = true;
+    errdefer if (cells_owned) {
+        for (cells) |c| if (c.text) |txt| allocator.free(txt);
+        allocator.free(cells);
+    };
 
     try out.append(allocator, .{
         .page = page,
@@ -1117,6 +1258,7 @@ pub fn extractFromStrokes(
         .confidence = 0.85, // baseline; refined by Pass D heuristics
         .bbox = .{ left, bottom, right, top },
     });
+    cells_owned = false;
 
     return out.toOwnedSlice(allocator);
 }
@@ -1170,7 +1312,7 @@ test "extractFromStrokes builds a 2x3 grid from synthetic strokes" {
         .{ .x0 = 250, .y0 = 100, .x1 = 250, .y1 = 300 },
         .{ .x0 = 350, .y0 = 100, .x1 = 350, .y1 = 300 },
     };
-    const out = try extractFromStrokes(a, &strokes, 1);
+    const out = try extractFromStrokes(a, &strokes, 1, &.{});
     defer tables.freeTables(a, out);
 
     try std.testing.expectEqual(@as(usize, 1), out.len);
@@ -1180,13 +1322,70 @@ test "extractFromStrokes builds a 2x3 grid from synthetic strokes" {
     try std.testing.expectEqual(tables.Engine.lattice, out[0].engine);
 }
 
+// Codex review v1.2-rc4 PR-4 round 2 [P3]: stress R1/R2/R3 errdefer
+// paths with FailingAllocator. Each fail_index from 0..N forces
+// allocator.alloc to fail at exactly that step, exercising every
+// errdefer between buildLatticeCellsWithText (toOwnedSlice failure
+// scenarios) and extractFromStrokes (cells_owned flag flip).
+test "extractFromStrokes survives every allocation failure index" {
+    const strokes = [_]Stroke{
+        .{ .x0 = 50, .y0 = 100, .x1 = 350, .y1 = 100 },
+        .{ .x0 = 50, .y0 = 200, .x1 = 350, .y1 = 200 },
+        .{ .x0 = 50, .y0 = 300, .x1 = 350, .y1 = 300 },
+        .{ .x0 = 50, .y0 = 100, .x1 = 50, .y1 = 300 },
+        .{ .x0 = 150, .y0 = 100, .x1 = 150, .y1 = 300 },
+        .{ .x0 = 250, .y0 = 100, .x1 = 250, .y1 = 300 },
+        .{ .x0 = 350, .y0 = 100, .x1 = 350, .y1 = 300 },
+    };
+    // Spans place glyph centers in 4 of the 6 cells (2×3 grid).
+    const spans = [_]layout.TextSpan{
+        .{ .x0 = 95, .y0 = 145, .x1 = 105, .y1 = 155, .text = "a", .font_size = 10 },
+        .{ .x0 = 195, .y0 = 145, .x1 = 205, .y1 = 155, .text = "bc", .font_size = 10 },
+        .{ .x0 = 295, .y0 = 145, .x1 = 305, .y1 = 155, .text = "def", .font_size = 10 },
+        .{ .x0 = 95, .y0 = 245, .x1 = 105, .y1 = 255, .text = "ghij", .font_size = 10 },
+    };
+
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const result = extractFromStrokes(failing.allocator(), &strokes, 1, &spans);
+        if (result) |out| {
+            tables.freeTables(failing.allocator(), out);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Either way, FailingAllocator's underlying gpa would have
+        // detected leaks at deinit; std.testing.allocator is a leak-
+        // checking allocator, so any leak crashes the test.
+    }
+}
+
+test "extractFromStrokes populates cell text from spans" {
+    const a = std.testing.allocator;
+    const strokes = [_]Stroke{
+        .{ .x0 = 50, .y0 = 100, .x1 = 350, .y1 = 100 },
+        .{ .x0 = 50, .y0 = 200, .x1 = 350, .y1 = 200 },
+        .{ .x0 = 50, .y0 = 300, .x1 = 350, .y1 = 300 },
+        .{ .x0 = 50, .y0 = 100, .x1 = 50, .y1 = 300 },
+        .{ .x0 = 150, .y0 = 100, .x1 = 150, .y1 = 300 },
+        .{ .x0 = 250, .y0 = 100, .x1 = 250, .y1 = 300 },
+        .{ .x0 = 350, .y0 = 100, .x1 = 350, .y1 = 300 },
+    };
+    const spans = [_]layout.TextSpan{
+        .{ .x0 = 100, .y0 = 150, .x1 = 110, .y1 = 160, .text = "ab", .font_size = 10 },
+    };
+    const out = try extractFromStrokes(a, &strokes, 1, &spans);
+    defer tables.freeTables(a, out);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+}
+
 test "extractFromStrokes returns no table when fewer than 2 cluster lines on either axis" {
     const a = std.testing.allocator;
     const strokes = [_]Stroke{
         .{ .x0 = 50, .y0 = 100, .x1 = 350, .y1 = 100 },
         .{ .x0 = 50, .y0 = 100, .x1 = 50, .y1 = 300 },
     };
-    const out = try extractFromStrokes(a, &strokes, 1);
+    const out = try extractFromStrokes(a, &strokes, 1, &.{});
     defer tables.freeTables(a, out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
 }
