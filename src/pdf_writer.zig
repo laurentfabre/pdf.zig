@@ -60,6 +60,10 @@ pub const Writer = struct {
         offset: u64,
         generation: u16,
         in_use: bool,
+        /// PR-W1 codex r1 P2: distinguish "allocated but not yet
+        /// emitted" from "free" (= xref `f` entry). Object 0 is the
+        /// only legal `allocated=false, in_use=false` slot.
+        allocated: bool,
     };
 
     pub const Error = error{
@@ -68,6 +72,12 @@ pub const Writer = struct {
         ObjectAlreadyEmitted,
         InvalidReal,
         UnbalancedObject,
+        /// PR-W1 codex r1 P2: writeXref refuses to emit a dangling
+        /// xref. Caller forgot to `beginObject` for an allocated num.
+        DanglingObjectAllocation,
+        /// PR-W1 codex r1 P3: tier-1 writer is generation-0 only.
+        /// Multi-generation support is a Tier-2 follow-up.
+        UnsupportedGeneration,
     };
 
     pub fn init(allocator: std.mem.Allocator) Writer {
@@ -95,6 +105,7 @@ pub const Writer = struct {
                 .offset = 0,
                 .generation = 65535,
                 .in_use = false,
+                .allocated = false,
             });
         }
         const num: u32 = @intCast(self.objects.items.len);
@@ -102,6 +113,7 @@ pub const Writer = struct {
             .offset = 0, // patched in beginObject
             .generation = 0,
             .in_use = false, // flipped to true in beginObject
+            .allocated = true, // codex r1 P2: tracks "must be emitted"
         });
         return num;
     }
@@ -116,6 +128,9 @@ pub const Writer = struct {
     }
 
     pub fn beginObject(self: *Writer, num: u32, generation: u16) Error!void {
+        // codex r1 P3: enforce generation = 0 for the v1 writer. Multi-
+        // generation requires versioning support that lives in Tier 2.
+        if (generation != 0) return error.UnsupportedGeneration;
         if (self.in_object) return error.UnbalancedObject;
         if (num == 0 or num >= self.objects.items.len) return error.ObjectNotEmitted;
         if (self.objects.items[num].in_use) return error.ObjectAlreadyEmitted;
@@ -124,6 +139,7 @@ pub const Writer = struct {
             .offset = offset,
             .generation = generation,
             .in_use = true,
+            .allocated = true,
         };
         try self.buf.writer(self.allocator).print("{d} {d} obj\n", .{ num, generation });
         self.in_object = true;
@@ -199,9 +215,11 @@ pub const Writer = struct {
     pub fn writeReal(self: *Writer, n: f64) Error!void {
         if (!std.math.isFinite(n)) return error.InvalidReal;
         // Use a fixed precision that's plenty for graphic coordinates.
-        // Strip trailing zeros for compactness.
-        var buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{d:.6}", .{n}) catch unreachable;
+        // Strip trailing zeros for compactness. codex r1 P3: very large
+        // f64 values can exceed the 32-byte buffer; surface that as
+        // InvalidReal rather than panic via `catch unreachable`.
+        var buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d:.6}", .{n}) catch return error.InvalidReal;
         const trimmed = stripTrailingZeros(s);
         try self.buf.appendSlice(self.allocator, trimmed);
     }
@@ -238,7 +256,14 @@ pub const Writer = struct {
                 .offset = 0,
                 .generation = 65535,
                 .in_use = false,
+                .allocated = false,
             });
+        }
+        // codex r1 P2: refuse to emit a dangling xref. Every allocated
+        // slot must have been emitted via beginObject + endObject.
+        for (self.objects.items, 0..) |obj, idx| {
+            if (idx == 0) continue;
+            if (obj.allocated and !obj.in_use) return error.DanglingObjectAllocation;
         }
         const xref_offset = self.buf.items.len;
         try self.buf.writer(self.allocator).print(
@@ -265,6 +290,10 @@ pub const Writer = struct {
         info_obj: ?u32,
     ) Error!void {
         if (self.in_object) return error.UnbalancedObject;
+        // codex r1 P2: validate refs point at emitted objects; tier-1
+        // writer is generation-0 only so we hardcode `0 R`.
+        try self.assertEmittedRef(root_obj);
+        if (info_obj) |inum| try self.assertEmittedRef(inum);
         try self.buf.writer(self.allocator).print(
             "trailer\n<< /Size {d} /Root {d} 0 R",
             .{ self.objects.items.len, root_obj },
@@ -276,6 +305,11 @@ pub const Writer = struct {
             " >>\nstartxref\n{d}\n%%EOF\n",
             .{xref_offset},
         );
+    }
+
+    fn assertEmittedRef(self: *const Writer, num: u32) Error!void {
+        if (num == 0 or num >= self.objects.items.len) return error.ObjectNotEmitted;
+        if (!self.objects.items[num].in_use) return error.ObjectNotEmitted;
     }
 
     /// Transfer ownership of the assembled bytes to the caller.
@@ -408,6 +442,59 @@ test "endObject without beginObject errors" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.UnbalancedObject, w.endObject());
+}
+
+// PR-W1 codex r1 P2/P3 regression tests.
+test "writeXref rejects dangling allocation (codex r1 P2)" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    try w.writeHeader();
+    _ = try w.allocObjectNum(); // allocate but never beginObject
+    try std.testing.expectError(error.DanglingObjectAllocation, w.writeXref());
+}
+
+test "writeTrailer rejects ref to unallocated object (codex r1 P2)" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    try w.writeHeader();
+    const a = try w.allocObjectNum();
+    try w.beginObject(a, 0);
+    try w.writeRaw("<< /Type /Catalog >>");
+    try w.endObject();
+    _ = try w.writeXref();
+    try std.testing.expectError(error.ObjectNotEmitted, w.writeTrailer(0, 99, null));
+}
+
+test "writeTrailer rejects ref to allocated-but-not-emitted (codex r1 P2)" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    try w.writeHeader();
+    const a = try w.allocObjectNum();
+    const b = try w.allocObjectNum(); // allocate, never emit
+    try w.beginObject(a, 0);
+    try w.writeRaw("<< >>");
+    try w.endObject();
+    // writeXref will error first; just verify the trailer assertion in
+    // isolation — directly call writeTrailer with a dangling ref `b`.
+    // (writeXref catches the error before we get here in the normal
+    // flow, but the trailer guard is defense-in-depth.)
+    try std.testing.expectError(error.ObjectNotEmitted, w.writeTrailer(0, b, null));
+}
+
+test "beginObject rejects nonzero generation (codex r1 P3)" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    const a = try w.allocObjectNum();
+    try std.testing.expectError(error.UnsupportedGeneration, w.beginObject(a, 1));
+}
+
+test "writeReal rejects values too large for buffer (codex r1 P3)" {
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    // 1e300 stringifies to >40 digits with .6 precision; even with the
+    // bumped 64-byte buffer, 1e306+ overflows. Verify InvalidReal is
+    // returned instead of panic-via-unreachable.
+    try std.testing.expectError(error.InvalidReal, w.writeReal(1e308));
 }
 
 test "beginObject twice on same number errors" {
