@@ -155,6 +155,13 @@ pub const Totals = struct {
     bytes_emitted: u64,
     warnings_count: u32,
     elapsed_ms: u64,
+    /// PR-11 [feat]: optional NDJSON `quality_flag` field on summary
+    /// records. Currently the only emitted value is `"scanned"`,
+    /// triggered when ≥ scan_threshold of pages produced very little
+    /// text (heuristic detection of image-only / scanned PDFs).
+    /// `null` means the field is omitted entirely from the JSON
+    /// (preserves the v1.x schema for born-digital PDFs).
+    quality_flag: ?[]const u8 = null,
 };
 
 pub const ChunkBreak = enum {
@@ -344,6 +351,12 @@ pub const Envelope = struct {
             ",\"pages_emitted\":{d},\"bytes_emitted\":{d},\"warnings_count\":{d},\"elapsed_ms\":{d}",
             .{ totals.pages_emitted, totals.bytes_emitted, totals.warnings_count, totals.elapsed_ms },
         );
+        // PR-11 [feat]: opt-in quality_flag field. Only emit when set
+        // (null preserves the v1.x born-digital summary shape).
+        if (totals.quality_flag) |flag| {
+            try self.writer.writeAll(",\"quality_flag\":");
+            try writeJsonString(self.writer, flag);
+        }
         try self.endRecord();
     }
 
@@ -736,6 +749,30 @@ test "interrupted record carries signal number" {
     const written = aw.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"interrupted\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"signal\":2") != null);
+}
+
+test "emitSummary omits quality_flag when null (PR-11 default)" {
+    var buf: [512]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitSummary(.{ .pages_emitted = 1, .bytes_emitted = 11, .warnings_count = 0, .elapsed_ms = 5 });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"quality_flag\"") == null);
+}
+
+test "emitSummary emits quality_flag when set (PR-11 scanned)" {
+    var buf: [512]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitSummary(.{
+        .pages_emitted = 4,
+        .bytes_emitted = 80,
+        .warnings_count = 0,
+        .elapsed_ms = 12,
+        .quality_flag = "scanned",
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"quality_flag\":\"scanned\"") != null);
 }
 
 test "every record is valid JSON Lines (one trailing newline, no embedded newlines)" {

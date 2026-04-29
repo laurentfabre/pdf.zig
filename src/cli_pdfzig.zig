@@ -43,6 +43,10 @@ pub const ExtractArgs = struct {
     max_tokens: u32 = 4000,
     no_toc: bool = false,
     no_warnings: bool = false,
+    /// PR-11 [feat]: percentage [0,100] of low-text pages required
+    /// to flag the document as scanned. Default 50 = ≥half the
+    /// extracted pages are below 50 bytes of extracted text.
+    scan_threshold: u8 = 50,
 };
 
 pub const InfoArgs = struct {
@@ -66,6 +70,7 @@ pub const ArgError = error{
     MissingValue,
     InvalidMaxTokens,
     InvalidOutputMode,
+    InvalidScanThreshold,
 };
 
 /// Parse argv (excluding argv[0]) into a Command.
@@ -116,6 +121,12 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             out.no_toc = true;
         } else if (std.mem.eql(u8, a, "--no-warnings")) {
             out.no_warnings = true;
+        } else if (std.mem.eql(u8, a, "--scan-threshold")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            const v = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidScanThreshold;
+            if (v > 100) return error.InvalidScanThreshold;
+            out.scan_threshold = @intCast(v);
         } else if (std.mem.eql(u8, a, "-")) {
             // Bare `-` is the stdin sentinel, not a flag.
             if (out.input.len != 0) return error.UnknownFlag;
@@ -159,6 +170,22 @@ fn parseOutputMode(s: []const u8) !OutputMode {
     if (std.mem.eql(u8, s, "chunks")) return .chunks;
     if (std.mem.eql(u8, s, "text")) return .text;
     return error.InvalidOutputMode;
+}
+
+/// PR-11 [feat]: scanned-PDF heuristic. Returns `"scanned"` when:
+///   - pages_emitted ≥ 3 (avoids 1-2 page false positives — codex r1 F1)
+///   - the document has at least one font
+///   - scanned_pages * 100 / pages_emitted ≥ scan_threshold
+/// Otherwise null (the field is omitted from the summary record).
+pub const MIN_PAGES_FOR_SCAN_FLAG: u32 = 3;
+pub fn computeScanFlag(pages_emitted: u32, scanned_pages: u32, has_fonts: bool, scan_threshold: u8) ?[]const u8 {
+    if (pages_emitted < MIN_PAGES_FOR_SCAN_FLAG or !has_fonts) return null;
+    // PR-11 codex r2 P3: widen to u64 before multiply. `scanned_pages
+    // * 100` would overflow u32 above ~42M scanned pages; widening
+    // makes the helper correct across the full u32 domain.
+    const pct = @as(u64, scanned_pages) * 100 / pages_emitted;
+    if (pct >= scan_threshold) return "scanned";
+    return null;
 }
 
 // ---- Run ----
@@ -341,6 +368,18 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     var pages_emitted: u32 = 0;
     var bytes_emitted: u64 = 0;
     var warnings_count: u32 = 0;
+    // PR-11 [feat]: scanned-PDF heuristic. Count pages whose
+    // extractMarkdown output is shorter than this threshold (50 B):
+    // a born-digital page rendering even a single sentence will
+    // produce well over 100 bytes of markdown, while a scanned page
+    // (image-only with possibly an OCR text stub) typically yields
+    // under 50. We only count when the document actually has fonts —
+    // that's the differentiator between "this is a real PDF that
+    // failed to extract" vs "fake / empty PDF that legitimately has
+    // no text". Final flag is emitted iff
+    // `scanned_pages * 100 / pages_emitted >= scan_threshold`.
+    var scanned_pages: u32 = 0;
+    const SCAN_LOW_BYTES: usize = 50;
 
     var collected = std.ArrayList(chunk.Page).empty;
     defer {
@@ -373,6 +412,14 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
             // and a warnings entry, continue to next page.
             const w = pageWarningFromError(err);
             warnings_count += 1;
+            // PR-11 codex r1 F2: count an extraction failure as a
+            // scanned page. The page record is still emitted (with
+            // empty markdown), so it must contribute to the totals.
+            // An all-fail or mostly-fail document with fonts present
+            // matches the "image-only / scanned" signal we want to
+            // surface.
+            pages_emitted += 1;
+            scanned_pages += 1;
             switch (args.output_mode) {
                 .ndjson => {
                     const warns = if (args.no_warnings) &.{} else &[_]stream.Warning{w};
@@ -392,6 +439,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
         bytes_emitted += md.len;
         pages_emitted += 1;
+        if (md.len < SCAN_LOW_BYTES) scanned_pages += 1;
 
         switch (args.output_mode) {
             .ndjson => {
@@ -453,11 +501,20 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
     if (args.output_mode == .ndjson) {
         const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - t_start);
+        // PR-11 [feat]: scanned-PDF heuristic — flag the doc as
+        // "scanned" when ≥ scan_threshold% of pages produced under
+        // 50 B of markdown AND the document has at least one font
+        // (filters out trivially-empty PDFs from legitimately-no-text
+        // signal). Per the roadmap, this enables routing through
+        // OCR shell-out paths in v1.3 (PR-12 / PR-13).
+        const has_fonts = doc.font_cache.count() > 0 or doc.font_obj_cache.count() > 0;
+        const flag = computeScanFlag(pages_emitted, scanned_pages, has_fonts, args.scan_threshold);
         try env.emitSummary(.{
             .pages_emitted = pages_emitted,
             .bytes_emitted = bytes_emitted,
             .warnings_count = warnings_count,
             .elapsed_ms = elapsed_ms,
+            .quality_flag = flag,
         });
         try writer.flush();
     }
@@ -640,6 +697,7 @@ fn writeArgError(err: ArgError) !void {
         error.MissingValue => "pdf.zig: flag requires a value",
         error.InvalidMaxTokens => "pdf.zig: --max-tokens must be a positive integer",
         error.InvalidOutputMode => "pdf.zig: --output must be one of ndjson|md|chunks|text",
+        error.InvalidScanThreshold => "pdf.zig: --scan-threshold must be an integer in [0, 100]",
     };
     try w.print("{s}\n", .{msg});
 }
@@ -669,6 +727,7 @@ fn writeHelp() !void {
         \\  --max-tokens N              chunk budget (default 4000)
         \\  --no-toc                    suppress `toc` record (NDJSON only)
         \\  --no-warnings               suppress `warnings` array on page records
+        \\  --scan-threshold PCT        flag doc as "scanned" when ≥PCT% of pages have <50B text (default 50)
         \\
         \\Examples:
         \\  pdf.zig extract hotel.pdf
@@ -721,6 +780,67 @@ test "parse rejects missing input" {
 
 test "parse rejects unknown subcommand" {
     try std.testing.expectError(error.UnknownSubcommand, parseArgs(&.{ "zap", "foo.pdf" }));
+}
+
+test "parse extract: --scan-threshold accepted" {
+    const cmd = try parseArgs(&.{ "extract", "--scan-threshold", "30", "foo.pdf" });
+    try std.testing.expectEqual(@as(u8, 30), cmd.extract.scan_threshold);
+}
+
+test "parse extract: --scan-threshold default is 50" {
+    const cmd = try parseArgs(&.{ "extract", "foo.pdf" });
+    try std.testing.expectEqual(@as(u8, 50), cmd.extract.scan_threshold);
+}
+
+test "parse extract: --scan-threshold rejects > 100" {
+    try std.testing.expectError(
+        error.InvalidScanThreshold,
+        parseArgs(&.{ "extract", "--scan-threshold", "150", "foo.pdf" }),
+    );
+}
+
+test "parse extract: --scan-threshold rejects non-numeric" {
+    try std.testing.expectError(
+        error.InvalidScanThreshold,
+        parseArgs(&.{ "extract", "--scan-threshold", "fifty", "foo.pdf" }),
+    );
+}
+
+// PR-11 codex r1 F3: integration coverage for the heuristic helper.
+// Each case names the scenario it pins down.
+test "computeScanFlag — 1-page low-text never flags (codex r1 F1)" {
+    // Single-page doc with 1 low-text page. Default threshold 50.
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(1, 1, true, 50));
+}
+
+test "computeScanFlag — 2-page mixed never flags at default 50% threshold" {
+    // 2-page doc, 1 low-text + 1 normal. pct=50, but pages_emitted < 3.
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(2, 1, true, 50));
+}
+
+test "computeScanFlag — 3-page all-low-text doc with fonts flags" {
+    const got = computeScanFlag(3, 3, true, 50);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("scanned", got.?);
+}
+
+test "computeScanFlag — 3-page mixed below threshold doesn't flag" {
+    // 3 pages, 1 low-text → pct=33 < 50.
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(3, 1, true, 50));
+}
+
+test "computeScanFlag — no-fonts never flags (filters fake/empty PDFs)" {
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(10, 10, false, 50));
+}
+
+test "computeScanFlag — custom threshold of 30 flags 33% scanned" {
+    const got = computeScanFlag(3, 1, true, 30);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("scanned", got.?);
+}
+
+test "computeScanFlag — pages_emitted = 0 never flags" {
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(0, 0, true, 50));
 }
 
 test "parse rejects --max-tokens 0" {
