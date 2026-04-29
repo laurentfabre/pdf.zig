@@ -371,6 +371,96 @@ updated: 2026-04-27
 
 ---
 
+## v1.5 — greenfield PDF authoring (Tier 1: minimum viable writer)
+
+> [!info] Why
+> pdf.zig is currently read-only. Tier 1 adds a clean writer module: hello-world PDFs with plain ASCII text on white pages using Type 1 base-14 fonts (no font file embedding). Sufficient for round-trip workflows (extract → modify markdown → re-render), test-fixture generation (replace `testpdf.zig`'s hand-rolled byte concat), and NDJSON-to-PDF assembly.
+>
+> **Use-case constraint.** Target documents are **multi-hundred pages** (not just hello-world). PR-W2 therefore implements a balanced page tree from day one (~10-fan-out per `/Pages` node), not a flat single-level tree. This is the only Tier-1 gate that materially diverges from "minimum viable" — every other PR keeps the minimal-scope discipline.
+>
+> **Scope boundary.** No font embedding (no non-ASCII), no images, no encryption, no PDF/A. Those are Tier 2 (PR-W7+) — listed separately under v1.6 once Tier 1 ships.
+
+- [ ] **PR-W1 · feat: PDF writer core (`src/pdf_writer.zig`)**
+  > [!info]- Details
+  > **Why.** Foundation for every authoring PR. Current `testpdf.zig` is ~50 hand-rolled byte-level fixtures (literal string concat); a real writer module unifies that and unblocks tier-1.
+  > **Files-touched envelope.** `src/pdf_writer.zig` (new, ~500 LOC), `src/integration_test.zig`.
+  > **Acceptance gate.**
+  > - Emit low-level PDF object types: name, string (literal + hex), integer, real, array, dict, stream, indirect ref, indirect object.
+  > - Track byte offsets per indirect object; emit valid xref table at end.
+  > - Emit `trailer << /Size N /Root R >>` + `startxref` + `%%EOF`.
+  > - Round-trip test: write a 1-page minimal PDF, parse with `Document.openFromMemory`, assert pageCount == 1.
+  > - Allocator-failure test (FailingAllocator over every alloc index) — must not leak.
+  >
+  > **Test strategy.** New unit tests for object serialization + round-trip integration test.
+  > **Codex gate.** xref byte-offset accuracy under stream lengths that span chunk boundaries; deferred-reference resolution before `endobj`; FlateDecode boundary not assumed (Tier-1 content streams uncompressed).
+
+- [ ] **PR-W2 · feat: Document/Page/Resources builders with balanced page tree (`src/pdf_document.zig`)**
+  > [!info]- Details
+  > **Why.** High-level API on top of PR-W1 so callers don't write objects directly. Page tree is **balanced from day one** — see the v1.5 section header for the use-case constraint (multi-hundred-page authoring).
+  > **Files-touched envelope.** `src/pdf_document.zig` (new, ~600 LOC including the page-tree builder), `src/integration_test.zig`.
+  > **Acceptance gate.**
+  > - `DocumentBuilder.init(allocator) -> *DocumentBuilder` returns a builder with empty catalog.
+  > - `addPage(media_box: [4]f64) -> *PageBuilder` allocates a page; pages are buffered until `write()` so the final tree shape can be balanced (fan-out target ≈ 10 children per `/Pages` node).
+  > - `PageBuilder.appendContent(bytes)` appends to the page's content stream.
+  > - `DocumentBuilder.write(allocator) -> []u8` flushes catalog + balanced page tree + pages + content streams + xref + trailer. Tree depth = `⌈log₁₀(N)⌉`; every leaf `/Page` carries the correct `/Parent` ref; every internal `/Pages` node has correct `/Count` (subtree page count) and `/Kids`.
+  > - **Stress test**: 1000-page synthetic PDF round-trips through `Document.openFromMemory` with `pageCount() == 1000`. Random-access page reads pick the right page (e.g. `pages.items[500]` resolves to the page added 500th).
+  > - 3-page baseline still produces a flat-ish tree (single `/Pages` parent — no unnecessary nesting under the threshold).
+  >
+  > **Test strategy.** Two integration tests: 3-page (flat) + 1000-page (deep tree). Round-trip via the existing reader.
+  > **Codex gate.** `/Count` correctness at every internal node (subtree page count, NOT direct-children count); `/Parent` chain on every leaf; tree fan-out is uniform (not pathological — last node may be partial); resources dict ownership (per-page; tier-2 may add shared resources via `/Parent` inheritance).
+
+- [ ] **PR-W3 · feat: Type 1 base-14 fonts + `drawText` content op encoder**
+  > [!info]- Details
+  > **Why.** Tier-1 minimum text rendering without font-file embedding. The 14 standard fonts (Helvetica, Helvetica-Bold, Times-Roman, Times-Bold, Courier, …) are guaranteed available in every PDF reader.
+  > **Files-touched envelope.** `src/pdf_document.zig` (extend), `src/encoding.zig` (WinAnsi escape helpers — new file or extend existing), `src/integration_test.zig`.
+  > **Acceptance gate.**
+  > - `BuiltinFont` enum with 14 entries; `PageBuilder.drawText(x, y, font, size, text)` emits `BT /Fk size Tf x y Td (escaped-text) Tj ET`.
+  > - Text accepts `[]const u8` ASCII + WinAnsiEncoding subset; non-encodable bytes are dropped with a warning (Tier-2 will handle UTF-8 via embedded fonts).
+  > - Round-trip: build a PDF with `drawText("Hello World")`, extract via `Document.extractText`, assert byte-identical match.
+  > - Special-char escapes: `(`, `)`, `\` properly escaped in literal strings.
+  >
+  > **Test strategy.** 14 unit tests (one per BuiltinFont) + round-trip integration test.
+  > **Codex gate.** WinAnsi encoding completeness vs the standard; backslash-escape edge cases; empty-text drawText is a no-op (not malformed BT/ET).
+
+- [ ] **PR-W4 · feat: FlateDecode content-stream compression**
+  > [!info]- Details
+  > **Why.** Uncompressed content streams from PR-W3 are 4-5× larger than necessary. `std.compress.flate` is in stdlib so this is a thin wrapper.
+  > **Files-touched envelope.** `src/pdf_writer.zig` (extend stream emission with `encoding: enum { raw, flate }` option), `src/pdf_document.zig` (default content streams to flate), `src/integration_test.zig`.
+  > **Acceptance gate.**
+  > - Streams >256 B compress with `/Filter /FlateDecode`; smaller stay raw.
+  > - Compressed output round-trips through the existing reader (which already handles FlateDecode).
+  > - Compression ratio ≥ 50% on a 3-page text PDF.
+  >
+  > **Test strategy.** Compression-ratio assertion + round-trip extract.
+  > **Codex gate.** No off-by-one in length-after-compression; `/Length` reflects compressed bytes; `/DL` field if predictor used (tier-1: no predictor).
+
+- [ ] **PR-W5 · feat: `pdf.zig new` CLI subcommand (markdown → PDF)**
+  > [!info]- Details
+  > **Why.** Surfaces the writer to end users. Reads markdown from stdin or a file, emits a basic PDF with paragraphs and H1/H2 headings.
+  > **Files-touched envelope.** `src/cli_pdfzig.zig` (new `new` subcommand + `parseNew` arg parser), `src/markdown_to_pdf.zig` (new, ~300 LOC), `src/integration_test.zig`, README.md.
+  > **Acceptance gate.**
+  > - `pdf.zig new --output out.pdf --input -` reads stdin markdown, writes PDF to file.
+  > - Headings (`# `/`## `/`### `) render in larger size; paragraphs flow with word-wrap; lists basic indent.
+  > - Page break on `\n\n---\n\n` markers (mirrors the v1.x `--output md` separator).
+  > - Round-trip integration test: `pdf.zig extract foo.pdf | pdf.zig new --output bar.pdf` produces a PDF whose extracted text is byte-identical to the original (modulo paragraph-break collapsing).
+  >
+  > **Test strategy.** New integration_test cases + 1 README example.
+  > **Codex gate.** Word-wrap doesn't split mid-character on multibyte UTF-8 (Tier 1: ASCII only, but flag the assumption); page-break heuristic stable.
+
+- [ ] **PR-W6 · refactor: replace `testpdf.zig` hand-rolled fixtures with writer API**
+  > [!info]- Details
+  > **Why.** ~50 generators in `testpdf.zig` use raw `%PDF-1.4\n... 1 0 obj <<...>>` byte concat. Replacing them with PR-W1+W2+W3 calls eliminates ~700 LOC of fragile string-building and gives the writer module a stress workout against every existing test fixture.
+  > **Files-touched envelope.** `src/testpdf.zig` (replace bodies, keep public signatures), `src/integration_test.zig` (sanity).
+  > **Acceptance gate.**
+  > - Every `generate*Pdf` function emits a byte-different but semantically-equivalent PDF (same pageCount, same extractable text, same font references).
+  > - All 462+ tests still pass.
+  > - `testpdf.zig` LOC drops by ≥ 40%.
+  >
+  > **Test strategy.** Existing test suite is the gate (no fixture should regress).
+  > **Codex gate.** Some fixtures intentionally generate malformed PDFs (e.g. `generatePdfWithoutPageType`) — those need a "raw bytes" escape hatch on the writer or stay hand-rolled and document why.
+
+---
+
 ## v2.0 — full PDF/UA conformance (placeholders, decompose before use)
 
 > [!warning] These two are intentionally too large for `/next-pr`
