@@ -548,9 +548,9 @@ const TreeAssert = struct {
         return .{ .kind = kind, .parent = parent, .count = count, .kids = kids };
     }
 
-    /// codex r4 P3: strictly parse `key<space>N<space>0<space>R`.
-    /// Anything else (missing `0`, missing `R`, gen != 0, trailing
-    /// junk) returns MalformedRef.
+    /// codex r4+r5 P3: strictly parse `key<space>N<space>0<space>R`
+    /// AND require a token-boundary byte after `R` (whitespace, EOF,
+    /// or PDF delimiter). Anything else returns MalformedRef.
     fn parseOptionalRef(body: []const u8, key: []const u8) !?u32 {
         const idx = std.mem.indexOf(u8, body, key) orelse return null;
         const start = idx + key.len;
@@ -564,6 +564,13 @@ const TreeAssert = struct {
             body[n_end + 3] != 'R')
         {
             return error.MalformedRef;
+        }
+        const after_r = n_end + 4;
+        if (after_r < body.len) {
+            const c = body[after_r];
+            const is_ws = c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0c;
+            const is_delim = c == '(' or c == ')' or c == '<' or c == '>' or c == '[' or c == ']' or c == '{' or c == '}' or c == '/' or c == '%';
+            if (!is_ws and !is_delim) return error.MalformedRef;
         }
         return try std.fmt.parseInt(u32, body[start..n_end], 10);
     }
@@ -705,6 +712,34 @@ fn verifyNode(
         },
         .other => return error.UnexpectedObjectType,
     }
+}
+
+// PR-W2 codex r5: focused parser tests for the strict ref helpers.
+test "parseOptionalRef rejects /Parent N 0 Rjunk (codex r5 P3)" {
+    const body = "/Parent 12 0 Rjunk /Count 5";
+    try std.testing.expectError(error.MalformedRef, TreeAssert.parseOptionalRef(body, "/Parent "));
+}
+
+test "parseOptionalRef rejects /Parent N 0 R<digit> (codex r5 P3)" {
+    const body = "/Parent 12 0 R2 /Kids []";
+    try std.testing.expectError(error.MalformedRef, TreeAssert.parseOptionalRef(body, "/Parent "));
+}
+
+test "parseOptionalRef accepts /Parent followed by whitespace" {
+    const body = "/Parent 12 0 R /Count 5";
+    const got = try TreeAssert.parseOptionalRef(body, "/Parent ");
+    try std.testing.expectEqual(@as(?u32, 12), got);
+}
+
+test "parseOptionalRef accepts /Parent followed by delimiter" {
+    const body = "/Parent 12 0 R>>";
+    const got = try TreeAssert.parseOptionalRef(body, "/Parent ");
+    try std.testing.expectEqual(@as(?u32, 12), got);
+}
+
+test "parseKidsArray rejects adjacent refs (codex r4 P3)" {
+    const body = "/Kids [1 0 R2 0 R]";
+    try std.testing.expectError(error.MalformedKids, TreeAssert.parseKidsArray(std.testing.allocator, body));
 }
 
 test "page tree shape: /Count + /Parent on 11-page doc (codex r1 P2)" {
