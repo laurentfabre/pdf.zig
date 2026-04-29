@@ -3,10 +3,10 @@
 //! Creates minimal valid PDFs for testing the parser.
 //! Hand-crafted bodies migrated to the writer API cluster-by-cluster
 //! (PR-W6.1+). Migrated so far: text-only (W6.1) + metadata + /Outlines
-//! (W6.2). Fixtures still hand-rolled: /Annots, AcroForm, /PageLabels,
-//! and the intentionally-malformed/specialized fixtures (CID font,
-//! incremental update, encrypted, Form XObject malformed-resources
-//! variants). Each future cluster gets its own ≤1-day PR.
+//! (W6.2) + /Annots links (W6.3). Fixtures still hand-rolled: AcroForm,
+//! /PageLabels, and the intentionally-malformed/specialized fixtures
+//! (CID font, incremental update, encrypted, Form XObject malformed-
+//! resources variants). Each future cluster gets its own ≤1-day PR.
 
 const std = @import("std");
 const document = @import("pdf_document.zig");
