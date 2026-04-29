@@ -1,0 +1,5 @@
+# Default owner for everything in this repo.
+# When a second maintainer joins, split by path:
+#   /src/capi.zig            @laurentfabre @other
+#   /python/zpdf/            @laurentfabre @other
+*       @laurentfabre
