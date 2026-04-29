@@ -27,6 +27,11 @@ pub const RecordKind = enum {
     links,
     form,
     table,
+    /// PR-17 [feat]: long-PDF section checkpoint. Heuristic-extracted
+    /// from `# ` markdown headers; downstream consumers (LLM
+    /// chunkers, citation tools) use it to anchor references to
+    /// logical document divisions.
+    section,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -40,6 +45,7 @@ pub const RecordKind = enum {
             .links => "links",
             .form => "form",
             .table => "table",
+            .section => "section",
         };
     }
 };
@@ -247,6 +253,25 @@ pub const Envelope = struct {
             try self.writer.print(",\"page\":{d},\"depth\":{d}}}", .{ item.page, item.depth });
         }
         try self.writer.writeAll("]");
+        try self.endRecord();
+    }
+
+    /// PR-17 [feat]: emit a section checkpoint record. `section_id`
+    /// is 0-indexed; `start_page` and `end_page` are 1-indexed
+    /// (matching the v1.x page-numbering convention used by other
+    /// records). Title is the markdown heading text without the
+    /// leading `# ` prefix.
+    pub fn emitSection(
+        self: *Envelope,
+        section_id: u32,
+        title: []const u8,
+        start_page: u32,
+        end_page: u32,
+    ) !void {
+        try self.beginRecord(.section);
+        try self.writer.print(",\"section_id\":{d},\"title\":", .{section_id});
+        try writeJsonString(self.writer, title);
+        try self.writer.print(",\"start_page\":{d},\"end_page\":{d}", .{ start_page, end_page });
         try self.endRecord();
     }
 
@@ -773,6 +798,34 @@ test "emitSummary emits quality_flag when set (PR-11 scanned)" {
     });
     const written = aw.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"quality_flag\":\"scanned\"") != null);
+}
+
+// PR-17 [feat]: section record schema test.
+test "emitSection writes section_id, title, start_page, end_page" {
+    var buf: [512]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitSection(0, "Introduction", 1, 4);
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"section\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"section_id\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"title\":\"Introduction\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"start_page\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"end_page\":4") != null);
+}
+
+test "emitSection escapes title with quotes and newlines" {
+    var buf: [512]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitSection(7, "Tab\there\nand \"quotes\"", 5, 7);
+    const written = aw.buffered();
+    // Title bytes must be escaped — no literal newline or unescaped quote inside the JSON.
+    var nl_count: usize = 0;
+    for (written) |c| {
+        if (c == '\n') nl_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), nl_count); // only the trailing newline
 }
 
 test "every record is valid JSON Lines (one trailing newline, no embedded newlines)" {
