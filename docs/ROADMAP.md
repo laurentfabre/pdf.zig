@@ -380,7 +380,7 @@ updated: 2026-04-27
 >
 > **Scope boundary.** No font embedding (no non-ASCII), no images, no encryption, no PDF/A. Those are Tier 2 (PR-W7+) — listed separately under v1.6 once Tier 1 ships.
 
-- [ ] **PR-W1 · feat: PDF writer core (`src/pdf_writer.zig`)**
+- [x] **PR-W1 · feat: PDF writer core (`src/pdf_writer.zig`)**
   > [!info]- Details
   > **Why.** Foundation for every authoring PR. Current `testpdf.zig` is ~50 hand-rolled byte-level fixtures (literal string concat); a real writer module unifies that and unblocks tier-1.
   > **Files-touched envelope.** `src/pdf_writer.zig` (new, ~500 LOC), `src/integration_test.zig`.
@@ -448,17 +448,24 @@ updated: 2026-04-27
   > **Test strategy.** New integration_test cases + 1 README example.
   > **Codex gate.** Word-wrap doesn't split mid-character on multibyte UTF-8 (Tier 1: ASCII only, but flag the assumption); page-break heuristic stable.
 
-- [ ] **PR-W6 · refactor: replace `testpdf.zig` hand-rolled fixtures with writer API**
+- [x] **PR-W6 · feat: writer escape-hatch surface + CI gap fix (foundation)**
   > [!info]- Details
-  > **Why.** ~50 generators in `testpdf.zig` use raw `%PDF-1.4\n... 1 0 obj <<...>>` byte concat. Replacing them with PR-W1+W2+W3 calls eliminates ~700 LOC of fragile string-building and gives the writer module a stress workout against every existing test fixture.
-  > **Files-touched envelope.** `src/testpdf.zig` (replace bodies, keep public signatures), `src/integration_test.zig` (sanity).
-  > **Acceptance gate.**
-  > - Every `generate*Pdf` function emits a byte-different but semantically-equivalent PDF (same pageCount, same extractable text, same font references).
-  > - All 462+ tests still pass.
-  > - `testpdf.zig` LOC drops by ≥ 40%.
+  > **Why.** Original PR-W6 scope was "replace ~50 hand-rolled `testpdf.zig` fixtures with writer calls". That requires the writer to support /Info, /Outlines, /Annots, AcroForm, /PageLabels — none of which it had. Split into a foundational PR (this one) + per-fixture-cluster follow-ups (W6.1+).
+  > **What landed.**
+  > - `DocumentBuilder.{addAuxiliaryObject, reserveAuxiliaryObject, setAuxiliaryPayload, setInfoDict, setCatalogExtras}` and `PageBuilder.{setPageExtras, objNum, content_obj_num}` for cyclic-aware aux graphs.
+  > - Single-use enforcement (`error.DocumentAlreadyWritten` after first `write()`).
+  > - **CI gap fix**: `pdf_writer.zig`, `pdf_document.zig`, `markdown_to_pdf.zig` were orphaned from `zig build test`. Test count jumped 474→856 once they were wired in. Two PR-W5 rc2 tests silently never ran and were broken; both fixed.
   >
-  > **Test strategy.** Existing test suite is the gate (no fixture should regress).
-  > **Codex gate.** Some fixtures intentionally generate malformed PDFs (e.g. `generatePdfWithoutPageType`) — those need a "raw bytes" escape hatch on the writer or stay hand-rolled and document why.
+  > **Test strategy.** 7 new tests cover the escape-hatch surface end-to-end (info round-trip, catalog ref splice, page extras, single-use guard, cyclic aux refs, unknown-aux rejection).
+  > **Codex gate.** Cleared rc2 (Medium reserve/set + 3 Low all addressed).
+
+- [ ] **PR-W6.1+ · refactor: convert `testpdf.zig` fixtures cluster-by-cluster**
+  > [!info]- Details
+  > **Why.** With the W6 foundation in place, fixture clusters can be migrated in isolation: text-only (Minimal, MultiPage, TJ, Superscript), metadata, outline, link, page-label, form-field. Each cluster is its own ≤1-day PR.
+  > **Acceptance gate per cluster.**
+  > - Byte-different but semantically-equivalent (same pageCount, extractable text, font refs).
+  > - All tests still pass.
+  > **Codex gate.** Intentionally-malformed fixtures (e.g. `generatePdfWithoutPageType`) stay hand-rolled with documented reason.
 
 ---
 
