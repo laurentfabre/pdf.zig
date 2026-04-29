@@ -200,14 +200,30 @@ fn buildCellsWithText(
     errdefer for (cells[0..cells_initialised]) |c| {
         if (c.text) |txt| allocator.free(txt);
     };
+    // Codex review v1.2-rc4 PR-4d round 0 [P1]: do NOT explicitly
+    // call `bufs[idx].deinit(allocator)` for empty cells. ArrayList
+    // .deinit sets `self.* = undefined`, which under the safe build
+    // is 0xaaaa...aa for ALL fields including capacity. If a later
+    // `bufs[idx].toOwnedSlice` then fails, the bufs errdefer
+    // (registered before this loop) iterates ALL bufs and re-calls
+    // deinit on the poisoned entries — `allocatedSlice()` returns
+    // a slice with len = 0xaaaa...aa, and `@memset(ptr, undefined)`
+    // dereferences the 0xaa pointer → SIGSEGV.
+    //
+    // Empty bufs (`.items.len == 0`, capacity = 0) hold no buffer,
+    // so there is no leak from skipping the explicit deinit. The
+    // success-path drops `bufs` via `defer allocator.free(bufs)`,
+    // which only frees the OUTER slice and never touches the
+    // ArrayList content. On error, the bufs errdefer fires deinit
+    // on every entry — but only entries that were appended to have
+    // capacity > 0; the rest are still in the `.empty` state set
+    // at line 178 and deinit on those is a no-op.
     var idx: usize = 0;
     var r: u32 = 0;
     while (r < n_rows) : (r += 1) {
         var c: u32 = 0;
         while (c < n_cols) : (c += 1) {
             const text = if (bufs[idx].items.len > 0) try bufs[idx].toOwnedSlice(allocator) else null;
-            // ArrayList already drained on toOwnedSlice; if empty, deinit it now.
-            if (text == null) bufs[idx].deinit(allocator);
             cells[idx] = .{ .r = r, .c = c, .rowspan = 1, .colspan = 1, .is_header = false, .text = text };
             idx += 1;
             cells_initialised += 1;
@@ -411,16 +427,12 @@ test "groupIntoRows clusters spans by Y" {
     try std.testing.expectEqual(@as(usize, 1), rows[1].spans.len); // y=80
 }
 
-// PR-4b — partial FailingAllocator stress for the *fixed* surfaces
+// PR-4b/4d — full FailingAllocator stress for every fixed surface
 // (extractFromSpans outer errdefer, buildCellsWithText
-// cells_initialised, cells_owned ownership flag,
-// groupIntoRows span_slice + sorted_owned, findColumnAnchors
-// peaks_owned). Indices 0..16 are leak-clean post-fix; later indices
-// may surface pre-existing bugs in unaddressed inner code paths
-// (e.g. some bufs.deinit edge case in buildCellsWithText) that are
-// filed as PR-4d. Bumping this bound is the primary acceptance gate
-// for that follow-up.
-test "extractFromSpans survives early allocation failure indices" {
+// cells_initialised, cells_owned ownership flag, groupIntoRows
+// span_slice + sorted_owned, findColumnAnchors peaks_owned, plus
+// the PR-4d bufs-deinit-on-undefined fix in the materialise loop).
+test "extractFromSpans survives every allocation failure index" {
     const spans = [_]T{
         .{ .x0 = 10, .y0 = 200, .x1 = 80, .y1 = 212, .text = "row1-A", .font_size = 12 },
         .{ .x0 = 200, .y0 = 200, .x1 = 240, .y1 = 212, .text = "10", .font_size = 12 },
@@ -432,7 +444,7 @@ test "extractFromSpans survives early allocation failure indices" {
         .{ .x0 = 200, .y0 = 140, .x1 = 240, .y1 = 152, .text = "40", .font_size = 12 },
     };
     var fail_index: usize = 0;
-    while (fail_index < 16) : (fail_index += 1) {
+    while (fail_index < 128) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         const result = extractFromSpans(failing.allocator(), &spans, 7);
         if (result) |out| {
