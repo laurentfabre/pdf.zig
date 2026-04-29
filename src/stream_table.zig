@@ -69,6 +69,21 @@ pub fn extractFromSpans(
     }
     if (rows.len < MIN_ROWS) return out.toOwnedSlice(allocator);
 
+    // PR-8 [perf]: fast pre-check on row span density. The per-run
+    // loop below skips singleton rows but only after entering its
+    // outer iteration. Pages with lots of single-span rows
+    // (paragraphs, headings) would still spin through groupIntoRows
+    // result + pay the loop overhead. Count multi-span rows once;
+    // if fewer than MIN_ROWS, no run can satisfy the table gate.
+    var multi_span_rows: usize = 0;
+    for (rows) |row| {
+        if (row.spans.len >= MIN_COLS_PER_ROW) {
+            multi_span_rows += 1;
+            if (multi_span_rows >= MIN_ROWS) break;
+        }
+    }
+    if (multi_span_rows < MIN_ROWS) return out.toOwnedSlice(allocator);
+
     if (debug_log) {
         std.debug.print("[stream_table p{d}] {d} rows, span counts: ", .{ page, rows.len });
         for (rows) |r| std.debug.print("{d}/", .{r.spans.len});
@@ -476,6 +491,26 @@ test "extractFromSpans detects a 4-row × 2-col stream table" {
     try std.testing.expectEqual(@as(u32, 7), out[0].page);
     try std.testing.expectEqual(tables.Engine.stream, out[0].engine);
     try std.testing.expect(out[0].confidence >= 0.7);
+}
+
+// PR-8 [perf]: regression for the multi-span-row early-out. Pages
+// with mostly singleton rows (paragraph layouts) should bail before
+// the per-table loop runs.
+test "extractFromSpans early-outs on singleton-dominant page" {
+    const a = std.testing.allocator;
+    // 5 single-span rows + 1 two-span row → multi_span_rows = 1 < MIN_ROWS.
+    const spans = [_]T{
+        .{ .x0 = 10, .y0 = 200, .x1 = 80, .y1 = 212, .text = "h", .font_size = 12 },
+        .{ .x0 = 10, .y0 = 180, .x1 = 80, .y1 = 192, .text = "para1", .font_size = 12 },
+        .{ .x0 = 10, .y0 = 160, .x1 = 80, .y1 = 172, .text = "para2", .font_size = 12 },
+        .{ .x0 = 10, .y0 = 140, .x1 = 80, .y1 = 152, .text = "para3", .font_size = 12 },
+        .{ .x0 = 10, .y0 = 120, .x1 = 80, .y1 = 132, .text = "h2", .font_size = 12 },
+        .{ .x0 = 10, .y0 = 100, .x1 = 80, .y1 = 112, .text = "x", .font_size = 12 },
+        .{ .x0 = 200, .y0 = 100, .x1 = 240, .y1 = 112, .text = "1", .font_size = 12 },
+    };
+    const out = try extractFromSpans(a, &spans, 1);
+    defer tables.freeTables(a, out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
 }
 
 test "extractFromSpans bails when fewer than MIN_ROWS multi-span rows" {
