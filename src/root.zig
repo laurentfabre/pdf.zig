@@ -1160,7 +1160,24 @@ pub const Document = struct {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 break :blk &[_]tables.Table{};
             };
-            for (pass_b) |t| {
+            // Codex review v1.2-rc4 PR-4 round 1 [P2]: mirror the
+            // Pass A transfer_idx pattern for Pass B. If
+            // `combined.append` fails partway, the tail
+            // `pass_b[b_idx..]` plus the outer `pass_b` slice would
+            // otherwise leak. The `b_owned` flag prevents
+            // double-free with the success path's
+            // `allocator.free(pass_b)`.
+            var b_idx: usize = 0;
+            var pass_b_owned = true;
+            errdefer if (pass_b_owned) {
+                for (pass_b[b_idx..]) |t| {
+                    for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+                    allocator.free(t.cells);
+                }
+                allocator.free(pass_b);
+            };
+            while (b_idx < pass_b.len) : (b_idx += 1) {
+                const t = pass_b[b_idx];
                 if (!conflictsExisting(combined.items, t)) {
                     try combined.append(allocator, t);
                 } else {
@@ -1169,10 +1186,28 @@ pub const Document = struct {
                 }
             }
             allocator.free(pass_b);
+            pass_b_owned = false;
 
-            // Pass C: stream-layout on the same spans.
-            const pass_c = stream_table.extractFromSpans(allocator, span_view, @intCast(page_idx + 1)) catch &[_]tables.Table{};
-            for (pass_c) |t| {
+            // Pass C: stream-layout on the same spans. Codex review
+            // v1.2-rc4 PR-4 round 1 [P2]: bubble OOM rather than
+            // silently returning an empty table set under allocator
+            // pressure (matching Pass B / pagetree convention).
+            const pass_c = stream_table.extractFromSpans(allocator, span_view, @intCast(page_idx + 1)) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                break :blk &[_]tables.Table{};
+            };
+            // Same transfer-idx guard for Pass C.
+            var c_idx: usize = 0;
+            var pass_c_owned = true;
+            errdefer if (pass_c_owned) {
+                for (pass_c[c_idx..]) |t| {
+                    for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+                    allocator.free(t.cells);
+                }
+                allocator.free(pass_c);
+            };
+            while (c_idx < pass_c.len) : (c_idx += 1) {
+                const t = pass_c[c_idx];
                 if (!conflictsExisting(combined.items, t)) {
                     try combined.append(allocator, t);
                 } else {
@@ -1181,6 +1216,7 @@ pub const Document = struct {
                 }
             }
             allocator.free(pass_c);
+            pass_c_owned = false;
         }
 
         const result = try combined.toOwnedSlice(allocator);

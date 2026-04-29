@@ -1078,7 +1078,17 @@ fn buildLatticeCellsWithText(
         try bufs[idx].appendSlice(allocator, span.text);
     }
 
-    // Materialise cells.
+    // Materialise cells. Codex review v1.2-rc4 PR-4 round 1 [P2]:
+    // each successful `bufs[idx].toOwnedSlice` transfers ownership
+    // to `cells[idx].text`; if a LATER toOwnedSlice fails the
+    // already-materialised text would leak (the bufs errdefer only
+    // covers ArrayLists still holding their buffer, and the cells
+    // errdefer only frees the slice header). Track the count and
+    // free initialised cell texts on error.
+    var cells_initialised: usize = 0;
+    errdefer for (cells[0..cells_initialised]) |c| {
+        if (c.text) |txt| allocator.free(txt);
+    };
     var idx: usize = 0;
     var r: u32 = 0;
     while (r < n_rows) : (r += 1) {
@@ -1088,6 +1098,7 @@ fn buildLatticeCellsWithText(
             if (text == null) bufs[idx].deinit(allocator);
             cells[idx] = .{ .r = r, .c = c, .rowspan = 1, .colspan = 1, .is_header = false, .text = text };
             idx += 1;
+            cells_initialised += 1;
         }
     }
     return cells;
@@ -1128,7 +1139,10 @@ pub fn extractFromStrokes(
 ) ![]tables.Table {
     var out: std.ArrayList(tables.Table) = .empty;
     errdefer {
-        for (out.items) |t| allocator.free(t.cells);
+        for (out.items) |t| {
+            for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+            allocator.free(t.cells);
+        }
         out.deinit(allocator);
     }
     if (strokes.len < 4) return out.toOwnedSlice(allocator); // ≥2 H + ≥2 V required
@@ -1211,10 +1225,17 @@ pub fn extractFromStrokes(
         col_lines.items,
         spans,
     );
-    errdefer {
+    // Codex review v1.2-rc4 PR-4 round 1 [P1]: ownership transfer
+    // guard. Until `out.append` succeeds, this errdefer owns
+    // `cells`; after, ownership lives in `out.items` and the outer
+    // errdefer (which now also frees per-cell text) is the sole
+    // owner. Without the flag, an OOM from `out.toOwnedSlice` would
+    // double-free `cells`.
+    var cells_owned = true;
+    errdefer if (cells_owned) {
         for (cells) |c| if (c.text) |txt| allocator.free(txt);
         allocator.free(cells);
-    }
+    };
 
     try out.append(allocator, .{
         .page = page,
@@ -1227,6 +1248,7 @@ pub fn extractFromStrokes(
         .confidence = 0.85, // baseline; refined by Pass D heuristics
         .bbox = .{ left, bottom, right, top },
     });
+    cells_owned = false;
 
     return out.toOwnedSlice(allocator);
 }
@@ -1288,6 +1310,25 @@ test "extractFromStrokes builds a 2x3 grid from synthetic strokes" {
     try std.testing.expectEqual(@as(u32, 3), out[0].n_cols);
     try std.testing.expectEqual(@as(usize, 6), out[0].cells.len);
     try std.testing.expectEqual(tables.Engine.lattice, out[0].engine);
+}
+
+test "extractFromStrokes populates cell text from spans" {
+    const a = std.testing.allocator;
+    const strokes = [_]Stroke{
+        .{ .x0 = 50, .y0 = 100, .x1 = 350, .y1 = 100 },
+        .{ .x0 = 50, .y0 = 200, .x1 = 350, .y1 = 200 },
+        .{ .x0 = 50, .y0 = 300, .x1 = 350, .y1 = 300 },
+        .{ .x0 = 50, .y0 = 100, .x1 = 50, .y1 = 300 },
+        .{ .x0 = 150, .y0 = 100, .x1 = 150, .y1 = 300 },
+        .{ .x0 = 250, .y0 = 100, .x1 = 250, .y1 = 300 },
+        .{ .x0 = 350, .y0 = 100, .x1 = 350, .y1 = 300 },
+    };
+    const spans = [_]layout.TextSpan{
+        .{ .x0 = 100, .y0 = 150, .x1 = 110, .y1 = 160, .text = "ab", .font_size = 10 },
+    };
+    const out = try extractFromStrokes(a, &strokes, 1, &spans);
+    defer tables.freeTables(a, out);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
 }
 
 test "extractFromStrokes returns no table when fewer than 2 cluster lines on either axis" {
