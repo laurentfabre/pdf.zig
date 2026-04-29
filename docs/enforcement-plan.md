@@ -9,7 +9,7 @@ Adapted from the zlsx companion repo's enforcement plan (`/Users/lf/Projects/Pro
 | Phase | Description | Status |
 |---|---|---|
 | 1 | Free wins: branch protection, repo merge settings, CODEOWNERS, PR template | **Local files done; gh-api side pending** |
-| 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | Not started |
+| 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | **Done (advisory; promote to required after a few green runs)** |
 | 3 | Worktree + subagent conventions: helper script, commit-msg trailer, PR template fields | Not started |
 | 4 | Agent-as-reviewer CI job (codex-review-on-PR) | Not started |
 | 5 | Optional: coverage gate, TDAD map, mutation testing | Deferred |
@@ -188,7 +188,40 @@ Plus repo-level: disable merge-commit style, enable auto-delete on merge.
 
 ## Phase 2 — implementation log
 
-(To be filled by the Phase 2 PR.)
+- [x] `.github/workflows/pr-gates.yml` created — wires three jobs on `pull_request` events (`opened`, `synchronize`, `reopened`, `labeled`, `unlabeled`). Labeled events re-run the gates so escape labels take effect without an empty commit.
+- [x] `scripts/ci/test-presence-check.sh` (Gate 5) — `src/*.zig` non-trivial change must come with a `test "..."` block, `python/tests/` change, or a `src/integration_test.zig` / `src/alloc_failure_test.zig` change. Escape: `no-test-needed`.
+- [x] `scripts/ci/abi-3file-check.sh` (Gate 6) — `src/capi.zig` changes must come with both `python/zpdf/_cdef.h` AND `python/zpdf/_ffi.py`. Escape: `abi-no-3file`.
+- [x] `scripts/ci/monotonic-test-count.sh` (Gate 7) — total `^test "` count under `src/` must not net-decrease. Escape: `delete-tests-ok`.
+- [ ] **Pending (gh api, applied after PR merge)** — escape labels created on GitHub:
+  ```sh
+  gh label create no-test-needed   --description 'PR is intentionally test-neutral (refactor, comments-only, formatting)' --color BFD4F2 -R laurentfabre/pdf.zig
+  gh label create abi-no-3file     --description 'src/capi.zig change is internal; does not alter the public ABI surface' --color BFD4F2 -R laurentfabre/pdf.zig
+  gh label create delete-tests-ok  --description 'Net test deletion is intentional (deprecation)' --color BFD4F2 -R laurentfabre/pdf.zig
+  ```
+- [x] Local smoke-tested against historical commits (Phase 2 PR description has the full command transcript):
+  - **ABI gate** correctly fails on `15c62829` ("v1.5 RC: capi exports + Python binding wired into release"), which touched `src/capi.zig` + `python/zpdf/_cdef.h` but not `python/zpdf/_ffi.py`. Would have caught the real historical ABI lockstep gap.
+  - **Test-presence gate** correctly fails on `2f073f6` (PR-W6.4) — the AcroForm fixture migration. Expected behavior: the gate doesn't know `testpdf.zig` is itself a test fixture file. The right answer for a refactor PR is the `no-test-needed` label; the escape label was verified to skip the gate cleanly.
+  - **Monotonic gate** correctly fires on a synthetic `337 → 314` regression (HEAD compared against pre-W6 history); the `delete-tests-ok` escape skips cleanly.
+- [ ] **Pending** — promote gates to `required_status_checks` after a few green PR runs. Three contexts to add: `Test-presence check`, `C ABI 3-file transaction`, `Monotonic test count`. Keep them advisory until at least one PR exercises each escape label so we know the escape actually works in CI (not only locally).
+
+### Local invocation (debugging a gate)
+
+```sh
+BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='[]' \
+  bash scripts/ci/test-presence-check.sh
+
+BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file"]' \
+  bash scripts/ci/abi-3file-check.sh
+
+BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='[]' \
+  bash scripts/ci/monotonic-test-count.sh
+```
+
+### Known limitations
+
+- **Test-presence**: heuristic "non-trivial change" filter strips blank lines and `// ...` comments only. Multi-line `///` doc-comments still count as significant; tolerable since the escape label exists. Also: `src/testpdf.zig` is a fixture-generator file but the gate sees it as `src/*.zig` — refactor PRs that only change fixtures need the `no-test-needed` label even though they're "test-adjacent".
+- **ABI gate**: only triggers when `src/capi.zig` is in the changed-file list. An ABI-affecting change made elsewhere (e.g., changing an extern struct's layout via a `pub const` in another file imported by `capi.zig`) won't be caught.
+- **Monotonic**: counts `^test "` exactly — moving a test from `test "foo"` to `test "renamed"` is a no-op (count preserved), but reformatting a test header onto a multi-line form would silently drop it.
 
 ---
 
