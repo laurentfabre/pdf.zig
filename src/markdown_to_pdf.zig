@@ -73,9 +73,12 @@ pub fn render(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
         } else if (std.mem.startsWith(u8, trimmed, "### ")) {
             try renderer.heading(trimmed[4..], H3_SIZE);
         } else if (bulletPrefix(trimmed)) |skip| {
-            try renderer.listItem(trimmed[skip..], "•");
+            // ASCII marker: drawText drops bytes outside 0x20..0x7e,
+            // so `•` would render as nothing. `-` is the safe fallback.
+            try renderer.listItem(trimmed[skip..], "-");
         } else if (numberedPrefix(trimmed)) |skip_count| {
-            const num = trimmed[0 .. skip_count - 2];
+            // Include the trailing dot; only the space is stripped.
+            const num = trimmed[0 .. skip_count - 1];
             try renderer.listItem(trimmed[skip_count..], num);
         } else {
             try renderer.paragraph(trimmed);
@@ -197,13 +200,26 @@ const Renderer = struct {
 
         var word_iter = std.mem.tokenizeAny(u8, text, " \t");
         while (word_iter.next()) |word| {
-            const projected = if (line.items.len == 0) word.len else line.items.len + 1 + word.len;
+            // Hard-wrap a single oversized token (URL, path) so it
+            // doesn't blow past the right margin. We slice in
+            // `max_chars`-sized chunks; each chunk except the last is
+            // emitted on its own line.
+            var remaining = word;
+            while (remaining.len > max_chars) {
+                if (line.items.len > 0) {
+                    try self.drawTextLine(line.items, font, size, left);
+                    line.clearRetainingCapacity();
+                }
+                try self.drawTextLine(remaining[0..max_chars], font, size, left);
+                remaining = remaining[max_chars..];
+            }
+            const projected = if (line.items.len == 0) remaining.len else line.items.len + 1 + remaining.len;
             if (projected > max_chars and line.items.len > 0) {
                 try self.drawTextLine(line.items, font, size, left);
                 line.clearRetainingCapacity();
             }
             if (line.items.len > 0) try line.append(self.allocator, ' ');
-            try line.appendSlice(self.allocator, word);
+            try line.appendSlice(self.allocator, remaining);
         }
         if (line.items.len > 0) {
             try self.drawTextLine(line.items, font, size, left);
@@ -322,4 +338,56 @@ test "render: numbered list" {
     try std.testing.expect(std.mem.indexOf(u8, text, "first") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "third") != null);
+}
+
+test "render: bullet markers survive round-trip (ASCII `-`)" {
+    const allocator = std.testing.allocator;
+    const md =
+        \\- alpha
+        \\- beta
+    ;
+    const bytes = try render(allocator, md);
+    defer allocator.free(bytes);
+
+    const zpdf = @import("root.zig");
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    const text = try doc.extractMarkdown(0, allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "-") != null);
+}
+
+test "render: numbered markers keep the dot" {
+    const allocator = std.testing.allocator;
+    const md =
+        \\1. first
+        \\2. second
+    ;
+    const bytes = try render(allocator, md);
+    defer allocator.free(bytes);
+
+    const zpdf = @import("root.zig");
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    const text = try doc.extractMarkdown(0, allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2.") != null);
+}
+
+test "render: long unbroken token hard-wraps within page width" {
+    const allocator = std.testing.allocator;
+    // 200-char token, longer than ~85 chars/line at body size.
+    const md = "https://example.com/" ++ ("a" ** 180);
+    const bytes = try render(allocator, md);
+    defer allocator.free(bytes);
+
+    const zpdf = @import("root.zig");
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    const text = try doc.extractMarkdown(0, allocator);
+    defer allocator.free(text);
+    // The token's prefix must still appear (chunked into >=2 chunks).
+    try std.testing.expect(std.mem.indexOf(u8, text, "https://example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "aaaaa") != null);
 }

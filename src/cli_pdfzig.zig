@@ -75,6 +75,7 @@ pub const ArgError = error{
     NoSubcommand,
     UnknownSubcommand,
     MissingInput,
+    MissingOutput,
     UnknownFlag,
     MissingValue,
     InvalidMaxTokens,
@@ -107,6 +108,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Command {
 
 fn parseNew(args: []const []const u8) ArgError!NewArgs {
     var out = NewArgs{ .output_path = "" };
+    var saw_positional: bool = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -121,11 +123,12 @@ fn parseNew(args: []const []const u8) ArgError!NewArgs {
         } else if (a.len > 1 and (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-")) and !std.mem.eql(u8, a, "-")) {
             return error.UnknownFlag;
         } else {
-            // Positional: treat as input file.
+            if (saw_positional) return error.UnknownFlag;
             out.input = a;
+            saw_positional = true;
         }
     }
-    if (out.output_path.len == 0) return error.MissingInput;
+    if (out.output_path.len == 0) return error.MissingOutput;
     return out;
 }
 
@@ -819,6 +822,7 @@ fn writeArgError(err: ArgError) !void {
         error.NoSubcommand => "pdf.zig: missing subcommand (try `pdf.zig --help`)",
         error.UnknownSubcommand => "pdf.zig: unknown subcommand",
         error.MissingInput => "pdf.zig: missing input file",
+        error.MissingOutput => "pdf.zig: missing output file (-o/--output-file is required)",
         error.UnknownFlag => "pdf.zig: unknown flag",
         error.MissingValue => "pdf.zig: flag requires a value",
         error.InvalidMaxTokens => "pdf.zig: --max-tokens must be a positive integer",
@@ -1057,7 +1061,11 @@ test "findH1Heading — H1 after H2 is found" {
 
 // PR-W5 [feat]: parseNew tests.
 test "parse new: requires --output-file" {
-    try std.testing.expectError(error.MissingInput, parseArgs(&.{ "new", "-" }));
+    try std.testing.expectError(error.MissingOutput, parseArgs(&.{ "new", "-" }));
+}
+
+test "parse new: rejects duplicate positionals" {
+    try std.testing.expectError(error.UnknownFlag, parseArgs(&.{ "new", "-o", "out.pdf", "a.md", "b.md" }));
 }
 
 test "parse new: -o / --output-file accepted" {
