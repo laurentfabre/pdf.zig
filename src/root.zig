@@ -26,6 +26,7 @@ pub const decompress = @import("decompress.zig");
 pub const simd = @import("simd.zig");
 pub const layout = @import("layout.zig");
 pub const pdf_writer = @import("pdf_writer.zig");
+pub const pdf_document = @import("pdf_document.zig");
 pub const structtree = @import("structtree.zig");
 pub const markdown = @import("markdown.zig");
 pub const outline = @import("outline.zig");

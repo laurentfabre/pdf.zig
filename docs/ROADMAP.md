@@ -394,7 +394,7 @@ updated: 2026-04-27
   > **Test strategy.** New unit tests for object serialization + round-trip integration test.
   > **Codex gate.** xref byte-offset accuracy under stream lengths that span chunk boundaries; deferred-reference resolution before `endobj`; FlateDecode boundary not assumed (Tier-1 content streams uncompressed).
 
-- [ ] **PR-W2 · feat: Document/Page/Resources builders with balanced page tree (`src/pdf_document.zig`)**
+- [x] **PR-W2 · feat: Document/Page/Resources builders with balanced page tree (`src/pdf_document.zig`)**
   > [!info]- Details
   > **Why.** High-level API on top of PR-W1 so callers don't write objects directly. Page tree is **balanced from day one** — see the v1.5 section header for the use-case constraint (multi-hundred-page authoring).
   > **Files-touched envelope.** `src/pdf_document.zig` (new, ~600 LOC including the page-tree builder), `src/integration_test.zig`.
