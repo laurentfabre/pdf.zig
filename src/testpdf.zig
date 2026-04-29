@@ -536,53 +536,25 @@ pub fn generateOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
     return doc.write();
 }
 
-/// Generate a PDF with link annotations
+/// PR-W6.3 [refactor]: link-annotation fixture via DocumentBuilder.
+/// Single URI link covering the body text, attached to the page via
+/// `setPageExtras("/Annots [N 0 R]")` and registered as an aux object.
 pub fn generateLinkPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, "Click here");
 
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    const link = try doc.addAuxiliaryObject(
+        "<< /Type /Annot /Subtype /Link /Rect [100 690 200 710] " ++
+            "/A << /S /URI /URI (https://example.com) >> >>",
+    );
 
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    var extras_buf: [64]u8 = undefined;
+    try page.setPageExtras(try std.fmt.bufPrint(&extras_buf, "/Annots [{d} 0 R]", .{link}));
 
-    // Page with /Annots array
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> ");
-    try writer.writeAll("/Annots [6 0 R] >>\nendobj\n");
-
-    const content = "BT\n/F1 12 Tf\n100 700 Td\n(Click here) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Object 6: Link annotation with URI
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /Type /Annot /Subtype /Link /Rect [100 690 200 710] ");
-    try writer.writeAll("/A << /S /URI /URI (https://example.com) >> >>\nendobj\n");
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 7\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-
-    try writer.writeAll("trailer\n<< /Size 7 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// Generate a PDF with form fields (/AcroForm)
@@ -792,64 +764,41 @@ pub fn generateNestedOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
     return doc.write();
 }
 
-/// Generate a PDF with multiple link annotations: URI, GoTo internal, and a non-link annotation
+/// PR-W6.3 [refactor]: multi-annotation fixture via DocumentBuilder.
+/// 3 annotations on one page: a URI link, a GoTo-internal link to the
+/// same page, and a /Highlight (which the link extractor must skip).
 pub fn generateMultiLinkPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, "Links page");
 
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    const uri_link = try doc.addAuxiliaryObject(
+        "<< /Type /Annot /Subtype /Link /Rect [10 10 100 30] " ++
+            "/A << /S /URI /URI (https://example.org) >> >>",
+    );
 
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    var goto_buf: [128]u8 = undefined;
+    const goto_link = try doc.addAuxiliaryObject(try std.fmt.bufPrint(
+        &goto_buf,
+        "<< /Type /Annot /Subtype /Link /Rect [10 40 100 60] " ++
+            "/A << /S /GoTo /D [{d} 0 R /Fit] >> >>",
+        .{page.objNum()},
+    ));
 
-    // Page with 3 annotations: 2 links + 1 highlight (should be ignored)
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> ");
-    try writer.writeAll("/Annots [6 0 R 7 0 R 8 0 R] >>\nendobj\n");
+    const highlight = try doc.addAuxiliaryObject(
+        "<< /Type /Annot /Subtype /Highlight /Rect [10 70 100 90] >>",
+    );
 
-    const content = "BT\n/F1 12 Tf\n100 700 Td\n(Links page) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+    var extras_buf: [128]u8 = undefined;
+    try page.setPageExtras(try std.fmt.bufPrint(
+        &extras_buf,
+        "/Annots [{d} 0 R {d} 0 R {d} 0 R]",
+        .{ uri_link, goto_link, highlight },
+    ));
 
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Object 6: URI link
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 10 100 30] ");
-    try writer.writeAll("/A << /S /URI /URI (https://example.org) >> >>\nendobj\n");
-
-    // Object 7: GoTo internal link to page 1 (obj 3)
-    const obj7_offset = pdf.items.len;
-    try writer.writeAll("7 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 40 100 60] ");
-    try writer.writeAll("/A << /S /GoTo /D [3 0 R /Fit] >> >>\nendobj\n");
-
-    // Object 8: Highlight annotation (NOT a link, should be skipped)
-    const obj8_offset = pdf.items.len;
-    try writer.writeAll("8 0 obj\n<< /Type /Annot /Subtype /Highlight /Rect [10 70 100 90] >>\nendobj\n");
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 9\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
-
-    try writer.writeAll("trailer\n<< /Size 9 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// Generate a PDF with all form field types: text, button, choice, signature
