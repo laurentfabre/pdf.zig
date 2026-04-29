@@ -1,202 +1,64 @@
 //! Test PDF Generator
 //!
 //! Creates minimal valid PDFs for testing the parser.
-//! These are hand-crafted PDFs that exercise specific features.
+//! Hand-crafted bodies migrated to the writer API cluster-by-cluster
+//! (PR-W6.1+); fixtures that need /Info, /Outlines, /Annots, AcroForm,
+//! /PageLabels stay hand-rolled for now.
 
 const std = @import("std");
+const document = @import("pdf_document.zig");
 
-/// Generate a minimal PDF with plain text
+/// PR-W6.1 [refactor]: text-only fixture, now built via DocumentBuilder.
+/// Byte-different from the previous hand-rolled output, semantically
+/// equivalent for the WinAnsi-printable subset of bytes the existing
+/// callers actually pass (same pageCount, font ref, extractable text).
+/// Bytes outside `[0x20, 0x7e]` are silently dropped by `drawText`'s
+/// WinAnsi filter — the old fixture inlined them verbatim, so seeds
+/// like `"fuzz seed — minimal"` (em dash) lose those code points.
+/// Existing call sites are robust to the dropped bytes.
 pub fn generateMinimalPdf(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-
-    var writer = pdf.writer(allocator);
-
-    // Header
-    try writer.writeAll("%PDF-1.4\n");
-    try writer.writeAll("%\xE2\xE3\xCF\xD3\n"); // Binary marker
-
-    // Object 1: Catalog
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n");
-    try writer.writeAll("<< /Type /Catalog /Pages 2 0 R >>\n");
-    try writer.writeAll("endobj\n");
-
-    // Object 2: Pages
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n");
-    try writer.writeAll("<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n");
-    try writer.writeAll("endobj\n");
-
-    // Object 3: Page
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n");
-    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\n");
-    try writer.writeAll("endobj\n");
-
-    // Object 4: Content stream
-    const obj4_offset = pdf.items.len;
-
-    // Build content stream
-    var content: std.ArrayList(u8) = .empty;
-    defer content.deinit(allocator);
-    var cw = content.writer(allocator);
-
-    try cw.writeAll("BT\n");
-    try cw.writeAll("/F1 12 Tf\n");
-    try cw.writeAll("100 700 Td\n");
-    try cw.print("({s}) Tj\n", .{text});
-    try cw.writeAll("ET\n");
-
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.items.len});
-    try writer.writeAll(content.items);
-    try writer.writeAll("\nendstream\nendobj\n");
-
-    // Object 5: Font
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n");
-    try writer.writeAll("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\n");
-    try writer.writeAll("endobj\n");
-
-    // XRef table
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n");
-    try writer.writeAll("0 6\n");
-    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-
-    // Trailer
-    try writer.writeAll("trailer\n");
-    try writer.writeAll("<< /Size 6 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n", .{xref_offset});
-    try writer.writeAll("%%EOF\n");
-
-    return pdf.toOwnedSlice(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, text);
+    return doc.write();
 }
 
-/// Generate a PDF with multiple pages
+/// PR-W6.1 [refactor]: multi-page text fixture via DocumentBuilder.
+/// Each input string lands as a single 12pt Helvetica `Tj` at (100, 700)
+/// on its own /Page. The page tree is balanced (PR-W2) — for ≤10
+/// pages it stays flat, matching the old hand-rolled shape. Non-ASCII
+/// bytes are dropped by `drawText`'s WinAnsi filter (printable-ASCII
+/// only), unlike the old verbatim-inlining hand-rolled fixture.
 pub fn generateMultiPagePdf(allocator: std.mem.Allocator, pages_text: []const []const u8) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-
-    var writer = pdf.writer(allocator);
-    var offsets: std.ArrayList(u64) = .empty;
-    defer offsets.deinit(allocator);
-
-    // Header
-    try writer.writeAll("%PDF-1.4\n");
-    try writer.writeAll("%\xE2\xE3\xCF\xD3\n");
-
-    // Object 1: Catalog
-    try offsets.append(allocator, pdf.items.len);
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    // Object 2: Pages - build kids array dynamically
-    // Object layout: 1=Catalog, 2=Pages, 3=Font, then pairs of (Page, Content)
-    // So pages are at 4, 6, 8, ... (4 + i*2)
-    try offsets.append(allocator, pdf.items.len);
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [");
-    for (0..pages_text.len) |i| {
-        if (i > 0) try writer.writeByte(' ');
-        try writer.print("{} 0 R", .{4 + i * 2}); // Page objects at 4, 6, 8, ...
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    for (pages_text) |text| {
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(100, 700, .helvetica, 12, text);
     }
-    try writer.print("] /Count {} >>\nendobj\n", .{pages_text.len});
-
-    // Object 3: Font (shared)
-    try offsets.append(allocator, pdf.items.len);
-    try writer.writeAll("3 0 obj\n");
-    try writer.writeAll("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Page objects and content streams
-    const base_obj = 4;
-    for (pages_text, 0..) |text, i| {
-        const page_obj = base_obj + i * 2;
-        const content_obj = page_obj + 1;
-
-        // Page object
-        try offsets.append(allocator, pdf.items.len);
-        try writer.print("{} 0 obj\n", .{page_obj});
-        try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-        try writer.print("/Contents {} 0 R /Resources << /Font << /F1 3 0 R >> >> >>\n", .{content_obj});
-        try writer.writeAll("endobj\n");
-
-        // Content stream
-        var content: std.ArrayList(u8) = .empty;
-        defer content.deinit(allocator);
-        var cw = content.writer(allocator);
-        try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n");
-        try cw.print("({s}) Tj\n", .{text});
-        try cw.writeAll("ET\n");
-
-        try offsets.append(allocator, pdf.items.len);
-        try writer.print("{} 0 obj\n<< /Length {} >>\nstream\n", .{ content_obj, content.items.len });
-        try writer.writeAll(content.items);
-        try writer.writeAll("\nendstream\nendobj\n");
-    }
-
-    // XRef table
-    const xref_offset = pdf.items.len;
-    const total_objects = offsets.items.len + 1; // +1 for object 0
-    try writer.writeAll("xref\n");
-    try writer.print("0 {}\n", .{total_objects});
-    try writer.writeAll("0000000000 65535 f \n");
-
-    for (offsets.items) |offset| {
-        try writer.print("{d:0>10} 00000 n \n", .{offset});
-    }
-
-    // Trailer
-    try writer.writeAll("trailer\n");
-    try writer.print("<< /Size {} /Root 1 0 R >>\n", .{total_objects});
-    try writer.print("startxref\n{}\n", .{xref_offset});
-    try writer.writeAll("%%EOF\n");
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// Generate a PDF with TJ operator (array-based text)
+/// PR-W6.1 [refactor]: TJ-operator (kerned text-show) fixture via
+/// DocumentBuilder. Direct content-stream injection because the writer
+/// only models `Tj`. `markFontUsed` returns the resource name (`/F0`
+/// for Helvetica) so the `Tf` operator references whatever the
+/// auto-resources block actually emits.
 pub fn generateTJPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-
-    var writer = pdf.writer(allocator);
-
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
-
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    // Content with TJ operator
-    const content = "BT\n/F1 12 Tf\n100 700 Td\n[(Hello) -200 (World)] TJ\nET\n";
-
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 6\n");
-    try writer.print("0000000000 65535 f \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj1_offset, obj2_offset });
-    try writer.print("{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj3_offset, obj4_offset, obj5_offset });
-    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    const f = page.markFontUsed(.helvetica);
+    var content_buf: [128]u8 = undefined;
+    const content = try std.fmt.bufPrint(
+        &content_buf,
+        "BT\n{s} 12 Tf\n100 700 Td\n[(Hello) -200 (World)] TJ\nET\n",
+        .{f},
+    );
+    try page.appendContent(content);
+    return doc.write();
 }
 
 /// Generate a PDF with a CID font (Type0 composite font with ToUnicode)
@@ -390,55 +252,36 @@ pub fn generateInlineImagePdf(allocator: std.mem.Allocator) ![]u8 {
 /// Tests the superscript/subscript newline-suppression fix: a Tm whose Y
 /// shift is smaller than 0.7 * max(current_font, last_text_font) should not
 /// emit a newline.
+/// PR-W6.1 [refactor]: superscript fixture via DocumentBuilder. Uses
+/// `Tm` (text matrix) for explicit positioning, which the writer's
+/// `drawText` doesn't model — direct content-stream injection.
+/// Layout: main text at (100, 700) 12pt, superscript "2" at (110, 707)
+/// 7pt, trailing " World" at (120, 700) 12pt. The 7-unit Y shift is
+/// below the heuristic threshold (`max(7,12)*0.7 = 8.4`) so the
+/// extractor must NOT emit a newline between them.
 pub fn generateSuperscriptPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
-
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
-
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    // Main text at Y=700 (12pt), superscript "2" at Y=707 (7pt), then back to Y=700 (12pt).
-    // Y shift = 7, threshold = max(7,12)*0.7 = 8.4 → no newline emitted.
-    const content =
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    const f = page.markFontUsed(.helvetica);
+    var content_buf: [512]u8 = undefined;
+    const content = try std.fmt.bufPrint(
+        &content_buf,
         "BT\n" ++
-        "/F1 12 Tf\n" ++
-        "1 0 0 1 100 700 Tm\n" ++
-        "(Hello) Tj\n" ++
-        "/F1 7 Tf\n" ++
-        "1 0 0 1 110 707 Tm\n" ++
-        "(2) Tj\n" ++
-        "/F1 12 Tf\n" ++
-        "1 0 0 1 120 700 Tm\n" ++
-        "( World) Tj\n" ++
-        "ET\n";
-
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.len});
-    try writer.writeAll(content);
-    try writer.writeAll("\nendstream\nendobj\n");
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 6\n");
-    try writer.print("0000000000 65535 f \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj1_offset, obj2_offset });
-    try writer.print("{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj3_offset, obj4_offset, obj5_offset });
-    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+            "{[f]s} 12 Tf\n" ++
+            "1 0 0 1 100 700 Tm\n" ++
+            "(Hello) Tj\n" ++
+            "{[f]s} 7 Tf\n" ++
+            "1 0 0 1 110 707 Tm\n" ++
+            "(2) Tj\n" ++
+            "{[f]s} 12 Tf\n" ++
+            "1 0 0 1 120 700 Tm\n" ++
+            "( World) Tj\n" ++
+            "ET\n",
+        .{ .f = f },
+    );
+    try page.appendContent(content);
+    return doc.write();
 }
 
 // ============================================================================
@@ -1340,7 +1183,7 @@ pub fn generateFormXObjectTablePdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{form_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1406,7 +1249,7 @@ pub fn generateFormXObjectIndirectSubtypePdf(allocator: std.mem.Allocator) ![]u8
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype 6 0 R /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{form_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1478,7 +1321,7 @@ pub fn generateFormXObjectEscapedNamePdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{form_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1564,9 +1407,9 @@ pub fn generateFormXObjectShadowedXObjectPdf(allocator: std.mem.Allocator) ![]u8
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] " ++
-        "/Resources << /XObject << /MidForm 7 0 R /InnerGrid 8 0 R >> >> " ++
-        "/Length {} >>\n",
+            "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] " ++
+            "/Resources << /XObject << /MidForm 7 0 R /InnerGrid 8 0 R >> >> " ++
+            "/Length {} >>\n",
         .{outer_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1587,7 +1430,7 @@ pub fn generateFormXObjectShadowedXObjectPdf(allocator: std.mem.Allocator) ![]u8
     try writer.writeAll("6 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{page_inner.len},
     );
     try writer.writeAll("stream\n");
@@ -1603,8 +1446,8 @@ pub fn generateFormXObjectShadowedXObjectPdf(allocator: std.mem.Allocator) ![]u8
     try writer.writeAll("7 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources null " ++
-        "/Length {} >>\n",
+            "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources null " ++
+            "/Length {} >>\n",
         .{mid_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1628,7 +1471,7 @@ pub fn generateFormXObjectShadowedXObjectPdf(allocator: std.mem.Allocator) ![]u8
     try writer.writeAll("8 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{shadow_inner.len},
     );
     try writer.writeAll("stream\n");
@@ -1692,8 +1535,8 @@ pub fn generateFormXObjectNullResourcesPdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources null " ++
-        "/Length {} >>\n",
+            "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources null " ++
+            "/Length {} >>\n",
         .{outer_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1712,7 +1555,7 @@ pub fn generateFormXObjectNullResourcesPdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll("6 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{inner_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1792,8 +1635,8 @@ pub fn generateFormXObjectMalformedResourcesPdf(allocator: std.mem.Allocator) ![
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources 42 " ++
-        "/Length {} >>\n",
+            "/BBox [0 0 612 792] /Matrix [1 0 0 1 0 0] /Resources 42 " ++
+            "/Length {} >>\n",
         .{outer_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1814,7 +1657,7 @@ pub fn generateFormXObjectMalformedResourcesPdf(allocator: std.mem.Allocator) ![
     try writer.writeAll("6 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{inner_content.len},
     );
     try writer.writeAll("stream\n");
@@ -1903,9 +1746,9 @@ pub fn generateFormXObjectIndirectArrayElementsPdf(allocator: std.mem.Allocator)
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [6 0 R 7 0 R 8 0 R 9 0 R] " ++
-        "/Matrix [10 0 R 11 0 R 12 0 R 13 0 R 14 0 R 15 0 R] " ++
-        "/Length {} >>\n",
+            "/BBox [6 0 R 7 0 R 8 0 R 9 0 R] " ++
+            "/Matrix [10 0 R 11 0 R 12 0 R 13 0 R 14 0 R 15 0 R] " ++
+            "/Length {} >>\n",
         .{form_content.len},
     );
     try writer.writeAll("stream\n");
@@ -2027,7 +1870,7 @@ pub fn generateFormXObjectBBoxClippedPdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{form_content.len},
     );
     try writer.writeAll("stream\n");
@@ -2094,9 +1937,9 @@ pub fn generateFormXObjectSelfReferencingPdf(allocator: std.mem.Allocator) ![]u8
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] " ++
-        "/Resources << /XObject << /SelfForm 5 0 R >> >> " ++
-        "/Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] " ++
+            "/Resources << /XObject << /SelfForm 5 0 R >> >> " ++
+            "/Length {} >>\n",
         .{form_content.len},
     );
     try writer.writeAll("stream\n");
@@ -2164,7 +2007,7 @@ pub fn generateImageXObjectIgnoredByLatticePdf(allocator: std.mem.Allocator) ![]
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 " ++
-        "/ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\n",
+            "/ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\n",
         .{image_data.len},
     );
     try writer.writeAll("stream\n");
@@ -2243,8 +2086,8 @@ pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll("5 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix 6 0 R /Resources 7 0 R " ++
-        "/Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix 6 0 R /Resources 7 0 R " ++
+            "/Length {} >>\n",
         .{outer_form_content.len},
     );
     try writer.writeAll("stream\n");
@@ -2272,7 +2115,7 @@ pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
     try writer.writeAll("8 0 obj\n");
     try writer.print(
         "<< /Type /XObject /Subtype /Form /FormType 1 " ++
-        "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
+            "/BBox [100 400 400 700] /Matrix [1 0 0 1 0 0] /Length {} >>\n",
         .{inner_form_content.len},
     );
     try writer.writeAll("stream\n");
