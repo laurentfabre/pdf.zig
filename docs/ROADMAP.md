@@ -422,10 +422,10 @@ updated: 2026-04-27
   > **Test strategy.** 14 unit tests (one per BuiltinFont) + round-trip integration test.
   > **Codex gate.** WinAnsi encoding completeness vs the standard; backslash-escape edge cases; empty-text drawText is a no-op (not malformed BT/ET).
 
-- [ ] **PR-W4 · feat: FlateDecode content-stream compression**
-  > [!info]- Details
-  > **Why.** Uncompressed content streams from PR-W3 are 4-5× larger than necessary. `std.compress.flate` is in stdlib so this is a thin wrapper.
-  > **Files-touched envelope.** `src/pdf_writer.zig` (extend stream emission with `encoding: enum { raw, flate }` option), `src/pdf_document.zig` (default content streams to flate), `src/integration_test.zig`.
+- [ ] **PR-W4 · feat: FlateDecode content-stream compression** (deferred — Zig 0.15.2 stdlib gap)
+  > [!warning] Blocked on Zig stdlib
+  > Both `std.compress.flate.Compress` (high-level) and `std.compress.flate.Compress.Simple` are non-functional in Zig 0.15.2. `Compress.drain` calls `@panic("TODO")` and `Simple.finish` has a compile-time error in `hasher.container()` (Container is an enum, not callable). Until upstream Zig completes the deflate encoder, this PR can't ship without either (a) writing a hand-rolled deflate encoder (~500 LOC, scope creep), (b) shelling out to `zlib` (breaks the no-deps story), or (c) waiting for Zig 0.16+.
+  > **Files-touched envelope.** `src/pdf_writer.zig`, `src/pdf_document.zig`, `src/integration_test.zig`.
   > **Acceptance gate.**
   > - Streams >256 B compress with `/Filter /FlateDecode`; smaller stay raw.
   > - Compressed output round-trips through the existing reader (which already handles FlateDecode).
@@ -433,6 +433,7 @@ updated: 2026-04-27
   >
   > **Test strategy.** Compression-ratio assertion + round-trip extract.
   > **Codex gate.** No off-by-one in length-after-compression; `/Length` reflects compressed bytes; `/DL` field if predictor used (tier-1: no predictor).
+  > **Workaround.** Tier-1 emits raw uncompressed content streams. Files are 4-5× larger than necessary but readable by every PDF viewer; the existing `decompress.zig` already handles compressed streams from third-party PDFs without issue.
 
 - [ ] **PR-W5 · feat: `pdf.zig new` CLI subcommand (markdown → PDF)**
   > [!info]- Details
