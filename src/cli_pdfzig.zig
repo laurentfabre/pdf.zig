@@ -172,6 +172,19 @@ fn parseOutputMode(s: []const u8) !OutputMode {
     return error.InvalidOutputMode;
 }
 
+/// PR-11 [feat]: scanned-PDF heuristic. Returns `"scanned"` when:
+///   - pages_emitted ≥ 3 (avoids 1-2 page false positives — codex r1 F1)
+///   - the document has at least one font
+///   - scanned_pages * 100 / pages_emitted ≥ scan_threshold
+/// Otherwise null (the field is omitted from the summary record).
+const MIN_PAGES_FOR_SCAN_FLAG: u32 = 3;
+fn computeScanFlag(pages_emitted: u32, scanned_pages: u32, has_fonts: bool, scan_threshold: u8) ?[]const u8 {
+    if (pages_emitted < MIN_PAGES_FOR_SCAN_FLAG or !has_fonts) return null;
+    const pct = scanned_pages * 100 / pages_emitted;
+    if (pct >= scan_threshold) return "scanned";
+    return null;
+}
+
 // ---- Run ----
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !ExitCode {
@@ -396,6 +409,14 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
             // and a warnings entry, continue to next page.
             const w = pageWarningFromError(err);
             warnings_count += 1;
+            // PR-11 codex r1 F2: count an extraction failure as a
+            // scanned page. The page record is still emitted (with
+            // empty markdown), so it must contribute to the totals.
+            // An all-fail or mostly-fail document with fonts present
+            // matches the "image-only / scanned" signal we want to
+            // surface.
+            pages_emitted += 1;
+            scanned_pages += 1;
             switch (args.output_mode) {
                 .ndjson => {
                     const warns = if (args.no_warnings) &.{} else &[_]stream.Warning{w};
@@ -484,12 +505,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
         // signal). Per the roadmap, this enables routing through
         // OCR shell-out paths in v1.3 (PR-12 / PR-13).
         const has_fonts = doc.font_cache.count() > 0 or doc.font_obj_cache.count() > 0;
-        const flag: ?[]const u8 = blk: {
-            if (pages_emitted == 0 or !has_fonts) break :blk null;
-            const pct = @as(u32, scanned_pages) * 100 / pages_emitted;
-            if (pct >= args.scan_threshold) break :blk "scanned";
-            break :blk null;
-        };
+        const flag = computeScanFlag(pages_emitted, scanned_pages, has_fonts, args.scan_threshold);
         try env.emitSummary(.{
             .pages_emitted = pages_emitted,
             .bytes_emitted = bytes_emitted,
@@ -785,6 +801,43 @@ test "parse extract: --scan-threshold rejects non-numeric" {
         error.InvalidScanThreshold,
         parseArgs(&.{ "extract", "--scan-threshold", "fifty", "foo.pdf" }),
     );
+}
+
+// PR-11 codex r1 F3: integration coverage for the heuristic helper.
+// Each case names the scenario it pins down.
+test "computeScanFlag — 1-page low-text never flags (codex r1 F1)" {
+    // Single-page doc with 1 low-text page. Default threshold 50.
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(1, 1, true, 50));
+}
+
+test "computeScanFlag — 2-page mixed never flags at default 50% threshold" {
+    // 2-page doc, 1 low-text + 1 normal. pct=50, but pages_emitted < 3.
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(2, 1, true, 50));
+}
+
+test "computeScanFlag — 3-page all-low-text doc with fonts flags" {
+    const got = computeScanFlag(3, 3, true, 50);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("scanned", got.?);
+}
+
+test "computeScanFlag — 3-page mixed below threshold doesn't flag" {
+    // 3 pages, 1 low-text → pct=33 < 50.
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(3, 1, true, 50));
+}
+
+test "computeScanFlag — no-fonts never flags (filters fake/empty PDFs)" {
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(10, 10, false, 50));
+}
+
+test "computeScanFlag — custom threshold of 30 flags 33% scanned" {
+    const got = computeScanFlag(3, 1, true, 30);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("scanned", got.?);
+}
+
+test "computeScanFlag — pages_emitted = 0 never flags" {
+    try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(0, 0, true, 50));
 }
 
 test "parse rejects --max-tokens 0" {
