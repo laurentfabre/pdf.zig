@@ -744,12 +744,12 @@ pub fn main() !void {
 
     // PR-4c: env_target is referenced inside the per-target loop
     // below, AFTER each target's iter loop has called
-    // `arena.reset(.retain_capacity)` (line 824). If allocated from
-    // arena_alloc the reset would invalidate the string and the
-    // next `mem.eql(u8, f, target.name)` comparison would segfault
-    // with `target_filter` pointing at reused arena memory. Allocate
-    // from page_allocator so the slice survives every reset; we
-    // free it at end-of-main.
+    // `arena.reset(.retain_capacity)`. If allocated from arena_alloc
+    // the reset would invalidate the string and the next
+    // `mem.eql(u8, f, target.name)` comparison would segfault with
+    // `target_filter` pointing at reused arena memory. Allocate from
+    // page_allocator so the slice survives every reset; we free it
+    // at end-of-main.
     const env_target = std.process.getEnvVarOwned(std.heap.page_allocator, "PDFZIG_FUZZ_TARGET") catch null;
     defer if (env_target) |s| std.heap.page_allocator.free(s);
     const target_filter = env_target;
