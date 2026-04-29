@@ -3,11 +3,12 @@
 //! Creates minimal valid PDFs for testing the parser.
 //! Hand-crafted bodies migrated to the writer API cluster-by-cluster
 //! (PR-W6.1+). Migrated so far: text-only (W6.1) + metadata + /Outlines
-//! (W6.2) + /Annots links (W6.3) + AcroForm fields (W6.4). Fixtures
-//! still hand-rolled: /PageLabels, plus the intentionally-malformed
-//! /specialized fixtures (CID font, incremental update, encrypted,
-//! Form XObject malformed-resources variants). Each future cluster
-//! gets its own ≤1-day PR.
+//! (W6.2) + /Annots links (W6.3) + AcroForm fields (W6.4) + /PageLabels
+//! (W6.5) — all the standard fixtures. Remaining hand-rolled bodies are
+//! intentionally-malformed/specialized: CID font, incremental update,
+//! encrypted, Form XObject malformed-resources variants, image XObject,
+//! tagged-table fixtures. Those stay hand-rolled by design (the writer
+//! intentionally produces well-formed PDFs).
 
 const std = @import("std");
 const document = @import("pdf_document.zig");
@@ -585,71 +586,23 @@ pub fn generateFormFieldPdf(allocator: std.mem.Allocator) ![]u8 {
     return doc.write();
 }
 
-/// Generate a PDF with page labels
+/// PR-W6.5 [refactor]: page-labels fixture via DocumentBuilder.
+/// 3 pages: indices 0..1 labelled with lowercase roman (`/S /r`),
+/// index 2+ labelled with decimal (`/S /D`). Number tree is direct
+/// (no aux objects) so a single `setCatalogExtras` call carries it.
 pub fn generatePageLabelPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    const labels = [_][]const u8{ "Page i", "Page ii", "Page 1" };
+    for (labels) |text| {
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(100, 700, .helvetica, 12, text);
+    }
 
-    // Catalog with PageLabels: pages 0-1 roman lowercase, pages 2+ decimal
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R ");
-    try writer.writeAll("/PageLabels << /Nums [0 << /S /r >> 2 << /S /D >>] >> >>\nendobj\n");
+    try doc.setCatalogExtras("/PageLabels << /Nums [0 << /S /r >> 2 << /S /D >>] >>");
 
-    // 3 pages
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R 8 0 R] /Count 3 >>\nendobj\n");
-
-    // Page 1
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    const c1 = "BT\n/F1 12 Tf\n100 700 Td\n(Page i) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ c1.len, c1 });
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Page 2
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 7 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    const c2 = "BT\n/F1 12 Tf\n100 700 Td\n(Page ii) Tj\nET\n";
-    const obj7_offset = pdf.items.len;
-    try writer.print("7 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ c2.len, c2 });
-
-    // Page 3
-    const obj8_offset = pdf.items.len;
-    try writer.writeAll("8 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 9 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    const c3 = "BT\n/F1 12 Tf\n100 700 Td\n(Page 1) Tj\nET\n";
-    const obj9_offset = pdf.items.len;
-    try writer.print("9 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ c3.len, c3 });
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 10\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
-
-    try writer.writeAll("trailer\n<< /Size 10 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 test "generate metadata PDF" {
@@ -804,78 +757,27 @@ pub fn generateAllFormFieldsPdf(allocator: std.mem.Allocator) ![]u8 {
     return doc.write();
 }
 
-/// Generate a PDF with page labels: uppercase roman, alpha, prefix, custom start
+/// PR-W6.5 [refactor]: extended page-labels fixture via DocumentBuilder.
+/// 5 pages exercising 3 number-tree ranges:
+///   indices 0..1 → uppercase roman (`/S /R`)
+///   index 2     → alpha lowercase  (`/S /a`)
+///   indices 3+  → decimal with prefix "App-" starting at 1
+///                 (`/S /D /P (App-) /St 1`)
 pub fn generateExtendedPageLabelPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
-
-    // Pages 0-1: uppercase roman (I, II)
-    // Page 2: alpha lowercase starting at 1 (a)
-    // Pages 3+: decimal with prefix "App-" starting at 1 (App-1)
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R ");
-    try writer.writeAll("/PageLabels << /Nums [0 << /S /R >> 2 << /S /a >> 3 << /S /D /P (App-) /St 1 >>] >> >>\nendobj\n");
-
-    // 5 pages
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R 8 0 R 10 0 R 12 0 R] /Count 5 >>\nendobj\n");
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Generate 5 pages (objects 3,4, 6,7, 8,9, 10,11, 12,13)
     const page_texts = [_][]const u8{ "Page I", "Page II", "Page a", "App Page 1", "App Page 2" };
-    var page_offsets: [10]u64 = undefined; // pairs of (page_obj, content_obj)
-    for (0..5) |pg| {
-        const page_obj_num = 3 + pg * 2;
-        const content_obj_num = page_obj_num + 1;
-        if (page_obj_num == 5) {
-            // Skip obj 5 (font) — already written. Adjust numbering.
-            // Actually our numbering is 3,4, 6,7, 8,9, 10,11, 12,13 — no collision with 5.
-        }
-
-        page_offsets[pg * 2] = pdf.items.len;
-        try writer.print("{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ", .{page_obj_num});
-        try writer.print("/Contents {} 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n", .{content_obj_num});
-
-        var content: std.ArrayList(u8) = .empty;
-        defer content.deinit(allocator);
-        var cw = content.writer(allocator);
-        try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n");
-        try cw.print("({s}) Tj\n", .{page_texts[pg]});
-        try cw.writeAll("ET\n");
-
-        page_offsets[pg * 2 + 1] = pdf.items.len;
-        try writer.print("{} 0 obj\n<< /Length {} >>\nstream\n", .{ content_obj_num, content.items.len });
-        try writer.writeAll(content.items);
-        try writer.writeAll("\nendstream\nendobj\n");
+    for (page_texts) |text| {
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(100, 700, .helvetica, 12, text);
     }
 
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 14\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[0]}); // obj 3
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[1]}); // obj 4
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset}); // obj 5
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[2]}); // obj 6
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[3]}); // obj 7
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[4]}); // obj 8
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[5]}); // obj 9
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[6]}); // obj 10
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[7]}); // obj 11
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[8]}); // obj 12
-    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[9]}); // obj 13
+    try doc.setCatalogExtras(
+        "/PageLabels << /Nums [0 << /S /R >> 2 << /S /a >> 3 << /S /D /P (App-) /St 1 >>] >>",
+    );
 
-    try writer.writeAll("trailer\n<< /Size 14 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// Generate a PDF with an XObject image on the page
