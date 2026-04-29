@@ -1899,7 +1899,11 @@ pub const Document = struct {
 
             const op = token.operator;
             if (op.len > 0) {
-                if (std.mem.eql(u8, op, "cm") and operand_count >= 6) {
+                if (std.mem.eql(u8, op, "cm") and operand_count >= 6 and
+                    operands[0] == .number and operands[1] == .number and
+                    operands[2] == .number and operands[3] == .number and
+                    operands[4] == .number and operands[5] == .number)
+                {
                     // Concatenate matrix
                     const new: [6]f64 = .{
                         operands[0].number, operands[1].number,
@@ -2465,7 +2469,14 @@ fn extractContentStream(
                         }
                     }
                 },
-                'd', 'D' => if (operand_count >= 2) {
+                'd', 'D' => if (operand_count >= 2 and
+                    operands[0] == .number and operands[1] == .number)
+                {
+                    // PDF spec: `Td` / `TD` take two numeric operands (tx, ty).
+                    // Corrupt streams that put non-numbers here used to panic
+                    // via direct `.number` access; skip the operator so the
+                    // text position simply doesn't move (graceful degradation
+                    // matching the PR-3 [fuzz] pattern on `Tf`).
                     switch (mode) {
                         .stream => {
                             const wmode = if (current_font) |f| f.wmode else 0;
@@ -2488,7 +2499,14 @@ fn extractContentStream(
                         .structured => {},
                     }
                 },
-                'm' => if (operand_count >= 6) {
+                'm' => if (operand_count >= 6 and
+                    operands[4] == .number and operands[5] == .number)
+                {
+                    // PDF spec: `Tm` takes six numeric operands (a b c d e f),
+                    // a 2×3 matrix; we only consume e/f (translation) here.
+                    // Tag-check those two indices so a corrupt stream with a
+                    // non-number at [4] or [5] skips the operator instead of
+                    // panicking on `.number` access.
                     switch (mode) {
                         .stream => {
                             const wmode = if (current_font) |f| f.wmode else 0;
