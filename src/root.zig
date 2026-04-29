@@ -181,6 +181,22 @@ pub const Document = struct {
     }
 
     /// Open from owned memory (will be freed on close via munmap)
+    /// PR-9 [refactor]: clean up partial Document state on parseDocument
+    /// failure. Mirrors `close()`'s field-level deinit so the errdefer
+    /// in the three open* paths can roll back hashmap/arena/list growth
+    /// instead of leaking ~432B per failed open (Findings 001-003).
+    /// Does NOT touch `data` ownership (caller's contract) or
+    /// `cached_reading_order` (set lazily after open succeeds).
+    fn deinitPartial(self: *Document) void {
+        self.parsing_arena.deinit();
+        self.xref_table.deinit();
+        self.object_cache.deinit();
+        self.errors.deinit(self.allocator);
+        self.pages.deinit(self.allocator);
+        self.font_cache.deinit();
+        self.font_obj_cache.deinit();
+    }
+
     fn openFromMemoryOwned(allocator: std.mem.Allocator, data: []align(std.heap.page_size_min) u8, config: ErrorConfig) !*Document {
         if (comptime is_wasm) {
             @compileError("openFromMemoryOwned is not available on WASM. Use openFromMemory instead.");
@@ -203,6 +219,7 @@ pub const Document = struct {
             .font_cache = std.StringHashMap(encoding.FontEncoding).init(allocator),
             .font_obj_cache = std.AutoHashMap(u32, encoding.FontEncoding).init(allocator),
         };
+        errdefer doc.deinitPartial();
 
         try doc.parseDocument();
         return doc;
@@ -227,6 +244,7 @@ pub const Document = struct {
             .font_cache = std.StringHashMap(encoding.FontEncoding).init(allocator),
             .font_obj_cache = std.AutoHashMap(u32, encoding.FontEncoding).init(allocator),
         };
+        errdefer doc.deinitPartial();
 
         try doc.parseDocument();
         return doc;
@@ -252,6 +270,7 @@ pub const Document = struct {
             .font_cache = std.StringHashMap(encoding.FontEncoding).init(allocator),
             .font_obj_cache = std.AutoHashMap(u32, encoding.FontEncoding).init(allocator),
         };
+        errdefer doc.deinitPartial();
 
         try doc.parseDocument();
         return doc;
@@ -558,7 +577,12 @@ pub const Document = struct {
             &self.xref_table,
             page,
             &self.object_cache,
-        ) catch return &.{};
+        ) catch |err| blk: {
+            // PR-9 [refactor]: bubble OOM; soft-fail only on domain errors
+            // (mirrors getTables' Pass B/C convention).
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            break :blk &[_]u8{};
+        };
 
         if (content.len == 0) return &.{};
 

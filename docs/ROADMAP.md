@@ -193,7 +193,7 @@ updated: 2026-04-27
   > **Test strategy.** `bench/bench.zig` regression check + corpus run + gold-set re-eval.
   > **Codex gate.** Early-out doesn't trigger on edge cases (single-row tables, 2-column tables); no perf regression on PDFs with strokes-but-no-table.
 
-- [ ] **PR-9 · refactor: strict-mode `checkAllAllocationFailures`**
+- [x] **PR-9 · refactor: strict-mode `checkAllAllocationFailures`**
   > [!info]- Details
   > **Why.** `[[PROJECT-LOG#🛡️ Defensive-programming alignment]]` §3.4 (currently shape-level — leak-shape asserted, not fixed).
   > **Files-touched envelope.** `src/alloc_failure_test.zig` (primary), `audit/fuzz_findings.md` (close findings 001–003), upstream `src/parser.zig` / `src/root.zig` (`errdefer` fixes — IF needed).

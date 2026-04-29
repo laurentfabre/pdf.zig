@@ -4,7 +4,7 @@
 
 ---
 
-## Finding 001 — `Document.openFromMemory` leaks under partial OOM
+## Finding 001 — `Document.openFromMemory` leaks under partial OOM (RESOLVED in PR-9)
 
 **Path**: `src/root.zig::Document.openFromMemory` → `parseDocument` → `xref_table`/`object_cache`/`font_cache` initialisation
 **Surfaced by**: `src/alloc_failure_test.zig::checkAllAllocationFailures — Document.openFromMemory`
@@ -26,7 +26,7 @@ When the third allocation (a `hash_map.allocate` → `grow` call inside the xref
 
 ---
 
-## Finding 002 — `Document.extractMarkdown` leaks under partial OOM
+## Finding 002 — `Document.extractMarkdown` leaks under partial OOM (RESOLVED in PR-9)
 
 **Path**: `src/root.zig::Document.extractMarkdown` → `extractTextWithBounds` → `MarkdownRenderer.render`
 **Surfaced by**: `src/alloc_failure_test.zig::checkAllAllocationFailures — Document.extractMarkdown`
@@ -40,7 +40,7 @@ Pattern matches Finding 001 — partial state from an earlier success in the cal
 
 ---
 
-## Finding 003 — `Document.metadata` leaks under partial OOM
+## Finding 003 — `Document.metadata` leaks under partial OOM (RESOLVED in PR-9)
 
 **Path**: `src/root.zig::Document.metadata` (called against an open Document)
 **Surfaced by**: `src/alloc_failure_test.zig::checkAllAllocationFailures — Document.metadata`
