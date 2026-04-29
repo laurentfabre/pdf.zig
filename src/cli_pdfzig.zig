@@ -54,10 +54,19 @@ pub const InfoArgs = struct {
     as_json: bool = false,
 };
 
+pub const NewArgs = struct {
+    /// Path to write the PDF to (required — binary stdout would
+    /// surprise pipelines).
+    output_path: []const u8,
+    /// Markdown source. `-` reads stdin; otherwise it's a file path.
+    input: []const u8 = "-",
+};
+
 pub const Command = union(enum) {
     extract: ExtractArgs,
     info: InfoArgs,
     chunk: ExtractArgs, // alias for extract with output_mode = .chunks
+    new: NewArgs,
     help,
     version,
 };
@@ -91,8 +100,33 @@ pub fn parseArgs(args: []const []const u8) ArgError!Command {
         return .{ .chunk = ea };
     }
     if (std.mem.eql(u8, sub, "info")) return .{ .info = try parseInfo(args[1..]) };
+    if (std.mem.eql(u8, sub, "new")) return .{ .new = try parseNew(args[1..]) };
 
     return error.UnknownSubcommand;
+}
+
+fn parseNew(args: []const []const u8) ArgError!NewArgs {
+    var out = NewArgs{ .output_path = "" };
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output-file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            out.output_path = args[i];
+        } else if (std.mem.eql(u8, a, "-i") or std.mem.eql(u8, a, "--input")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            out.input = args[i];
+        } else if (a.len > 1 and (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-")) and !std.mem.eql(u8, a, "-")) {
+            return error.UnknownFlag;
+        } else {
+            // Positional: treat as input file.
+            out.input = a;
+        }
+    }
+    if (out.output_path.len == 0) return error.MissingInput;
+    return out;
 }
 
 fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
@@ -225,6 +259,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !ExitCode {
         .extract => |ea| try runExtract(allocator, ea),
         .chunk => |ea| try runExtract(allocator, ea),
         .info => |ia| try runInfo(allocator, ia),
+        .new => |na| try runNew(allocator, na),
     };
 }
 
@@ -793,6 +828,56 @@ fn writeArgError(err: ArgError) !void {
     try w.print("{s}\n", .{msg});
 }
 
+/// PR-W5 [feat]: read markdown from stdin or a file, render via
+/// `markdown_to_pdf`, write the result to `args.output_path`.
+fn runNew(allocator: std.mem.Allocator, args: NewArgs) !ExitCode {
+    const markdown_to_pdf = @import("markdown_to_pdf.zig");
+
+    // Read input source.
+    const md_bytes = if (std.mem.eql(u8, args.input, "-"))
+        readStdinAlloc(allocator) catch |err| {
+            var serr_buf: [256]u8 = undefined;
+            var sbw = std.fs.File.stderr().writer(&serr_buf);
+            const sw = &sbw.interface;
+            sw.print("pdf.zig: cannot read stdin: {s}\n", .{@errorName(err)}) catch {};
+            sw.flush() catch {};
+            return .io_error;
+        }
+    else
+        std.fs.cwd().readFileAlloc(allocator, args.input, 32 * 1024 * 1024) catch |err| {
+            var serr_buf: [256]u8 = undefined;
+            var sbw = std.fs.File.stderr().writer(&serr_buf);
+            const sw = &sbw.interface;
+            sw.print("pdf.zig: cannot read {s}: {s}\n", .{ args.input, @errorName(err) }) catch {};
+            sw.flush() catch {};
+            return .io_error;
+        };
+    defer allocator.free(md_bytes);
+
+    const pdf_bytes = try markdown_to_pdf.render(allocator, md_bytes);
+    defer allocator.free(pdf_bytes);
+
+    const out_file = std.fs.cwd().createFile(args.output_path, .{ .truncate = true }) catch |err| {
+        var serr_buf: [256]u8 = undefined;
+        var sbw = std.fs.File.stderr().writer(&serr_buf);
+        const sw = &sbw.interface;
+        sw.print("pdf.zig: cannot create {s}: {s}\n", .{ args.output_path, @errorName(err) }) catch {};
+        sw.flush() catch {};
+        return .io_error;
+    };
+    defer out_file.close();
+
+    out_file.writeAll(pdf_bytes) catch |err| {
+        var serr_buf: [256]u8 = undefined;
+        var sbw = std.fs.File.stderr().writer(&serr_buf);
+        const sw = &sbw.interface;
+        sw.print("pdf.zig: write failed for {s}: {s}\n", .{ args.output_path, @errorName(err) }) catch {};
+        sw.flush() catch {};
+        return .io_error;
+    };
+    return .ok;
+}
+
 fn writeHelp() !void {
     var buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&buf);
@@ -808,6 +893,7 @@ fn writeHelp() !void {
         \\  chunk <file> --max-tokens N alias for `extract --output chunks`
         \\  info <file>                 print pretty metadata
         \\  info --json <file>          single `meta` NDJSON record
+        \\  new -o FILE [INPUT.md|-]    render markdown into a new PDF
         \\  --version                   print version and exit
         \\  --help                      this message
         \\
@@ -819,6 +905,10 @@ fn writeHelp() !void {
         \\  --no-toc                    suppress `toc` record (NDJSON only)
         \\  --no-warnings               suppress `warnings` array on page records
         \\  --scan-threshold PCT        flag doc as "scanned" when ≥PCT% of pages have <50B text (default 50)
+        \\
+        \\New options:
+        \\  -o, --output-file FILE      output PDF path (required)
+        \\  -i, --input FILE            markdown source file (default: stdin via "-")
         \\
         \\Examples:
         \\  pdf.zig extract hotel.pdf
@@ -963,6 +1053,33 @@ test "findH1Heading — H1 after H2 is found" {
     const got = findH1Heading("## skip me\n# Real Section\n");
     try std.testing.expect(got != null);
     try std.testing.expectEqualStrings("Real Section", got.?);
+}
+
+// PR-W5 [feat]: parseNew tests.
+test "parse new: requires --output-file" {
+    try std.testing.expectError(error.MissingInput, parseArgs(&.{ "new", "-" }));
+}
+
+test "parse new: -o / --output-file accepted" {
+    const cmd = try parseArgs(&.{ "new", "-o", "out.pdf" });
+    try std.testing.expect(cmd == .new);
+    try std.testing.expectEqualStrings("out.pdf", cmd.new.output_path);
+    // Default input is stdin "-".
+    try std.testing.expectEqualStrings("-", cmd.new.input);
+}
+
+test "parse new: input file as positional" {
+    const cmd = try parseArgs(&.{ "new", "-o", "out.pdf", "doc.md" });
+    try std.testing.expectEqualStrings("doc.md", cmd.new.input);
+}
+
+test "parse new: -i / --input flag" {
+    const cmd = try parseArgs(&.{ "new", "-o", "out.pdf", "-i", "doc.md" });
+    try std.testing.expectEqualStrings("doc.md", cmd.new.input);
+}
+
+test "parse new: rejects unknown flag" {
+    try std.testing.expectError(error.UnknownFlag, parseArgs(&.{ "new", "--bogus" }));
 }
 
 test "parse rejects --max-tokens 0" {

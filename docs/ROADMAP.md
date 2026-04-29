@@ -435,7 +435,7 @@ updated: 2026-04-27
   > **Codex gate.** No off-by-one in length-after-compression; `/Length` reflects compressed bytes; `/DL` field if predictor used (tier-1: no predictor).
   > **Workaround.** Tier-1 emits raw uncompressed content streams. Files are 4-5× larger than necessary but readable by every PDF viewer; the existing `decompress.zig` already handles compressed streams from third-party PDFs without issue.
 
-- [ ] **PR-W5 · feat: `pdf.zig new` CLI subcommand (markdown → PDF)**
+- [x] **PR-W5 · feat: `pdf.zig new` CLI subcommand (markdown → PDF)**
   > [!info]- Details
   > **Why.** Surfaces the writer to end users. Reads markdown from stdin or a file, emits a basic PDF with paragraphs and H1/H2 headings.
   > **Files-touched envelope.** `src/cli_pdfzig.zig` (new `new` subcommand + `parseNew` arg parser), `src/markdown_to_pdf.zig` (new, ~300 LOC), `src/integration_test.zig`, README.md.
