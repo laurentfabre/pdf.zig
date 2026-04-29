@@ -180,7 +180,7 @@ updated: 2026-04-27
   > **Test strategy.** New harness + 5-cell currency-format unit test in `src/stream_table.zig`.
   > **Codex gate.** Regex isn't over-permissive; IBM mirror URL freshness.
 
-- [ ] **PR-8 · perf: Pass B+C early-out for table-free pages**
+- [x] **PR-8 · perf: Pass B+C early-out for table-free pages**
   > [!info]- Details
   > **Why.** `[[PROJECT-LOG#🗺️ Roadmap]]` v1.2 GA performance regression — pdf.zig 2.2 s vs upstream zpdf 1.3 s on n=40.
   > **Files-touched envelope.** `src/tables.zig::getTables` (dispatcher), `src/lattice.zig::collectStrokes` (early-out), `src/stream_table.zig::collectAnchors` (early-out), `bench/bench.zig`.
