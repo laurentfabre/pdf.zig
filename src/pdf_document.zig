@@ -548,13 +548,24 @@ const TreeAssert = struct {
         return .{ .kind = kind, .parent = parent, .count = count, .kids = kids };
     }
 
+    /// codex r4 P3: strictly parse `key<space>N<space>0<space>R`.
+    /// Anything else (missing `0`, missing `R`, gen != 0, trailing
+    /// junk) returns MalformedRef.
     fn parseOptionalRef(body: []const u8, key: []const u8) !?u32 {
         const idx = std.mem.indexOf(u8, body, key) orelse return null;
-        const p = idx + key.len;
-        var n_end = p;
+        const start = idx + key.len;
+        var n_end = start;
         while (n_end < body.len and std.ascii.isDigit(body[n_end])) n_end += 1;
-        if (n_end == p) return null;
-        return try std.fmt.parseInt(u32, body[p..n_end], 10);
+        if (n_end == start) return error.MalformedRef;
+        if (n_end + 4 > body.len) return error.MalformedRef;
+        if (body[n_end] != ' ' or
+            body[n_end + 1] != '0' or
+            body[n_end + 2] != ' ' or
+            body[n_end + 3] != 'R')
+        {
+            return error.MalformedRef;
+        }
+        return try std.fmt.parseInt(u32, body[start..n_end], 10);
     }
 
     fn parseOptionalInt(body: []const u8, key: []const u8) !?u32 {
@@ -594,8 +605,19 @@ const TreeAssert = struct {
             {
                 return error.MalformedKids;
             }
+            // codex r4 P3: after `R`, require either whitespace
+            // (more refs follow) or the closing `]`. Without this,
+            // adjacent refs like `1 0 R2 0 R` would parse as
+            // `[1, 2]`.
+            const after_r = num_end + 4;
+            if (after_r < close) {
+                const c = body[after_r];
+                if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
+                    return error.MalformedKids;
+                }
+            }
             try out.append(allocator, n);
-            cursor = num_end + 4;
+            cursor = after_r;
         }
         return out.toOwnedSlice(allocator);
     }
