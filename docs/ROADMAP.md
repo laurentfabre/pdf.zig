@@ -109,7 +109,7 @@ updated: 2026-04-27
   > **Test strategy.** Reuse the rc3 `buildCellsWithText` test pattern.
   > **Codex gate.** Glyph-center vs glyph-bbox-overlap policy consistent with Pass C.
 
-- [ ] **PR-4b · fix: stream_table.zig leak/double-free shapes mirroring PR-4 lattice fixes**
+- [x] **PR-4b · fix: stream_table.zig leak/double-free shapes mirroring PR-4 lattice fixes**
   > [!info]- Details
   > **Why.** Codex review on PR-4 round 2 [P2] flagged that `stream_table.extractFromSpans` carries the same three leak/double-free shapes that PR-4 fixed in `lattice.zig`: outer errdefer frees only `t.cells` (not per-cell `text`); `buildCellsWithText` has the partial-success `toOwnedSlice` leak shape; `try out.append` can fail after `cells` has been built but before ownership reaches `out`. Out of PR-4's diff scope.
   > **Files-touched envelope.** `src/stream_table.zig` (errdefer + ownership-flag mirror of PR-4).
@@ -132,7 +132,7 @@ updated: 2026-04-27
   >
   > **Test strategy.** Bump bound + observe no panic + no leak.
 
-- [ ] **PR-4c · fix: fuzz harness target_filter UAF + check arena reset/seed lifetimes**
+- [x] **PR-4c · fix: fuzz harness target_filter UAF + check arena reset/seed lifetimes**
   > [!info]- Details
   > **Why.** Discovered while extending the fuzz harness for PR-4: `target_filter` is allocated from `arena_alloc` but the in-target loop calls `arena.reset(.retain_capacity)` every 4096 iters, leaving `target_filter` dangling. Crashes the harness at `mem.eql(u8, f, target.name)` when `PDFZIG_FUZZ_TARGET` is set and the target is fast enough that reset fires inside its iter loop.
   > **Files-touched envelope.** `src/fuzz_runner.zig` (allocate `env_target` from `page_allocator`).
