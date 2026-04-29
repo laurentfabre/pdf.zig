@@ -1346,7 +1346,7 @@ test "extractFromStrokes survives every allocation failure index" {
     };
 
     var fail_index: usize = 0;
-    while (fail_index < 64) : (fail_index += 1) {
+    while (fail_index < 128) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         const result = extractFromStrokes(failing.allocator(), &strokes, 1, &spans);
         if (result) |out| {
