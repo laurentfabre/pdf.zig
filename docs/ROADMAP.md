@@ -117,7 +117,7 @@ updated: 2026-04-27
   > - `extractFromSpans` outer errdefer frees per-cell `text` before `t.cells`.
   > - `buildCellsWithText` has `cells_initialised` errdefer cleanup.
   > - `cells_owned` flag guards `out.append`.
-  > - New FailingAllocator unit test for `extractFromSpans` exercises every alloc-failure index.
+  > - New FailingAllocator unit test for `extractFromSpans` covers the early alloc-failure indices (0..15) for all five fixed surfaces. The full 0..127 sweep is gated on PR-4d (separate `buildCellsWithText` `bufs.deinit` issue) — see PR-4d entry.
   >
   > **Test strategy.** Mirror `lattice.zig` "extractFromStrokes survives every allocation failure index".
   > **Codex gate.** Verify R5 P2 finding from PR-4 round-2 review is fully resolved.
