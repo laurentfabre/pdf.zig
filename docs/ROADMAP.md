@@ -459,13 +459,18 @@ updated: 2026-04-27
   > **Test strategy.** 7 new tests cover the escape-hatch surface end-to-end (info round-trip, catalog ref splice, page extras, single-use guard, cyclic aux refs, unknown-aux rejection).
   > **Codex gate.** Cleared rc2 (Medium reserve/set + 3 Low all addressed).
 
-- [ ] **PR-W6.1+ · refactor: convert `testpdf.zig` fixtures cluster-by-cluster**
+- [x] **PR-W6.1–W6.5 · refactor: convert `testpdf.zig` standard fixtures cluster-by-cluster** (#20–#24)
   > [!info]- Details
-  > **Why.** With the W6 foundation in place, fixture clusters can be migrated in isolation: text-only (Minimal, MultiPage, TJ, Superscript), metadata, outline, link, page-label, form-field. Each cluster is its own ≤1-day PR.
-  > **Acceptance gate per cluster.**
-  > - Byte-different but semantically-equivalent (same pageCount, extractable text, font refs).
-  > - All tests still pass.
-  > **Codex gate.** Intentionally-malformed fixtures (e.g. `generatePdfWithoutPageType`) stay hand-rolled with documented reason.
+  > Five per-cluster PRs migrated all standard fixtures to the writer API:
+  > - W6.1 (#20): text-only — Minimal, MultiPage, TJ, Superscript
+  > - W6.2 (#21): metadata + outlines — Metadata, Outline, NestedOutline, Utf16Be
+  > - W6.3 (#22): link annotations — Link, MultiLink
+  > - W6.4 (#23): AcroForm fields — FormField, AllFormFields
+  > - W6.5 (#24): page labels — PageLabel, ExtendedPageLabel
+  >
+  > **Net delta:** ~−495 lines on `testpdf.zig` across the 13 migrated fixtures. Output is byte-different from the old hand-rolled bytes but semantically equivalent (same pageCount, font refs, extractable text, metadata/outline/annot/form/page-label structure). 1133/1133 tests pass.
+  >
+  > **Intentionally still hand-rolled** (the writer is for well-formed PDFs by design): CID font (Type0 composite), incremental update, encrypted, Form XObject malformed-resources variants, image XObject, tagged-table fixtures, generatePdfWithoutPageType.
 
 ---
 
