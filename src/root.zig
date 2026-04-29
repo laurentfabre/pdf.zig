@@ -176,6 +176,11 @@ pub const Document = struct {
                 file.handle,
                 0,
             );
+            // PR-9 [refactor]: codex r1 P1 — if openFromMemoryOwned
+            // fails (allocator.create or parseDocument), the mmapped
+            // region must be unmapped here. Mirrors the Windows path
+            // which has `errdefer allocator.free(data)` above.
+            errdefer std.posix.munmap(data);
             return openFromMemoryOwned(allocator, data, config);
         }
     }

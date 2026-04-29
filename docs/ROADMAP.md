@@ -132,6 +132,16 @@ updated: 2026-04-27
   >
   > **Test strategy.** Bump bound + observe no panic + no leak.
 
+- [ ] **PR-9b · fix: ContentLexer OOM swallowing in scanString/scanHexString**
+  > [!info]- Details
+  > **Why.** Codex review on PR-9 round 1 [P2] flagged that `ContentLexer.next` calls non-erroring `scanString` / `scanHexString` which themselves use `appendByte` / `finalizeBuf` that swallow OOM with `catch {}` and `catch &.{}`. Leak-clean under the scratch arena, but silently drops text on allocator pressure — a correctness concern, not a leak.
+  > **Files-touched envelope.** `src/interpreter.zig` (ContentLexer + helpers + scan* signature change).
+  > **Acceptance gate.**
+  > - `appendByte` / `finalizeBuf` propagate OOM instead of swallowing.
+  > - `scanString` / `scanHexString` change return type to `![]const u8`.
+  > - `ContentLexer.next` propagates lexer OOM up its caller chain.
+  > - 407/407 tests stay green.
+
 - [x] **PR-4c · fix: fuzz harness target_filter UAF + check arena reset/seed lifetimes**
   > [!info]- Details
   > **Why.** Discovered while extending the fuzz harness for PR-4: `target_filter` is allocated from `arena_alloc` but the in-target loop calls `arena.reset(.retain_capacity)` every 4096 iters, leaving `target_filter` dangling. Crashes the harness at `mem.eql(u8, f, target.name)` when `PDFZIG_FUZZ_TARGET` is set and the target is fast enough that reset fires inside its iter loop.
