@@ -311,7 +311,7 @@ updated: 2026-04-27
   > **Test strategy.** Two fixtures, integration test, char-level diff vs pymupdf4llm reference.
   > **Codex gate.** UAX #9 conformance against public test suite (`BidiTest.txt`); digit handling (Arabic-Indic vs European). **Highest-complexity PR in the roadmap.**
 
-- [ ] **PR-17 · feat: `kind:"section"` long-PDF checkpoint records**
+- [x] **PR-17 · feat: `kind:"section"` long-PDF checkpoint records**
   > [!info]- Details
   > **Why.** Codex minor #9 in `[[week7-ga-audit]]`.
   > **Files-touched envelope.** `src/stream.zig` (new record kind), `src/cli_pdfzig.zig` (emission), `src/integration_test.zig`.

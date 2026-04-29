@@ -172,6 +172,23 @@ fn parseOutputMode(s: []const u8) !OutputMode {
     return error.InvalidOutputMode;
 }
 
+/// PR-17 [feat]: scan a single page's markdown for an H1 heading
+/// (`# ` prefix). Returns the title text (without `# ` prefix and
+/// trailing whitespace) or null if no H1 line exists. Skips H2+ —
+/// they're too granular to use as section boundaries.
+pub fn findH1Heading(md: []const u8) ?[]const u8 {
+    var iter = std.mem.splitScalar(u8, md, '\n');
+    while (iter.next()) |line| {
+        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "# ")) continue;
+        if (std.mem.startsWith(u8, trimmed, "## ")) continue; // skip H2+
+        const title = std.mem.trim(u8, trimmed[2..], " \t\r");
+        if (title.len == 0) continue;
+        return title;
+    }
+    return null;
+}
+
 /// PR-11 [feat]: scanned-PDF heuristic. Returns `"scanned"` when:
 ///   - pages_emitted ≥ 3 (avoids 1-2 page false positives — codex r1 F1)
 ///   - the document has at least one font
@@ -381,6 +398,19 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     var scanned_pages: u32 = 0;
     const SCAN_LOW_BYTES: usize = 50;
 
+    // PR-17 [feat]: section-checkpoint state. We keep the current
+    // open section's title (heap-owned, freed when the section is
+    // emitted) plus its start_page. When we encounter a new H1
+    // heading on a page, the previous section is emitted with
+    // end_page = current_page - 1 and the new section is opened.
+    // After the page loop completes, the still-open final section
+    // is emitted with end_page = last_page_emitted.
+    var section_id: u32 = 0;
+    var current_section_title: ?[]u8 = null;
+    var current_section_start: u32 = 0;
+    var last_page_seen: u32 = 0;
+    defer if (current_section_title) |t| allocator.free(t);
+
     var collected = std.ArrayList(chunk.Page).empty;
     defer {
         for (collected.items) |p| allocator.free(p.markdown);
@@ -439,7 +469,32 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
         bytes_emitted += md.len;
         pages_emitted += 1;
+        last_page_seen = @intCast(page_idx + 1);
         if (md.len < SCAN_LOW_BYTES) scanned_pages += 1;
+
+        // PR-17 [feat]: section-checkpoint detection. If the current
+        // page's markdown opens with an H1 heading, close the
+        // previous section (if any) and open a new one. NDJSON-only
+        // emission — other output modes don't speak record kinds.
+        if (args.output_mode == .ndjson) {
+            if (findH1Heading(md)) |h1| {
+                const new_page: u32 = @intCast(page_idx + 1);
+                if (current_section_title) |old_title| {
+                    env.emitSection(section_id, old_title, current_section_start, new_page - 1) catch |e| {
+                        allocator.free(md);
+                        return mapWriteErr(e);
+                    };
+                    allocator.free(old_title);
+                    section_id += 1;
+                    current_section_title = null;
+                }
+                current_section_title = allocator.dupe(u8, h1) catch |e| {
+                    allocator.free(md);
+                    return mapWriteErr(e);
+                };
+                current_section_start = new_page;
+            }
+        }
 
         switch (args.output_mode) {
             .ndjson => {
@@ -500,6 +555,12 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     }
 
     if (args.output_mode == .ndjson) {
+        // PR-17 [feat]: emit the still-open final section.
+        if (current_section_title) |title| {
+            env.emitSection(section_id, title, current_section_start, last_page_seen) catch |e| return mapWriteErr(e);
+            allocator.free(title);
+            current_section_title = null;
+        }
         const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - t_start);
         // PR-11 [feat]: scanned-PDF heuristic — flag the doc as
         // "scanned" when ≥ scan_threshold% of pages produced under
@@ -841,6 +902,37 @@ test "computeScanFlag — custom threshold of 30 flags 33% scanned" {
 
 test "computeScanFlag — pages_emitted = 0 never flags" {
     try std.testing.expectEqual(@as(?[]const u8, null), computeScanFlag(0, 0, true, 50));
+}
+
+// PR-17 [feat]: H1 heading extraction.
+test "findH1Heading — single H1 line" {
+    const got = findH1Heading("# Introduction\n\nSome body text.");
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("Introduction", got.?);
+}
+
+test "findH1Heading — H1 with leading whitespace" {
+    const got = findH1Heading("  # Chapter 1\n");
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("Chapter 1", got.?);
+}
+
+test "findH1Heading — H2/H3 are skipped" {
+    try std.testing.expectEqual(@as(?[]const u8, null), findH1Heading("## H2 only\n### H3\n"));
+}
+
+test "findH1Heading — body text without heading returns null" {
+    try std.testing.expectEqual(@as(?[]const u8, null), findH1Heading("Just a paragraph with # in the middle.\n"));
+}
+
+test "findH1Heading — empty heading is rejected" {
+    try std.testing.expectEqual(@as(?[]const u8, null), findH1Heading("# \n"));
+}
+
+test "findH1Heading — H1 after H2 is found" {
+    const got = findH1Heading("## skip me\n# Real Section\n");
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("Real Section", got.?);
 }
 
 test "parse rejects --max-tokens 0" {
