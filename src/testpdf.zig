@@ -9,11 +9,13 @@ const std = @import("std");
 const document = @import("pdf_document.zig");
 
 /// PR-W6.1 [refactor]: text-only fixture, now built via DocumentBuilder.
-/// Byte-different from the previous hand-rolled output but
-/// semantically equivalent for printable-ASCII inputs (same pageCount,
-/// font ref, extractable text). Non-ASCII bytes are silently dropped
-/// by `drawText`'s WinAnsi filter, where the old hand-rolled fixture
-/// would have inlined them verbatim.
+/// Byte-different from the previous hand-rolled output, semantically
+/// equivalent for the WinAnsi-printable subset of bytes the existing
+/// callers actually pass (same pageCount, font ref, extractable text).
+/// Bytes outside `[0x20, 0x7e]` are silently dropped by `drawText`'s
+/// WinAnsi filter — the old fixture inlined them verbatim, so seeds
+/// like `"fuzz seed — minimal"` (em dash) lose those code points.
+/// Existing call sites are robust to the dropped bytes.
 pub fn generateMinimalPdf(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var doc = document.DocumentBuilder.init(allocator);
     defer doc.deinit();

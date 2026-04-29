@@ -255,7 +255,7 @@ pub const PageBuilder = struct {
         defer scratch.deinit(self.allocator);
         const ws = scratch.writer(self.allocator);
 
-        try ws.print("BT /F{d} ", .{@intFromEnum(font)});
+        try ws.print("BT {s} ", .{font.resourceName()});
         try writeRealTo(ws, size);
         try ws.writeAll(" Tf ");
         try writeRealTo(ws, x);
@@ -608,8 +608,7 @@ fn emitAutoResources(w: *pdf_writer.Writer, page: *const PageBuilder) !void {
     for (page.fonts_used, 0..) |used, idx| {
         if (!used) continue;
         const font: BuiltinFont = @enumFromInt(idx);
-        try w.writeRaw("/F");
-        try w.writeInt(@intCast(idx));
+        try w.writeRaw(font.resourceName());
         try w.writeRaw(" << /Type /Font /Subtype /Type1 /BaseFont /");
         try w.writeRaw(font.baseFontName());
         if (font.usesWinAnsi()) {
@@ -1473,4 +1472,32 @@ test "PageBuilder.objNum is stable for cross-references" {
     const bytes = try doc.write();
     defer allocator.free(bytes);
     try std.testing.expect(bytes.len > 0);
+}
+
+test "PageBuilder.markFontUsed name matches auto-resources output" {
+    // Codex r1 P3: the font→resource-name mapping appears in
+    // `BuiltinFont.resourceName`, `drawText`, and `emitAutoResources`.
+    // This test pins them together — if any of the three drift, this
+    // test fails before strict-consumer fixtures break in the wild.
+    const allocator = std.testing.allocator;
+    inline for (.{
+        BuiltinFont.helvetica,
+        BuiltinFont.times_bold,
+        BuiltinFont.courier_oblique,
+        BuiltinFont.symbol,
+        BuiltinFont.zapf_dingbats,
+    }) |font| {
+        var doc = DocumentBuilder.init(allocator);
+        defer doc.deinit();
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        const f = page.markFontUsed(font);
+        const bytes = try doc.write();
+        defer allocator.free(bytes);
+
+        // The exact resource name appears in the /Resources/Font dict
+        // body (e.g. `/F0 << /Type /Font ...`).
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "{s} <<", .{f});
+        try std.testing.expect(std.mem.indexOf(u8, bytes, key) != null);
+    }
 }
