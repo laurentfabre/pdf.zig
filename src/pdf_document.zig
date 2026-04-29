@@ -200,7 +200,19 @@ pub const PageBuilder = struct {
                 '(' => try ws.writeAll("\\("),
                 ')' => try ws.writeAll("\\)"),
                 '\\' => try ws.writeAll("\\\\"),
-                else => try ws.writeByte(b),
+                // codex r1 [Low]: PDF literal strings normalise
+                // unescaped CR / CRLF to LF (§7.3.4.2). Octal-escape
+                // control bytes so the Symbol/ZapfDingbats path is
+                // byte-preserving. The WinAnsi-filtered path can't
+                // hit this branch because [0x20, 0x7e] excludes them
+                // anyway, so this is essentially Symbol-only.
+                else => {
+                    if (b < 0x20 or b == 0x7f) {
+                        try ws.print("\\{o:0>3}", .{b});
+                    } else {
+                        try ws.writeByte(b);
+                    }
+                },
             }
         }
         try ws.writeAll(") Tj ET\n");
@@ -388,9 +400,6 @@ const Tree = struct {
     };
 };
 
-/// Release all `Tree`-owned slices: `internal_node_objs`,
-/// `leaf_parent_obj`, the `internal_nodes` slice itself, and each
-/// `internal_nodes[i].kids` sub-slice.
 /// PR-W3 [feat]: synthesise the page's `/Resources` dict from
 /// `fonts_used`. If no fonts were touched, emits `<< >>`.
 fn emitAutoResources(w: *pdf_writer.Writer, page: *const PageBuilder) !void {
@@ -419,6 +428,9 @@ fn emitAutoResources(w: *pdf_writer.Writer, page: *const PageBuilder) !void {
     try w.writeRaw(">> >>");
 }
 
+/// Release all `Tree`-owned slices: `internal_node_objs`,
+/// `leaf_parent_obj`, the `internal_nodes` slice itself, and each
+/// `internal_nodes[i].kids` sub-slice.
 fn freeTree(allocator: std.mem.Allocator, tree: *Tree) void {
     for (tree.internal_nodes) |node| allocator.free(node.kids);
     allocator.free(tree.internal_nodes);
