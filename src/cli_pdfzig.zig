@@ -409,6 +409,12 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     var current_section_title: ?[]u8 = null;
     var current_section_start: u32 = 0;
     var last_page_seen: u32 = 0;
+    // PR-17 codex r1 F2: detect non-monotonic page ranges (e.g.
+    // `--pages 5,1` or `--pages 1,1`). Section semantics depend on
+    // increasing page numbers; if the user picks an out-of-order
+    // subset, disable section emission for this run rather than
+    // emit `end_page < start_page`.
+    var section_emission_enabled = true;
     defer if (current_section_title) |t| allocator.free(t);
 
     var collected = std.ArrayList(chunk.Page).empty;
@@ -423,6 +429,16 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
             try writer.flush();
             return if (sig == std.posix.SIG.TERM) .interrupted_term else .interrupted_int;
         }
+
+        // PR-17 codex r1 F1+F2: maintain `last_page_seen` and
+        // `section_emission_enabled` for every iteration regardless
+        // of whether extractMarkdown later succeeds or fails.
+        // Out-of-order or duplicate page selections (e.g.
+        // `--pages 5,1`) disable section emission so a failed
+        // close doesn't produce `end_page < start_page`.
+        const cur_page: u32 = @intCast(page_idx + 1);
+        if (cur_page <= last_page_seen) section_emission_enabled = false;
+        last_page_seen = cur_page;
 
         // .text mode streams plain text via the upstream extractor — no
         // markdown rendering, no per-page allocation. The other modes share
@@ -469,18 +485,19 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
         bytes_emitted += md.len;
         pages_emitted += 1;
-        last_page_seen = @intCast(page_idx + 1);
         if (md.len < SCAN_LOW_BYTES) scanned_pages += 1;
 
         // PR-17 [feat]: section-checkpoint detection. If the current
         // page's markdown opens with an H1 heading, close the
         // previous section (if any) and open a new one. NDJSON-only
         // emission — other output modes don't speak record kinds.
-        if (args.output_mode == .ndjson) {
+        // Gated on `section_emission_enabled` (codex r1 F2): an
+        // out-of-order `--pages` range disables emission for this
+        // run.
+        if (args.output_mode == .ndjson and section_emission_enabled) {
             if (findH1Heading(md)) |h1| {
-                const new_page: u32 = @intCast(page_idx + 1);
                 if (current_section_title) |old_title| {
-                    env.emitSection(section_id, old_title, current_section_start, new_page - 1) catch |e| {
+                    env.emitSection(section_id, old_title, current_section_start, cur_page - 1) catch |e| {
                         allocator.free(md);
                         return mapWriteErr(e);
                     };
@@ -492,7 +509,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                     allocator.free(md);
                     return mapWriteErr(e);
                 };
-                current_section_start = new_page;
+                current_section_start = cur_page;
             }
         }
 
@@ -555,11 +572,15 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     }
 
     if (args.output_mode == .ndjson) {
-        // PR-17 [feat]: emit the still-open final section.
-        if (current_section_title) |title| {
-            env.emitSection(section_id, title, current_section_start, last_page_seen) catch |e| return mapWriteErr(e);
-            allocator.free(title);
-            current_section_title = null;
+        // PR-17 [feat]: emit the still-open final section. Skip if
+        // section emission was disabled (codex r1 F2: non-monotonic
+        // page range).
+        if (section_emission_enabled) {
+            if (current_section_title) |title| {
+                env.emitSection(section_id, title, current_section_start, last_page_seen) catch |e| return mapWriteErr(e);
+                allocator.free(title);
+                current_section_title = null;
+            }
         }
         const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - t_start);
         // PR-11 [feat]: scanned-PDF heuristic — flag the doc as
