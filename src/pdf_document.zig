@@ -566,27 +566,36 @@ const TreeAssert = struct {
         return try std.fmt.parseInt(u32, body[p..n_end], 10);
     }
 
+    /// Parse `/Kids [N1 0 R N2 0 R ...]` strictly. codex r3 P3:
+    /// each entry must be exactly `<digits> 0 R` (single space
+    /// separators, generation MUST be 0, terminating `R` required).
     fn parseKidsArray(allocator: std.mem.Allocator, body: []const u8) ![]u32 {
         const key = "/Kids [";
         const idx = std.mem.indexOf(u8, body, key) orelse return try allocator.alloc(u32, 0);
-        const p = idx + key.len;
-        const close = std.mem.indexOfScalarPos(u8, body, p, ']') orelse return error.MalformedKids;
+        const start = idx + key.len;
+        const close = std.mem.indexOfScalarPos(u8, body, start, ']') orelse return error.MalformedKids;
         var out: std.ArrayList(u32) = .empty;
         errdefer out.deinit(allocator);
-        var cursor = p;
+        var cursor = start;
         while (cursor < close) {
-            // skip whitespace
+            // skip whitespace before the next ref
             while (cursor < close and (body[cursor] == ' ' or body[cursor] == '\t' or body[cursor] == '\n')) cursor += 1;
             if (cursor >= close) break;
             var num_end = cursor;
             while (num_end < close and std.ascii.isDigit(body[num_end])) num_end += 1;
-            if (num_end == cursor) break;
+            if (num_end == cursor) return error.MalformedKids;
             const n = try std.fmt.parseInt(u32, body[cursor..num_end], 10);
+            // Strictly require " 0 R" after the object number.
+            if (num_end + 4 > close) return error.MalformedKids;
+            if (body[num_end] != ' ' or
+                body[num_end + 1] != '0' or
+                body[num_end + 2] != ' ' or
+                body[num_end + 3] != 'R')
+            {
+                return error.MalformedKids;
+            }
             try out.append(allocator, n);
-            // skip " 0 R"
-            cursor = num_end;
-            while (cursor < close and body[cursor] != 'R') cursor += 1;
-            if (cursor < close) cursor += 1;
+            cursor = num_end + 4;
         }
         return out.toOwnedSlice(allocator);
     }
@@ -603,13 +612,15 @@ fn assertPageTreeShape(allocator: std.mem.Allocator, bytes: []const u8, expected
     defer TreeAssert.deinitMap(&map, allocator);
 
     // Find the root /Pages node — it's the only `pages` entry whose
-    // parent is null.
+    // parent is null. Also collect the set of all emitted `/Page`
+    // leaf ids (codex r3 P2: distinct-reachability check).
     var root: ?u32 = null;
-    var page_leaves: usize = 0;
+    var emitted_leaves = std.AutoHashMap(u32, void).init(allocator);
+    defer emitted_leaves.deinit();
     var it = map.iterator();
     while (it.next()) |entry| {
         switch (entry.value_ptr.kind) {
-            .page => page_leaves += 1,
+            .page => try emitted_leaves.put(entry.key_ptr.*, {}),
             .pages => {
                 if (entry.value_ptr.parent == null) {
                     if (root != null) return error.MultipleRoots;
@@ -619,12 +630,23 @@ fn assertPageTreeShape(allocator: std.mem.Allocator, bytes: []const u8, expected
             .other => {},
         }
     }
-    try std.testing.expectEqual(expected_pages, page_leaves);
+    try std.testing.expectEqual(expected_pages, emitted_leaves.count());
     try std.testing.expect(root != null);
 
-    // Recursively verify counts and parent backlinks.
-    const counted = try verifyNode(&map, root.?, null);
+    // Recursively verify counts + parent backlinks AND that every
+    // visited /Page id is a unique reachable leaf.
+    var visited_leaves = std.AutoHashMap(u32, void).init(allocator);
+    defer visited_leaves.deinit();
+    const counted = try verifyNode(&map, root.?, null, &visited_leaves);
     try std.testing.expectEqual(@as(u32, @intCast(expected_pages)), counted);
+
+    // Every emitted leaf must be reachable through the tree exactly
+    // once. visited_leaves should equal emitted_leaves as a set.
+    if (visited_leaves.count() != emitted_leaves.count()) return error.UnreachableLeaves;
+    var emit_it = emitted_leaves.keyIterator();
+    while (emit_it.next()) |k| {
+        if (!visited_leaves.contains(k.*)) return error.UnreachableLeaves;
+    }
 }
 
 /// Walk the subtree rooted at `obj`. Returns the total leaf count
@@ -634,15 +656,26 @@ fn assertPageTreeShape(allocator: std.mem.Allocator, bytes: []const u8, expected
 ///   - if /Pages: every kid's parent ref equals obj; recurse and
 ///     verify /Count matches the recursive sum.
 ///   - if /Page: returns 1 and verifies parent matches expected.
-fn verifyNode(map: *std.AutoHashMap(u32, TreeAssert.ObjEntry), obj: u32, expected_parent: ?u32) !u32 {
+///   - codex r3 P2: each /Page leaf must be visited exactly once
+///     (rejects duplicate refs in /Kids).
+fn verifyNode(
+    map: *std.AutoHashMap(u32, TreeAssert.ObjEntry),
+    obj: u32,
+    expected_parent: ?u32,
+    visited_leaves: *std.AutoHashMap(u32, void),
+) !u32 {
     const entry = map.get(obj) orelse return error.MissingObject;
     if (entry.parent != expected_parent) return error.ParentMismatch;
     switch (entry.kind) {
-        .page => return 1,
+        .page => {
+            const gop = try visited_leaves.getOrPut(obj);
+            if (gop.found_existing) return error.DuplicateLeafReference;
+            return 1;
+        },
         .pages => {
             var sum: u32 = 0;
             for (entry.kids) |kid| {
-                sum += try verifyNode(map, kid, obj);
+                sum += try verifyNode(map, kid, obj, visited_leaves);
             }
             const declared = entry.count orelse return error.MissingCount;
             if (declared != sum) return error.CountMismatch;
