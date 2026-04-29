@@ -145,8 +145,8 @@ pub const DocumentBuilder = struct {
         // Step 2: build the balanced page-tree shape (object numbers
         // for internal /Pages nodes only — the leaves are already
         // allocated above).
-        const tree = try buildBalancedTree(self.allocator, &w, page_obj_nums);
-        defer self.allocator.free(tree.internal_node_objs);
+        var tree = try buildBalancedTree(self.allocator, &w, page_obj_nums);
+        defer freeTree(self.allocator, &tree);
 
         // Step 3: emit catalog → root pages node → internal nodes →
         // leaf pages → content streams. Order doesn't matter to the
@@ -245,6 +245,16 @@ const Tree = struct {
         subtree_page_count: u32,
     };
 };
+
+/// Release all `Tree`-owned slices: `internal_node_objs`,
+/// `leaf_parent_obj`, the `internal_nodes` slice itself, and each
+/// `internal_nodes[i].kids` sub-slice.
+fn freeTree(allocator: std.mem.Allocator, tree: *Tree) void {
+    for (tree.internal_nodes) |node| allocator.free(node.kids);
+    allocator.free(tree.internal_nodes);
+    allocator.free(tree.internal_node_objs);
+    allocator.free(tree.leaf_parent_obj);
+}
 
 /// Build a balanced /Pages tree over `leaf_obj_nums` with fan-out
 /// `PAGE_TREE_FANOUT`. Allocates internal-node object numbers inside
@@ -362,6 +372,10 @@ fn buildBalancedTree(
     // become the root's kids.
     const root_obj = try w.allocObjectNum();
     const root_kids = try allocator.dupe(u32, current_level_kids.items);
+    // Until root_kids is consumed by `internal_nodes.append`, this
+    // local errdefer owns it. Flag flips after the append succeeds.
+    var root_kids_owned = true;
+    errdefer if (root_kids_owned) allocator.free(root_kids);
     var root_subtree: u32 = 0;
     for (current_level_counts.items) |c| root_subtree += c;
 
@@ -389,9 +403,19 @@ fn buildBalancedTree(
         .kids = root_kids,
         .subtree_page_count = root_subtree,
     });
+    root_kids_owned = false;
 
     // Convert internal_nodes ArrayList to owned slices.
     const nodes_slice = try internal_nodes.toOwnedSlice(allocator);
+    // From here on, the errdefer for `internal_nodes` no longer owns
+    // anything (toOwnedSlice drained it); ownership of each
+    // `nodes_slice[i].kids` belongs to the eventual `freeTree` call.
+    // If a subsequent allocation fails, free the nodes_slice + its
+    // kids manually.
+    errdefer {
+        for (nodes_slice) |n| allocator.free(n.kids);
+        allocator.free(nodes_slice);
+    }
     // The caller frees `internal_node_objs` (a small index slice for
     // testability) and walks `internal_nodes` for emission.
     const obj_slice = try allocator.alloc(u32, nodes_slice.len);
