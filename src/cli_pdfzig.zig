@@ -43,6 +43,10 @@ pub const ExtractArgs = struct {
     max_tokens: u32 = 4000,
     no_toc: bool = false,
     no_warnings: bool = false,
+    /// PR-11 [feat]: percentage [0,100] of low-text pages required
+    /// to flag the document as scanned. Default 50 = ≥half the
+    /// extracted pages are below 50 bytes of extracted text.
+    scan_threshold: u8 = 50,
 };
 
 pub const InfoArgs = struct {
@@ -66,6 +70,7 @@ pub const ArgError = error{
     MissingValue,
     InvalidMaxTokens,
     InvalidOutputMode,
+    InvalidScanThreshold,
 };
 
 /// Parse argv (excluding argv[0]) into a Command.
@@ -116,6 +121,12 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             out.no_toc = true;
         } else if (std.mem.eql(u8, a, "--no-warnings")) {
             out.no_warnings = true;
+        } else if (std.mem.eql(u8, a, "--scan-threshold")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            const v = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidScanThreshold;
+            if (v > 100) return error.InvalidScanThreshold;
+            out.scan_threshold = @intCast(v);
         } else if (std.mem.eql(u8, a, "-")) {
             // Bare `-` is the stdin sentinel, not a flag.
             if (out.input.len != 0) return error.UnknownFlag;
@@ -341,6 +352,18 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     var pages_emitted: u32 = 0;
     var bytes_emitted: u64 = 0;
     var warnings_count: u32 = 0;
+    // PR-11 [feat]: scanned-PDF heuristic. Count pages whose
+    // extractMarkdown output is shorter than this threshold (50 B):
+    // a born-digital page rendering even a single sentence will
+    // produce well over 100 bytes of markdown, while a scanned page
+    // (image-only with possibly an OCR text stub) typically yields
+    // under 50. We only count when the document actually has fonts —
+    // that's the differentiator between "this is a real PDF that
+    // failed to extract" vs "fake / empty PDF that legitimately has
+    // no text". Final flag is emitted iff
+    // `scanned_pages * 100 / pages_emitted >= scan_threshold`.
+    var scanned_pages: u32 = 0;
+    const SCAN_LOW_BYTES: usize = 50;
 
     var collected = std.ArrayList(chunk.Page).empty;
     defer {
@@ -392,6 +415,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
         bytes_emitted += md.len;
         pages_emitted += 1;
+        if (md.len < SCAN_LOW_BYTES) scanned_pages += 1;
 
         switch (args.output_mode) {
             .ndjson => {
@@ -453,11 +477,25 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
     if (args.output_mode == .ndjson) {
         const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - t_start);
+        // PR-11 [feat]: scanned-PDF heuristic — flag the doc as
+        // "scanned" when ≥ scan_threshold% of pages produced under
+        // 50 B of markdown AND the document has at least one font
+        // (filters out trivially-empty PDFs from legitimately-no-text
+        // signal). Per the roadmap, this enables routing through
+        // OCR shell-out paths in v1.3 (PR-12 / PR-13).
+        const has_fonts = doc.font_cache.count() > 0 or doc.font_obj_cache.count() > 0;
+        const flag: ?[]const u8 = blk: {
+            if (pages_emitted == 0 or !has_fonts) break :blk null;
+            const pct = @as(u32, scanned_pages) * 100 / pages_emitted;
+            if (pct >= args.scan_threshold) break :blk "scanned";
+            break :blk null;
+        };
         try env.emitSummary(.{
             .pages_emitted = pages_emitted,
             .bytes_emitted = bytes_emitted,
             .warnings_count = warnings_count,
             .elapsed_ms = elapsed_ms,
+            .quality_flag = flag,
         });
         try writer.flush();
     }
@@ -640,6 +678,7 @@ fn writeArgError(err: ArgError) !void {
         error.MissingValue => "pdf.zig: flag requires a value",
         error.InvalidMaxTokens => "pdf.zig: --max-tokens must be a positive integer",
         error.InvalidOutputMode => "pdf.zig: --output must be one of ndjson|md|chunks|text",
+        error.InvalidScanThreshold => "pdf.zig: --scan-threshold must be an integer in [0, 100]",
     };
     try w.print("{s}\n", .{msg});
 }
@@ -669,6 +708,7 @@ fn writeHelp() !void {
         \\  --max-tokens N              chunk budget (default 4000)
         \\  --no-toc                    suppress `toc` record (NDJSON only)
         \\  --no-warnings               suppress `warnings` array on page records
+        \\  --scan-threshold PCT        flag doc as "scanned" when ≥PCT% of pages have <50B text (default 50)
         \\
         \\Examples:
         \\  pdf.zig extract hotel.pdf
@@ -721,6 +761,30 @@ test "parse rejects missing input" {
 
 test "parse rejects unknown subcommand" {
     try std.testing.expectError(error.UnknownSubcommand, parseArgs(&.{ "zap", "foo.pdf" }));
+}
+
+test "parse extract: --scan-threshold accepted" {
+    const cmd = try parseArgs(&.{ "extract", "--scan-threshold", "30", "foo.pdf" });
+    try std.testing.expectEqual(@as(u8, 30), cmd.extract.scan_threshold);
+}
+
+test "parse extract: --scan-threshold default is 50" {
+    const cmd = try parseArgs(&.{ "extract", "foo.pdf" });
+    try std.testing.expectEqual(@as(u8, 50), cmd.extract.scan_threshold);
+}
+
+test "parse extract: --scan-threshold rejects > 100" {
+    try std.testing.expectError(
+        error.InvalidScanThreshold,
+        parseArgs(&.{ "extract", "--scan-threshold", "150", "foo.pdf" }),
+    );
+}
+
+test "parse extract: --scan-threshold rejects non-numeric" {
+    try std.testing.expectError(
+        error.InvalidScanThreshold,
+        parseArgs(&.{ "extract", "--scan-threshold", "fifty", "foo.pdf" }),
+    );
 }
 
 test "parse rejects --max-tokens 0" {

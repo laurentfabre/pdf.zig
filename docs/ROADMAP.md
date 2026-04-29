@@ -234,7 +234,7 @@ updated: 2026-04-27
 
 ## v1.3 — OCR shell-out (closes NG4 image-text bucket)
 
-- [ ] **PR-11 · feat: scanned-PDF detection (`quality_flag:"scanned"`)**
+- [x] **PR-11 · feat: scanned-PDF detection (`quality_flag:"scanned"`)**
   > [!info]- Details
   > **Files-touched envelope.** `src/cli_pdfzig.zig` (heuristic + summary record), `src/stream.zig` (new `quality_flag` field on `summary`), `src/integration_test.zig`.
   > **Acceptance gate.**
