@@ -1167,6 +1167,21 @@ pub fn extractFromStrokes(
     }
     if (strokes.len < 4) return out.toOwnedSlice(allocator); // ≥2 H + ≥2 V required
 
+    // PR-8 [perf]: fast pre-cluster check. The full clusterByCoord
+    // pass is O(N log N) over all strokes (sort + linear sweep).
+    // On pages full of stroke commands but no axis-aligned segments
+    // (decorative borders, charts, vector logos), it does the work
+    // for nothing because the post-cluster check at H/V cluster
+    // count later filters them out anyway. A linear scan with early
+    // break catches the common case in O(N) before we ever sort.
+    var has_h = false;
+    var has_v = false;
+    for (strokes) |s| {
+        if (s.isHorizontal()) has_h = true else if (s.isVertical()) has_v = true;
+        if (has_h and has_v) break;
+    }
+    if (!has_h or !has_v) return out.toOwnedSlice(allocator);
+
     const h_clusters = try clusterByCoord(allocator, strokes, true);
     defer {
         for (h_clusters) |*c| c.members.deinit(allocator);
@@ -1387,6 +1402,22 @@ test "extractFromStrokes populates cell text from spans" {
     const out = try extractFromStrokes(a, &strokes, 1, &spans);
     defer tables.freeTables(a, out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
+}
+
+// PR-8 [perf]: regression for the H/V pre-cluster early-out.
+// Strokes without H/V coverage (e.g., diagonal-only or H-only)
+// should skip the cluster pass entirely.
+test "extractFromStrokes early-outs on H-only strokes (no verticals)" {
+    const a = std.testing.allocator;
+    const strokes = [_]Stroke{
+        .{ .x0 = 50, .y0 = 100, .x1 = 350, .y1 = 100 },
+        .{ .x0 = 50, .y0 = 200, .x1 = 350, .y1 = 200 },
+        .{ .x0 = 50, .y0 = 300, .x1 = 350, .y1 = 300 },
+        .{ .x0 = 50, .y0 = 400, .x1 = 350, .y1 = 400 },
+    };
+    const out = try extractFromStrokes(a, &strokes, 1, &.{});
+    defer tables.freeTables(a, out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
 }
 
 test "extractFromStrokes returns no table when fewer than 2 cluster lines on either axis" {
