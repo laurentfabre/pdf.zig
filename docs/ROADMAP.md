@@ -376,6 +376,8 @@ updated: 2026-04-27
 > [!info] Why
 > pdf.zig is currently read-only. Tier 1 adds a clean writer module: hello-world PDFs with plain ASCII text on white pages using Type 1 base-14 fonts (no font file embedding). Sufficient for round-trip workflows (extract → modify markdown → re-render), test-fixture generation (replace `testpdf.zig`'s hand-rolled byte concat), and NDJSON-to-PDF assembly.
 >
+> **Use-case constraint.** Target documents are **multi-hundred pages** (not just hello-world). PR-W2 therefore implements a balanced page tree from day one (~10-fan-out per `/Pages` node), not a flat single-level tree. This is the only Tier-1 gate that materially diverges from "minimum viable" — every other PR keeps the minimal-scope discipline.
+>
 > **Scope boundary.** No font embedding (no non-ASCII), no images, no encryption, no PDF/A. Those are Tier 2 (PR-W7+) — listed separately under v1.6 once Tier 1 ships.
 
 - [ ] **PR-W1 · feat: PDF writer core (`src/pdf_writer.zig`)**
@@ -392,19 +394,20 @@ updated: 2026-04-27
   > **Test strategy.** New unit tests for object serialization + round-trip integration test.
   > **Codex gate.** xref byte-offset accuracy under stream lengths that span chunk boundaries; deferred-reference resolution before `endobj`; FlateDecode boundary not assumed (Tier-1 content streams uncompressed).
 
-- [ ] **PR-W2 · feat: Document/Page/Resources builders (`src/pdf_document.zig`)**
+- [ ] **PR-W2 · feat: Document/Page/Resources builders with balanced page tree (`src/pdf_document.zig`)**
   > [!info]- Details
-  > **Why.** High-level API on top of PR-W1 so callers don't write objects directly.
-  > **Files-touched envelope.** `src/pdf_document.zig` (new, ~400 LOC), `src/integration_test.zig`.
+  > **Why.** High-level API on top of PR-W1 so callers don't write objects directly. Page tree is **balanced from day one** — see the v1.5 section header for the use-case constraint (multi-hundred-page authoring).
+  > **Files-touched envelope.** `src/pdf_document.zig` (new, ~600 LOC including the page-tree builder), `src/integration_test.zig`.
   > **Acceptance gate.**
   > - `DocumentBuilder.init(allocator) -> *DocumentBuilder` returns a builder with empty catalog.
-  > - `addPage(media_box: [4]f64) -> *PageBuilder` allocates a page, wires it into the page tree.
+  > - `addPage(media_box: [4]f64) -> *PageBuilder` allocates a page; pages are buffered until `write()` so the final tree shape can be balanced (fan-out target ≈ 10 children per `/Pages` node).
   > - `PageBuilder.appendContent(bytes)` appends to the page's content stream.
-  > - `DocumentBuilder.write(allocator) -> []u8` flushes catalog + page tree + pages + content streams + xref + trailer.
-  > - 3-page synthetic PDF round-trips through `Document.openFromMemory` with correct `pageCount() == 3` and per-page MediaBox values.
+  > - `DocumentBuilder.write(allocator) -> []u8` flushes catalog + balanced page tree + pages + content streams + xref + trailer. Tree depth = `⌈log₁₀(N)⌉`; every leaf `/Page` carries the correct `/Parent` ref; every internal `/Pages` node has correct `/Count` (subtree page count) and `/Kids`.
+  > - **Stress test**: 1000-page synthetic PDF round-trips through `Document.openFromMemory` with `pageCount() == 1000`. Random-access page reads pick the right page (e.g. `pages.items[500]` resolves to the page added 500th).
+  > - 3-page baseline still produces a flat-ish tree (single `/Pages` parent — no unnecessary nesting under the threshold).
   >
-  > **Test strategy.** Mirror the existing `testpdf.generateMultiPagePdf` semantics but via the builder API; round-trip via the existing reader.
-  > **Codex gate.** Page tree depth correctness (Kids array fans out at >25 pages per /Pages node — tier-1 single-level only, document the limit); resources dict ownership (per-page or shared via /Parent inheritance).
+  > **Test strategy.** Two integration tests: 3-page (flat) + 1000-page (deep tree). Round-trip via the existing reader.
+  > **Codex gate.** `/Count` correctness at every internal node (subtree page count, NOT direct-children count); `/Parent` chain on every leaf; tree fan-out is uniform (not pathological — last node may be partial); resources dict ownership (per-page; tier-2 may add shared resources via `/Parent` inheritance).
 
 - [ ] **PR-W3 · feat: Type 1 base-14 fonts + `drawText` content op encoder**
   > [!info]- Details
