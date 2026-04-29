@@ -132,7 +132,7 @@ updated: 2026-04-27
   >
   > **Test strategy.** Bump bound + observe no panic + no leak.
 
-- [ ] **PR-9b · fix: ContentLexer OOM swallowing in scanString/scanHexString**
+- [x] **PR-9b · fix: ContentLexer OOM swallowing in scanString/scanHexString**
   > [!info]- Details
   > **Why.** Codex review on PR-9 round 1 [P2] flagged that `ContentLexer.next` calls non-erroring `scanString` / `scanHexString` which themselves use `appendByte` / `finalizeBuf` that swallow OOM with `catch {}` and `catch &.{}`. Leak-clean under the scratch arena, but silently drops text on allocator pressure — a correctness concern, not a leak.
   > **Files-touched envelope.** `src/interpreter.zig` (ContentLexer + helpers + scan* signature change).

@@ -531,7 +531,7 @@ pub const ContentLexer = struct {
         const c = self.data[self.pos];
 
         // String literal
-        if (c == '(') return Token{ .string = self.scanString() };
+        if (c == '(') return Token{ .string = try self.scanString() };
 
         // Hex string
         if (c == '<') {
@@ -540,14 +540,14 @@ pub const ContentLexer = struct {
                 self.pos += 2;
                 return self.next();
             }
-            return Token{ .hex_string = self.scanHexString() };
+            return Token{ .hex_string = try self.scanHexString() };
         }
 
         // Name
         if (c == '/') return Token{ .name = self.scanName() };
 
         // Array
-        if (c == '[') return Token{ .array = self.scanArray() };
+        if (c == '[') return Token{ .array = try self.scanArray() };
 
         // End markers
         if (c == ']' or c == '>') {
@@ -591,7 +591,12 @@ pub const ContentLexer = struct {
         }
     }
 
-    fn scanString(self: *ContentLexer) []const u8 {
+    /// PR-9b [refactor]: was `[]const u8` swallowing internal OOM
+    /// via appendByte/finalizeBuf catches. Now propagates so OOM
+    /// surfaces to the caller chain (next() → ... → extractMarkdown).
+    /// On error, any heap-promoted overflow ArrayList is freed
+    /// via appendByte's local errdefer.
+    fn scanString(self: *ContentLexer) std.mem.Allocator.Error![]const u8 {
         self.pos += 1; // Skip '('
         var depth: usize = 1;
 
@@ -599,6 +604,9 @@ pub const ContentLexer = struct {
         var stack_buf: [4096]u8 = undefined;
         var stack_len: usize = 0;
         var overflow: ?std.ArrayList(u8) = null;
+        // If we OOM mid-build, free the overflow buffer (if it was
+        // promoted from stack to heap).
+        errdefer if (overflow) |*list| list.deinit(self.allocator);
 
         while (self.pos < self.data.len and depth > 0) {
             const c = self.data[self.pos];
@@ -641,59 +649,71 @@ pub const ContentLexer = struct {
                     },
                     else => escaped,
                 };
-                appendByte(&stack_buf, &stack_len, &overflow, self.allocator, decoded);
+                try appendByte(&stack_buf, &stack_len, &overflow, self.allocator, decoded);
             } else if (c == '(') {
                 depth += 1;
-                appendByte(&stack_buf, &stack_len, &overflow, self.allocator, c);
+                try appendByte(&stack_buf, &stack_len, &overflow, self.allocator, c);
                 self.pos += 1;
             } else if (c == ')') {
                 depth -= 1;
                 if (depth > 0) {
-                    appendByte(&stack_buf, &stack_len, &overflow, self.allocator, c);
+                    try appendByte(&stack_buf, &stack_len, &overflow, self.allocator, c);
                 }
                 self.pos += 1;
             } else {
-                appendByte(&stack_buf, &stack_len, &overflow, self.allocator, c);
+                try appendByte(&stack_buf, &stack_len, &overflow, self.allocator, c);
                 self.pos += 1;
             }
         }
 
-        return finalizeBuf(&stack_buf, stack_len, &overflow, self.allocator);
+        return try finalizeBuf(&stack_buf, stack_len, &overflow, self.allocator);
     }
 
-    fn appendByte(stack_buf: *[4096]u8, stack_len: *usize, overflow: *?std.ArrayList(u8), allocator: std.mem.Allocator, byte: u8) void {
+    /// PR-9b [refactor]: was `void` return swallowing OOM via
+    /// `catch {}`. Now propagates so the caller can surface OOM
+    /// instead of silently dropping bytes from the lexed string.
+    fn appendByte(stack_buf: *[4096]u8, stack_len: *usize, overflow: *?std.ArrayList(u8), allocator: std.mem.Allocator, byte: u8) std.mem.Allocator.Error!void {
         if (overflow.*) |*list| {
-            list.append(allocator, byte) catch {};
+            try list.append(allocator, byte);
         } else if (stack_len.* < stack_buf.len) {
             stack_buf[stack_len.*] = byte;
             stack_len.* += 1;
         } else {
-            // Overflow to heap - copy existing stack data first
+            // Overflow to heap - copy existing stack data first.
+            // Capture the new list locally before assigning to
+            // `overflow.*` so an OOM mid-build leaves the caller's
+            // overflow Optional unchanged (no half-built ArrayList).
             var list: std.ArrayList(u8) = .empty;
-            list.appendSlice(allocator, stack_buf[0..stack_len.*]) catch {};
-            list.append(allocator, byte) catch {};
+            errdefer list.deinit(allocator);
+            try list.appendSlice(allocator, stack_buf[0..stack_len.*]);
+            try list.append(allocator, byte);
             overflow.* = list;
         }
     }
 
-    fn finalizeBuf(stack_buf: *[4096]u8, stack_len: usize, overflow: *?std.ArrayList(u8), allocator: std.mem.Allocator) []const u8 {
+    /// PR-9b [refactor]: was `[]const u8` return swallowing OOM via
+    /// `catch &.{}`. Now propagates so callers see allocator pressure.
+    fn finalizeBuf(stack_buf: *[4096]u8, stack_len: usize, overflow: *?std.ArrayList(u8), allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
         if (overflow.*) |*list| {
-            return list.toOwnedSlice(allocator) catch &.{};
+            return try list.toOwnedSlice(allocator);
         }
         if (stack_len == 0) return &.{};
         // Single allocation + copy
-        const result = allocator.alloc(u8, stack_len) catch return &.{};
+        const result = try allocator.alloc(u8, stack_len);
         @memcpy(result, stack_buf[0..stack_len]);
         return result;
     }
 
-    fn scanHexString(self: *ContentLexer) []const u8 {
+    /// PR-9b [refactor]: see scanString — same OOM-propagating
+    /// signature change. Free overflow on error via errdefer.
+    fn scanHexString(self: *ContentLexer) std.mem.Allocator.Error![]const u8 {
         self.pos += 1; // Skip '<'
 
         // Use stack buffer for most hex strings (avoids heap allocations)
         var stack_buf: [4096]u8 = undefined;
         var stack_len: usize = 0;
         var overflow: ?std.ArrayList(u8) = null;
+        errdefer if (overflow) |*list| list.deinit(self.allocator);
 
         var high_nibble: ?u8 = null;
 
@@ -714,7 +734,7 @@ pub const ContentLexer = struct {
                 continue;
 
             if (high_nibble) |high| {
-                appendByte(&stack_buf, &stack_len, &overflow, self.allocator, (high << 4) | nibble);
+                try appendByte(&stack_buf, &stack_len, &overflow, self.allocator, (high << 4) | nibble);
                 high_nibble = null;
             } else {
                 high_nibble = nibble;
@@ -723,11 +743,11 @@ pub const ContentLexer = struct {
 
         // Handle odd number of hex digits (pad with 0)
         if (high_nibble) |high| {
-            appendByte(&stack_buf, &stack_len, &overflow, self.allocator, high << 4);
+            try appendByte(&stack_buf, &stack_len, &overflow, self.allocator, high << 4);
         }
 
         if (self.pos < self.data.len) self.pos += 1; // Skip '>'
-        return finalizeBuf(&stack_buf, stack_len, &overflow, self.allocator);
+        return try finalizeBuf(&stack_buf, stack_len, &overflow, self.allocator);
     }
 
     fn scanName(self: *ContentLexer) []const u8 {
@@ -790,7 +810,9 @@ pub const ContentLexer = struct {
         }
     }
 
-    fn scanArray(self: *ContentLexer) []const Operand {
+    /// PR-9b [refactor]: signature now propagates OOM from
+    /// scanString / scanHexString instead of swallowing.
+    fn scanArray(self: *ContentLexer) std.mem.Allocator.Error![]const Operand {
         self.pos += 1; // Skip '['
 
         var count: usize = 0;
@@ -809,10 +831,10 @@ pub const ContentLexer = struct {
 
             // Parse element
             if (c == '(') {
-                self.array_buffer[count] = .{ .string = self.scanString() };
+                self.array_buffer[count] = .{ .string = try self.scanString() };
                 count += 1;
             } else if (c == '<') {
-                self.array_buffer[count] = .{ .hex_string = self.scanHexString() };
+                self.array_buffer[count] = .{ .hex_string = try self.scanHexString() };
                 count += 1;
             } else if (c == '-' or c == '+' or c == '.' or (c >= '0' and c <= '9')) {
                 self.array_buffer[count] = .{ .number = self.scanNumber() };
