@@ -199,6 +199,38 @@ pub fn build(b: *std.Build) void {
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    // PR-W6 [feat]: writer-stack tests. Tests in pdf_writer.zig,
+    // pdf_document.zig, and markdown_to_pdf.zig were previously
+    // orphaned (`pub const X = @import(...)` in root.zig does not pull
+    // X's tests into the binary unless something references X at
+    // compile time). Wiring them in here so CI actually exercises them.
+    const pdf_writer_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pdf_writer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_pdf_writer_unit_tests = b.addRunArtifact(pdf_writer_unit_tests);
+
+    const pdf_document_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pdf_document.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_pdf_document_unit_tests = b.addRunArtifact(pdf_document_unit_tests);
+
+    const markdown_to_pdf_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/markdown_to_pdf.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_markdown_to_pdf_unit_tests = b.addRunArtifact(markdown_to_pdf_unit_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_simd_unit_tests.step);
@@ -210,6 +242,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_testpdf_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_stream_unit_tests.step);
+    test_step.dependOn(&run_pdf_writer_unit_tests.step);
+    test_step.dependOn(&run_pdf_document_unit_tests.step);
+    test_step.dependOn(&run_markdown_to_pdf_unit_tests.step);
 
     // Allocation-failure tests — Week 4 of architecture.md §11.
     // Asserts the documented shape of upstream OOM behaviour (Findings 001–003

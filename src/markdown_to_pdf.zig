@@ -340,7 +340,7 @@ test "render: numbered list" {
     try std.testing.expect(std.mem.indexOf(u8, text, "third") != null);
 }
 
-test "render: bullet markers survive round-trip (ASCII `-`)" {
+test "render: bullet markers emit ASCII `-` in the content stream" {
     const allocator = std.testing.allocator;
     const md =
         \\- alpha
@@ -348,16 +348,13 @@ test "render: bullet markers survive round-trip (ASCII `-`)" {
     ;
     const bytes = try render(allocator, md);
     defer allocator.free(bytes);
-
-    const zpdf = @import("root.zig");
-    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
-    defer doc.close();
-    const text = try doc.extractMarkdown(0, allocator);
-    defer allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "-") != null);
+    // The marker is drawn as a literal string `(-)` followed by `Tj`.
+    // Markdown extraction auto-renumbers/normalises markers, so we
+    // inspect the raw content bytes instead.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "(-) Tj") != null);
 }
 
-test "render: numbered markers keep the dot" {
+test "render: numbered markers emit `1.`/`2.` literals in the content stream" {
     const allocator = std.testing.allocator;
     const md =
         \\1. first
@@ -365,29 +362,27 @@ test "render: numbered markers keep the dot" {
     ;
     const bytes = try render(allocator, md);
     defer allocator.free(bytes);
-
-    const zpdf = @import("root.zig");
-    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
-    defer doc.close();
-    const text = try doc.extractMarkdown(0, allocator);
-    defer allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "1.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "2.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "(1.) Tj") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "(2.) Tj") != null);
 }
 
-test "render: long unbroken token hard-wraps within page width" {
+test "render: long unbroken token hard-wraps in the content stream" {
     const allocator = std.testing.allocator;
-    // 200-char token, longer than ~85 chars/line at body size.
+    // 200-char token, longer than ~85 chars/line at body size. The
+    // hard-wrap loop chunks it into max_chars pieces and emits each
+    // chunk as its own Tj. We assert that the token is split into
+    // at least 2 distinct Tj operators.
     const md = "https://example.com/" ++ ("a" ** 180);
     const bytes = try render(allocator, md);
     defer allocator.free(bytes);
 
-    const zpdf = @import("root.zig");
-    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
-    defer doc.close();
-    const text = try doc.extractMarkdown(0, allocator);
-    defer allocator.free(text);
-    // The token's prefix must still appear (chunked into >=2 chunks).
-    try std.testing.expect(std.mem.indexOf(u8, text, "https://example.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "aaaaa") != null);
+    var tj_count: usize = 0;
+    var search = bytes;
+    while (std.mem.indexOf(u8, search, ") Tj")) |idx| : (search = search[idx + 4 ..]) {
+        tj_count += 1;
+    }
+    try std.testing.expect(tj_count >= 2);
+    // The first chunk starts with the URL prefix (the prefix is
+    // shorter than max_chars, so it fits intact in chunk #1).
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "(https://example.com") != null);
 }

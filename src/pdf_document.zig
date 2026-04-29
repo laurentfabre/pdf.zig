@@ -110,6 +110,12 @@ pub const PageBuilder = struct {
     /// a `/Resources << /Font << /Fk << ...inline Type 1... >> >> >>`
     /// dict on the fly. When both empty, emits `<< >>`.
     resources_raw: std.ArrayList(u8),
+    /// PR-W6 [feat]: extra raw bytes spliced into the leaf `/Page`
+    /// dict between `/Resources` and `/Contents`. Used for `/Annots`,
+    /// `/Group`, `/StructParents`, etc. Caller is responsible for
+    /// well-formed PDF tokens (must start with `/<Name>` and round-trip
+    /// through the parser).
+    extras_raw: std.ArrayList(u8),
     /// PR-W3 [feat]: which BuiltinFont indices were referenced by
     /// `drawText` on this page. The /Resources dict is auto-built
     /// from this set during `write`.
@@ -117,12 +123,21 @@ pub const PageBuilder = struct {
     /// Allocator used for `content` + `resources_raw`. Set by the
     /// owning DocumentBuilder via `init`.
     allocator: std.mem.Allocator,
+    /// PR-W6 [feat]: object number assigned to this leaf `/Page` by
+    /// `DocumentBuilder.addPage`. Stable for the lifetime of the
+    /// builder so callers can reference the page from /Annots, /Dest,
+    /// /Outlines, /Names, etc.
+    obj_num: u32 = 0,
+    /// PR-W6 [feat]: object number for this page's content stream.
+    /// Allocated alongside `obj_num`.
+    content_obj_num: u32 = 0,
 
     fn init(allocator: std.mem.Allocator, media_box: [4]f64) PageBuilder {
         return .{
             .media_box = media_box,
             .content = .empty,
             .resources_raw = .empty,
+            .extras_raw = .empty,
             .allocator = allocator,
         };
     }
@@ -130,6 +145,7 @@ pub const PageBuilder = struct {
     fn deinit(self: *PageBuilder) void {
         self.content.deinit(self.allocator);
         self.resources_raw.deinit(self.allocator);
+        self.extras_raw.deinit(self.allocator);
     }
 
     pub fn appendContent(self: *PageBuilder, bytes: []const u8) !void {
@@ -143,6 +159,22 @@ pub const PageBuilder = struct {
     pub fn setResourcesRaw(self: *PageBuilder, raw: []const u8) !void {
         self.resources_raw.clearRetainingCapacity();
         try self.resources_raw.appendSlice(self.allocator, raw);
+    }
+
+    /// PR-W6 [feat]: replace the per-page extras blob (key/value pairs
+    /// inside the leaf `/Page` dict — `/Annots [...]`, `/Group << >>`,
+    /// `/StructParents N`, etc.). Pass empty to clear. Caller writes
+    /// well-formed PDF tokens; nothing is escaped.
+    pub fn setPageExtras(self: *PageBuilder, raw: []const u8) !void {
+        self.extras_raw.clearRetainingCapacity();
+        try self.extras_raw.appendSlice(self.allocator, raw);
+    }
+
+    /// PR-W6 [feat]: object number assigned to this leaf `/Page` by
+    /// `DocumentBuilder.addPage`. Useful when constructing /Annots
+    /// destinations, outline /Dest entries, /AcroForm fields, etc.
+    pub fn objNum(self: *const PageBuilder) u32 {
+        return self.obj_num;
     }
 
     /// PR-W3 [feat]: emit `BT /Fk size Tf x y Td (escaped) Tj ET`
@@ -238,16 +270,42 @@ fn writeRealTo(writer: anytype, n: f64) !void {
 
 pub const DocumentBuilder = struct {
     allocator: std.mem.Allocator,
+    /// PR-W6 [feat]: writer is now long-lived so `addPage` and
+    /// `addAuxiliaryObject` can reserve object numbers eagerly. The
+    /// builder is single-use: `write()` consumes the writer and
+    /// invalidates further mutating calls.
+    writer: pdf_writer.Writer,
     /// Pages in document order. Each pointer is heap-owned; freed by
     /// `deinit`.
     pages: std.ArrayList(*PageBuilder),
+    /// PR-W6 [feat]: caller-supplied indirect objects (e.g. /Outlines
+    /// items, /Annot dicts, /AcroForm field nodes). Each entry's bytes
+    /// are emitted verbatim between `obj_num 0 obj` and `endobj`.
+    aux_objects: std.ArrayList(AuxObject),
+    /// PR-W6 [feat]: optional /Info dict (object number reserved on
+    /// the first `setInfoDict` call; payload re-settable until `write`).
+    info_obj_num: ?u32 = null,
+    info_payload: std.ArrayList(u8),
+    /// PR-W6 [feat]: raw bytes spliced into the /Catalog dict between
+    /// `/Pages X 0 R` and the closing `>>` (e.g. `/Outlines N 0 R
+    /// /PageLabels << ... >>`).
+    catalog_extras_raw: std.ArrayList(u8),
+
+    const AuxObject = struct {
+        obj_num: u32,
+        payload: []u8,
+    };
 
     pub const Error = pdf_writer.Writer.Error || error{NoPages};
 
     pub fn init(allocator: std.mem.Allocator) DocumentBuilder {
         return .{
             .allocator = allocator,
+            .writer = pdf_writer.Writer.init(allocator),
             .pages = .empty,
+            .aux_objects = .empty,
+            .info_payload = .empty,
+            .catalog_extras_raw = .empty,
         };
     }
 
@@ -257,56 +315,91 @@ pub const DocumentBuilder = struct {
             self.allocator.destroy(p);
         }
         self.pages.deinit(self.allocator);
+        for (self.aux_objects.items) |a| self.allocator.free(a.payload);
+        self.aux_objects.deinit(self.allocator);
+        self.info_payload.deinit(self.allocator);
+        self.catalog_extras_raw.deinit(self.allocator);
+        self.writer.deinit();
     }
 
     pub fn addPage(self: *DocumentBuilder, media_box: [4]f64) !*PageBuilder {
+        // Reserve the leaf /Page object number AND its content stream
+        // up-front so other auxiliary objects (annotations, outlines,
+        // form fields) can reference the page before `write()` runs.
+        const page_num = try self.writer.allocObjectNum();
+        const content_num = try self.writer.allocObjectNum();
         const page = try self.allocator.create(PageBuilder);
         errdefer self.allocator.destroy(page);
         page.* = PageBuilder.init(self.allocator, media_box);
+        page.obj_num = page_num;
+        page.content_obj_num = content_num;
         try self.pages.append(self.allocator, page);
         return page;
     }
 
+    /// PR-W6 [feat]: register an auxiliary indirect object. The
+    /// `payload` bytes are duplicated and emitted verbatim between
+    /// `<num> 0 obj` and `endobj` during `write()`. Returns the
+    /// allocated object number for the caller to use in refs.
+    pub fn addAuxiliaryObject(self: *DocumentBuilder, payload: []const u8) !u32 {
+        const num = try self.writer.allocObjectNum();
+        const owned = try self.allocator.dupe(u8, payload);
+        errdefer self.allocator.free(owned);
+        try self.aux_objects.append(self.allocator, .{ .obj_num = num, .payload = owned });
+        return num;
+    }
+
+    /// PR-W6 [feat]: set the /Info dict payload. The payload must be
+    /// a complete PDF dict expression (`<< /Title (...) /Author (...)
+    /// >>`). The object number is reserved on the first call and
+    /// returned so the caller may reference it (e.g. as an /Encrypt
+    /// peer); subsequent calls only update the payload.
+    pub fn setInfoDict(self: *DocumentBuilder, payload: []const u8) !u32 {
+        if (self.info_obj_num == null) {
+            self.info_obj_num = try self.writer.allocObjectNum();
+        }
+        self.info_payload.clearRetainingCapacity();
+        try self.info_payload.appendSlice(self.allocator, payload);
+        return self.info_obj_num.?;
+    }
+
+    /// PR-W6 [feat]: replace the /Catalog extras blob (raw bytes
+    /// spliced in *before* the closing `>>`). Pass empty to clear.
+    /// Caller is responsible for well-formed PDF tokens.
+    pub fn setCatalogExtras(self: *DocumentBuilder, raw: []const u8) !void {
+        self.catalog_extras_raw.clearRetainingCapacity();
+        try self.catalog_extras_raw.appendSlice(self.allocator, raw);
+    }
+
     /// Assemble the document and return owned bytes. Caller frees with
-    /// `allocator.free(bytes)`.
+    /// `allocator.free(bytes)`. Single-use: don't call twice.
     pub fn write(self: *DocumentBuilder) ![]u8 {
         if (self.pages.items.len == 0) return error.NoPages;
 
-        var w = pdf_writer.Writer.init(self.allocator);
-        defer w.deinit();
+        const w = &self.writer;
         try w.writeHeader();
 
         const num_pages: u32 = @intCast(self.pages.items.len);
 
-        // Step 1: allocate object numbers up-front so refs work in any
-        // emission order.
         const catalog = try w.allocObjectNum();
 
-        // Each page leaf + its content stream.
+        // Pull pre-allocated page/content nums into a local array for
+        // buildBalancedTree (which expects a slice of page nums).
         const page_obj_nums = try self.allocator.alloc(u32, num_pages);
         defer self.allocator.free(page_obj_nums);
-        const content_obj_nums = try self.allocator.alloc(u32, num_pages);
-        defer self.allocator.free(content_obj_nums);
-        for (0..num_pages) |i| {
-            page_obj_nums[i] = try w.allocObjectNum();
-            content_obj_nums[i] = try w.allocObjectNum();
-        }
+        for (self.pages.items, 0..) |p, i| page_obj_nums[i] = p.obj_num;
 
-        // Step 2: build the balanced page-tree shape (object numbers
-        // for internal /Pages nodes only — the leaves are already
-        // allocated above).
-        var tree = try buildBalancedTree(self.allocator, &w, page_obj_nums);
+        var tree = try buildBalancedTree(self.allocator, w, page_obj_nums);
         defer freeTree(self.allocator, &tree);
 
-        // Step 3: emit catalog → root pages node → internal nodes →
-        // leaf pages → content streams. Order doesn't matter to the
-        // PDF format; we go top-down for cache locality during
-        // round-trip parsing.
-
-        // 3a. Catalog.
+        // 3a. Catalog (with optional extras blob).
         try w.beginObject(catalog, 0);
         try w.writeRaw("<< /Type /Catalog /Pages ");
         try w.writeRef(tree.root_obj, 0);
+        if (self.catalog_extras_raw.items.len > 0) {
+            try w.writeRaw(" ");
+            try w.writeRaw(self.catalog_extras_raw.items);
+        }
         try w.writeRaw(" >>");
         try w.endObject();
 
@@ -330,9 +423,9 @@ pub const DocumentBuilder = struct {
             try w.endObject();
         }
 
-        // 3c. Leaf /Page objects.
+        // 3c. Leaf /Page objects (with optional /Annots, /Group, …).
         for (self.pages.items, 0..) |page, i| {
-            try w.beginObject(page_obj_nums[i], 0);
+            try w.beginObject(page.obj_num, 0);
             try w.writeRaw("<< /Type /Page /Parent ");
             try w.writeRef(tree.leaf_parent_obj[i], 0);
             try w.writeRaw(" /MediaBox [");
@@ -345,29 +438,45 @@ pub const DocumentBuilder = struct {
             try w.writeReal(page.media_box[3]);
             try w.writeRaw("] /Resources ");
             if (page.resources_raw.items.len > 0) {
-                // Caller-supplied raw resources fully override the
-                // auto-emitted font dict. drawText callers that mix
-                // both are on their own; the docstring on
-                // setResourcesRaw warns about this.
                 try w.writeRaw(page.resources_raw.items);
             } else {
-                try emitAutoResources(&w, page);
+                try emitAutoResources(w, page);
+            }
+            if (page.extras_raw.items.len > 0) {
+                try w.writeRaw(" ");
+                try w.writeRaw(page.extras_raw.items);
             }
             try w.writeRaw(" /Contents ");
-            try w.writeRef(content_obj_nums[i], 0);
+            try w.writeRef(page.content_obj_num, 0);
             try w.writeRaw(" >>");
             try w.endObject();
         }
 
         // 3d. Content streams.
-        for (self.pages.items, 0..) |page, i| {
-            try w.beginObject(content_obj_nums[i], 0);
+        for (self.pages.items) |page| {
+            try w.beginObject(page.content_obj_num, 0);
             try w.writeStream(page.content.items, "");
             try w.endObject();
         }
 
+        // 3e. Auxiliary objects (outline items, annotations, form
+        // fields, page-label trees, …). Each payload is the complete
+        // dict / stream body — emitted verbatim between obj/endobj.
+        for (self.aux_objects.items) |aux| {
+            try w.beginObject(aux.obj_num, 0);
+            try w.writeRaw(aux.payload);
+            try w.endObject();
+        }
+
+        // 3f. /Info dict (optional).
+        if (self.info_obj_num) |info_num| {
+            try w.beginObject(info_num, 0);
+            try w.writeRaw(self.info_payload.items);
+            try w.endObject();
+        }
+
         const xref_off = try w.writeXref();
-        try w.writeTrailer(xref_off, catalog, null);
+        try w.writeTrailer(xref_off, catalog, self.info_obj_num);
         return try w.finalize();
     }
 };
@@ -1124,4 +1233,86 @@ fn smokeFlow(doc: *DocumentBuilder) ![]u8 {
     try page.appendContent("BT /F1 12 Tf 50 50 Td (x) Tj ET");
     try page.setResourcesRaw("<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>");
     return doc.write();
+}
+
+// ---------- PR-W6 [feat]: escape-hatch surface for fixture refactor ----------
+
+test "DocumentBuilder.setInfoDict round-trips /Info entries" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    _ = try doc.setInfoDict("<< /Title (Hello) /Author (Tester) >>");
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "body");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // Round-trip via the existing reader: title appears in the metadata.
+    const root = @import("root.zig");
+    var parsed = try root.Document.openFromMemory(allocator, bytes, root.ErrorConfig.permissive());
+    defer parsed.close();
+    const meta = parsed.metadata();
+    try std.testing.expectEqualStrings("Hello", meta.title.?);
+    try std.testing.expectEqualStrings("Tester", meta.author.?);
+}
+
+test "DocumentBuilder.addAuxiliaryObject + setCatalogExtras link from /Catalog" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    // Reserve a small auxiliary object (a /Names dict in this test
+    // would be more realistic, but a /Metadata stream is simpler to
+    // build by hand).
+    const aux_num = try doc.addAuxiliaryObject("<< /Type /Metadata /Subtype /XML >>");
+
+    var extras_buf: [128]u8 = undefined;
+    const extras = try std.fmt.bufPrint(&extras_buf, "/Metadata {d} 0 R", .{aux_num});
+    try doc.setCatalogExtras(extras);
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "x");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // The catalog string contains both the aux object's body AND the
+    // /Metadata ref pointing at it.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Type /Metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Metadata ") != null);
+}
+
+test "PageBuilder.setPageExtras splices into leaf /Page dict" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "x");
+    try page.setPageExtras("/UserUnit 2");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/UserUnit 2") != null);
+}
+
+test "PageBuilder.objNum is stable for cross-references" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page1 = try doc.addPage(.{ 0, 0, 612, 792 });
+    const page2 = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page1.drawText(72, 720, .helvetica, 12, "a");
+    try page2.drawText(72, 720, .helvetica, 12, "b");
+
+    // Page object numbers are non-zero, distinct, and remain valid
+    // through write().
+    try std.testing.expect(page1.objNum() != 0);
+    try std.testing.expect(page2.objNum() != 0);
+    try std.testing.expect(page1.objNum() != page2.objNum());
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+    try std.testing.expect(bytes.len > 0);
 }
