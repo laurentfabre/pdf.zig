@@ -45,17 +45,75 @@ const pdf_writer = @import("pdf_writer.zig");
 /// soft-limit reader implementations check at (~200).
 pub const PAGE_TREE_FANOUT: u32 = 10;
 
+/// PR-W3 [feat]: the 14 standard Type 1 fonts every PDF reader is
+/// required to ship per ISO 32000-1 §9.6.2.2. No font-file embedding
+/// needed — the reader has the metrics built-in. Tier-1 limit:
+/// callers can only encode WinAnsiEncoding bytes (Latin-1-ish);
+/// non-encodable bytes are dropped silently in `drawText`. PR-W7+
+/// (Tier 2) will introduce TrueType subsetting + UTF-8.
+pub const BuiltinFont = enum(u4) {
+    helvetica,
+    helvetica_bold,
+    helvetica_oblique,
+    helvetica_bold_oblique,
+    times_roman,
+    times_bold,
+    times_italic,
+    times_bold_italic,
+    courier,
+    courier_bold,
+    courier_oblique,
+    courier_bold_oblique,
+    symbol,
+    zapf_dingbats,
+
+    /// PDF /BaseFont name per ISO 32000-1 §9.6.2.2 Table 121.
+    pub fn baseFontName(self: BuiltinFont) []const u8 {
+        return switch (self) {
+            .helvetica => "Helvetica",
+            .helvetica_bold => "Helvetica-Bold",
+            .helvetica_oblique => "Helvetica-Oblique",
+            .helvetica_bold_oblique => "Helvetica-BoldOblique",
+            .times_roman => "Times-Roman",
+            .times_bold => "Times-Bold",
+            .times_italic => "Times-Italic",
+            .times_bold_italic => "Times-BoldItalic",
+            .courier => "Courier",
+            .courier_bold => "Courier-Bold",
+            .courier_oblique => "Courier-Oblique",
+            .courier_bold_oblique => "Courier-BoldOblique",
+            .symbol => "Symbol",
+            .zapf_dingbats => "ZapfDingbats",
+        };
+    }
+
+    /// Symbol and ZapfDingbats use their own encoding — not WinAnsi.
+    /// drawText still works for them but the character set is the
+    /// font's native encoding (per §9.6.6.4).
+    pub fn usesWinAnsi(self: BuiltinFont) bool {
+        return self != .symbol and self != .zapf_dingbats;
+    }
+};
+
+pub const NUM_BUILTIN_FONTS: comptime_int = @typeInfo(BuiltinFont).@"enum".fields.len;
+
 pub const PageBuilder = struct {
     media_box: [4]f64,
     /// Raw bytes inside the content stream (before any compression).
-    /// Caller composes BT/ET, Tf, Td, etc. via `appendContent`. PR-W3
-    /// will add typed helpers.
+    /// Caller composes BT/ET, Tf, Td, etc. via `appendContent` or
+    /// (preferred) the typed `drawText` helper.
     content: std.ArrayList(u8),
     /// Raw bytes that make up the `/Resources` dict body, e.g.
-    /// `"<< /Font << /F1 5 0 R >> >>"`. Default is `"<< >>"` (empty
-    /// dict — valid per spec but no fonts available so any text op
-    /// will reference an undefined font name).
+    /// `"<< /Font << /F1 5 0 R >> >>"`. When non-empty, this fully
+    /// overrides the auto-emitted resources from `fonts_used`. When
+    /// empty AND `fonts_used` has any true entry, `write` synthesises
+    /// a `/Resources << /Font << /Fk << ...inline Type 1... >> >> >>`
+    /// dict on the fly. When both empty, emits `<< >>`.
     resources_raw: std.ArrayList(u8),
+    /// PR-W3 [feat]: which BuiltinFont indices were referenced by
+    /// `drawText` on this page. The /Resources dict is auto-built
+    /// from this set during `write`.
+    fonts_used: [NUM_BUILTIN_FONTS]bool = @splat(false),
     /// Allocator used for `content` + `resources_raw`. Set by the
     /// owning DocumentBuilder via `init`.
     allocator: std.mem.Allocator,
@@ -79,12 +137,104 @@ pub const PageBuilder = struct {
     }
 
     /// Replace the `/Resources` dict body. Must be a valid dict
-    /// expression `<< ... >>`. Pass `"<< >>"` to clear.
+    /// expression `<< ... >>`. Pass `"<< >>"` to clear. Setting this
+    /// suppresses the auto-emitted font dict — you must include any
+    /// /Font entries the page needs.
     pub fn setResourcesRaw(self: *PageBuilder, raw: []const u8) !void {
         self.resources_raw.clearRetainingCapacity();
         try self.resources_raw.appendSlice(self.allocator, raw);
     }
+
+    /// PR-W3 [feat]: emit `BT /Fk size Tf x y Td (escaped) Tj ET`
+    /// for `text` rendered with `font` at `size` points starting at
+    /// PDF user-space coordinates `(x, y)` (origin = bottom-left).
+    /// `font` is registered in this page's resources automatically.
+    /// Bytes outside [0x20, 0x7e] are dropped silently for the 12
+    /// WinAnsi-using built-in fonts (Tier-1 ASCII subset). Symbol /
+    /// ZapfDingbats accept all bytes but use their native encoding.
+    /// Empty text after escaping is a no-op (no BT/ET emitted).
+    pub fn drawText(
+        self: *PageBuilder,
+        x: f64,
+        y: f64,
+        font: BuiltinFont,
+        size: f64,
+        text: []const u8,
+    ) !void {
+        if (!std.math.isFinite(x) or !std.math.isFinite(y) or !std.math.isFinite(size)) {
+            return error.InvalidReal;
+        }
+        if (size <= 0) return error.InvalidReal;
+
+        // Filter to WinAnsi-printable ASCII for the 12 standard fonts.
+        // Symbol / ZapfDingbats keep all bytes (caller is responsible
+        // for using the right encoding).
+        var filtered: std.ArrayList(u8) = .empty;
+        defer filtered.deinit(self.allocator);
+        if (font.usesWinAnsi()) {
+            for (text) |b| {
+                if (b >= 0x20 and b <= 0x7e) try filtered.append(self.allocator, b);
+            }
+        } else {
+            try filtered.appendSlice(self.allocator, text);
+        }
+        if (filtered.items.len == 0) return; // no-op for empty / all-dropped text
+
+        self.fonts_used[@intFromEnum(font)] = true;
+
+        // Compose into a scratch buffer first so a partial-failure
+        // doesn't leave the page's content stream half-written.
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.allocator);
+        const ws = scratch.writer(self.allocator);
+
+        try ws.print("BT /F{d} ", .{@intFromEnum(font)});
+        try writeRealTo(ws, size);
+        try ws.writeAll(" Tf ");
+        try writeRealTo(ws, x);
+        try ws.writeAll(" ");
+        try writeRealTo(ws, y);
+        try ws.writeAll(" Td (");
+        for (filtered.items) |b| {
+            switch (b) {
+                '(' => try ws.writeAll("\\("),
+                ')' => try ws.writeAll("\\)"),
+                '\\' => try ws.writeAll("\\\\"),
+                // codex r1 [Low]: PDF literal strings normalise
+                // unescaped CR / CRLF to LF (§7.3.4.2). Octal-escape
+                // control bytes so the Symbol/ZapfDingbats path is
+                // byte-preserving. The WinAnsi-filtered path can't
+                // hit this branch because [0x20, 0x7e] excludes them
+                // anyway, so this is essentially Symbol-only.
+                else => {
+                    if (b < 0x20 or b == 0x7f) {
+                        try ws.print("\\{o:0>3}", .{b});
+                    } else {
+                        try ws.writeByte(b);
+                    }
+                },
+            }
+        }
+        try ws.writeAll(") Tj ET\n");
+
+        try self.content.appendSlice(self.allocator, scratch.items);
+    }
 };
+
+/// Tiny mirror of `pdf_writer.Writer.writeReal`: emit a finite f64
+/// in the spec's restricted form (no exponent, trailing zeros
+/// stripped). NaN/inf rejected by `drawText` callers, so we can
+/// safely format here.
+fn writeRealTo(writer: anytype, n: f64) !void {
+    var buf: [64]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d:.6}", .{n}) catch return error.InvalidReal;
+    var end = s.len;
+    if (std.mem.indexOfScalar(u8, s, '.') != null) {
+        while (end > 0 and s[end - 1] == '0') end -= 1;
+        if (end > 0 and s[end - 1] == '.') end -= 1;
+    }
+    try writer.writeAll(s[0..end]);
+}
 
 pub const DocumentBuilder = struct {
     allocator: std.mem.Allocator,
@@ -195,9 +345,13 @@ pub const DocumentBuilder = struct {
             try w.writeReal(page.media_box[3]);
             try w.writeRaw("] /Resources ");
             if (page.resources_raw.items.len > 0) {
+                // Caller-supplied raw resources fully override the
+                // auto-emitted font dict. drawText callers that mix
+                // both are on their own; the docstring on
+                // setResourcesRaw warns about this.
                 try w.writeRaw(page.resources_raw.items);
             } else {
-                try w.writeRaw("<< >>");
+                try emitAutoResources(&w, page);
             }
             try w.writeRaw(" /Contents ");
             try w.writeRef(content_obj_nums[i], 0);
@@ -245,6 +399,34 @@ const Tree = struct {
         subtree_page_count: u32,
     };
 };
+
+/// PR-W3 [feat]: synthesise the page's `/Resources` dict from
+/// `fonts_used`. If no fonts were touched, emits `<< >>`.
+fn emitAutoResources(w: *pdf_writer.Writer, page: *const PageBuilder) !void {
+    var any_font: bool = false;
+    for (page.fonts_used) |used| if (used) {
+        any_font = true;
+        break;
+    };
+    if (!any_font) {
+        try w.writeRaw("<< >>");
+        return;
+    }
+    try w.writeRaw("<< /Font << ");
+    for (page.fonts_used, 0..) |used, idx| {
+        if (!used) continue;
+        const font: BuiltinFont = @enumFromInt(idx);
+        try w.writeRaw("/F");
+        try w.writeInt(@intCast(idx));
+        try w.writeRaw(" << /Type /Font /Subtype /Type1 /BaseFont /");
+        try w.writeRaw(font.baseFontName());
+        if (font.usesWinAnsi()) {
+            try w.writeRaw(" /Encoding /WinAnsiEncoding");
+        }
+        try w.writeRaw(" >> ");
+    }
+    try w.writeRaw(">> >>");
+}
 
 /// Release all `Tree`-owned slices: `internal_node_objs`,
 /// `leaf_parent_obj`, the `internal_nodes` slice itself, and each
@@ -439,6 +621,120 @@ fn buildBalancedTree(
 }
 
 // ---------- tests ----------
+
+// PR-W3 [feat]: drawText + BuiltinFont tests.
+test "BuiltinFont.baseFontName covers all 14 standard fonts" {
+    try std.testing.expectEqualStrings("Helvetica", BuiltinFont.helvetica.baseFontName());
+    try std.testing.expectEqualStrings("Times-Roman", BuiltinFont.times_roman.baseFontName());
+    try std.testing.expectEqualStrings("Courier-Bold", BuiltinFont.courier_bold.baseFontName());
+    try std.testing.expectEqualStrings("Symbol", BuiltinFont.symbol.baseFontName());
+    try std.testing.expectEqualStrings("ZapfDingbats", BuiltinFont.zapf_dingbats.baseFontName());
+}
+
+test "BuiltinFont.usesWinAnsi: 12 standard + Symbol/Dingbats split" {
+    try std.testing.expect(BuiltinFont.helvetica.usesWinAnsi());
+    try std.testing.expect(BuiltinFont.times_bold_italic.usesWinAnsi());
+    try std.testing.expect(!BuiltinFont.symbol.usesWinAnsi());
+    try std.testing.expect(!BuiltinFont.zapf_dingbats.usesWinAnsi());
+}
+
+test "drawText round-trip: Hello World extracts byte-identical" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, "Hello World");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    const zpdf = @import("root.zig");
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+    const md = try d.extractMarkdown(0, allocator);
+    defer allocator.free(md);
+    try std.testing.expect(std.mem.indexOf(u8, md, "Hello World") != null);
+}
+
+test "drawText with parens/backslash escapes correctly" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(50, 600, .helvetica, 10, "foo (bar) \\baz");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+    // Verify the escaped literal appears in the content stream.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "(foo \\(bar\\) \\\\baz)") != null);
+}
+
+test "drawText filters non-ASCII for WinAnsi fonts" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    // Mix of ASCII + high-byte chars; high bytes should be dropped.
+    try page.drawText(50, 600, .helvetica, 10, "abc\xc3\xa9def");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+    // The PDF should contain "(abcdef)" not "(abc...def)".
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "(abcdef)") != null);
+}
+
+test "drawText empty-after-filter is a no-op (no BT/ET emitted)" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    // All bytes outside [0x20, 0x7e] for Helvetica.
+    try page.drawText(50, 600, .helvetica, 10, "\xff\xfe\xfd");
+    try std.testing.expectEqual(@as(usize, 0), page.content.items.len);
+    try std.testing.expect(!page.fonts_used[@intFromEnum(BuiltinFont.helvetica)]);
+}
+
+test "drawText rejects nonfinite coords / size" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try std.testing.expectError(error.InvalidReal, page.drawText(std.math.nan(f64), 0, .helvetica, 10, "x"));
+    try std.testing.expectError(error.InvalidReal, page.drawText(0, 0, .helvetica, std.math.inf(f64), "x"));
+    try std.testing.expectError(error.InvalidReal, page.drawText(0, 0, .helvetica, -5, "x"));
+    try std.testing.expectError(error.InvalidReal, page.drawText(0, 0, .helvetica, 0, "x"));
+}
+
+test "auto-resources emits /Font dict with all used builtins" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(50, 700, .helvetica, 12, "a");
+    try page.drawText(50, 680, .times_roman, 12, "b");
+    try page.drawText(50, 660, .courier_bold, 12, "c");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+    // Each font must appear via its BaseFont name + /Encoding (WinAnsi).
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/BaseFont /Helvetica") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/BaseFont /Times-Roman") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/BaseFont /Courier-Bold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Encoding /WinAnsiEncoding") != null);
+}
+
+test "auto-resources skips /Encoding for Symbol/Dingbats" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(50, 700, .symbol, 12, "abc");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/BaseFont /Symbol") != null);
+    // Symbol's font dict should NOT carry a /WinAnsiEncoding ref —
+    // its uses its own native encoding.
+    const symbol_pos = std.mem.indexOf(u8, bytes, "/BaseFont /Symbol").?;
+    const close_pos = std.mem.indexOfPos(u8, bytes, symbol_pos, ">>").?;
+    const sym_dict = bytes[symbol_pos..close_pos];
+    try std.testing.expect(std.mem.indexOf(u8, sym_dict, "/WinAnsiEncoding") == null);
+}
 
 test "DocumentBuilder rejects empty document" {
     var doc = DocumentBuilder.init(std.testing.allocator);

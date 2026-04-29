@@ -409,7 +409,7 @@ updated: 2026-04-27
   > **Test strategy.** Two integration tests: 3-page (flat) + 1000-page (deep tree). Round-trip via the existing reader.
   > **Codex gate.** `/Count` correctness at every internal node (subtree page count, NOT direct-children count); `/Parent` chain on every leaf; tree fan-out is uniform (not pathological — last node may be partial); resources dict ownership (per-page; tier-2 may add shared resources via `/Parent` inheritance).
 
-- [ ] **PR-W3 · feat: Type 1 base-14 fonts + `drawText` content op encoder**
+- [x] **PR-W3 · feat: Type 1 base-14 fonts + `drawText` content op encoder**
   > [!info]- Details
   > **Why.** Tier-1 minimum text rendering without font-file embedding. The 14 standard fonts (Helvetica, Helvetica-Bold, Times-Roman, Times-Bold, Courier, …) are guaranteed available in every PDF reader.
   > **Files-touched envelope.** `src/pdf_document.zig` (extend), `src/encoding.zig` (WinAnsi escape helpers — new file or extend existing), `src/integration_test.zig`.
