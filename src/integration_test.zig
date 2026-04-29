@@ -5,6 +5,7 @@
 const std = @import("std");
 const zpdf = @import("root.zig");
 const testpdf = @import("testpdf.zig");
+const cli = @import("cli_pdfzig.zig");
 
 test "parse minimal PDF" {
     const allocator = std.testing.allocator;
@@ -1540,6 +1541,67 @@ test "continuation link accepts true near-boundary chain" {
 // convention) and C is the column index (0=left). Glyph centers
 // land squarely inside the cell bbox so the intersection is
 // unambiguous.
+// PR-11 codex r2 P3 (test-gate): end-to-end integration coverage
+// for the scanned-PDF heuristic. Uses generateMultiPagePdf with
+// very-short text per page (registers fonts but produces tiny
+// markdown output, mimicking image-only / scanned PDFs).
+test "scanned-PDF heuristic flags 3-page low-text doc" {
+    const allocator = std.testing.allocator;
+
+    // 3 pages, each with a single character: enough to register the
+    // page + font but produces sub-50-byte markdown per page.
+    const pages_text = [_][]const u8{ "x", "y", "z" };
+    const pdf_data = try testpdf.generateMultiPagePdf(allocator, &pages_text);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    var pages_emitted: u32 = 0;
+    var scanned_pages: u32 = 0;
+    var page_idx: usize = 0;
+    while (page_idx < doc.pageCount()) : (page_idx += 1) {
+        const md = try doc.extractMarkdown(page_idx, allocator);
+        defer allocator.free(md);
+        pages_emitted += 1;
+        if (md.len < 50) scanned_pages += 1;
+    }
+    const has_fonts = doc.font_cache.count() > 0 or doc.font_obj_cache.count() > 0;
+    const flag = cli.computeScanFlag(pages_emitted, scanned_pages, has_fonts, 50);
+    try std.testing.expect(flag != null);
+    try std.testing.expectEqualStrings("scanned", flag.?);
+}
+
+test "scanned-PDF heuristic does NOT flag born-digital 3-page doc" {
+    const allocator = std.testing.allocator;
+
+    // 3 pages with normal-length sentences — markdown comfortably
+    // exceeds 50 bytes per page.
+    const pages_text = [_][]const u8{
+        "The quick brown fox jumps over the lazy dog. This sentence is intentionally long enough to exceed the scanned-flag threshold.",
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+        "Sphinx of black quartz, judge my vow. Pack my box with five dozen liquor jugs. The five boxing wizards jump quickly.",
+    };
+    const pdf_data = try testpdf.generateMultiPagePdf(allocator, &pages_text);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    var pages_emitted: u32 = 0;
+    var scanned_pages: u32 = 0;
+    var page_idx: usize = 0;
+    while (page_idx < doc.pageCount()) : (page_idx += 1) {
+        const md = try doc.extractMarkdown(page_idx, allocator);
+        defer allocator.free(md);
+        pages_emitted += 1;
+        if (md.len < 50) scanned_pages += 1;
+    }
+    const has_fonts = doc.font_cache.count() > 0 or doc.font_obj_cache.count() > 0;
+    const flag = cli.computeScanFlag(pages_emitted, scanned_pages, has_fonts, 50);
+    try std.testing.expectEqual(@as(?[]const u8, null), flag);
+}
+
 test "lattice pass B populates cell text via glyph-center intersection" {
     const allocator = std.testing.allocator;
 

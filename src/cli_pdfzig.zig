@@ -177,10 +177,13 @@ fn parseOutputMode(s: []const u8) !OutputMode {
 ///   - the document has at least one font
 ///   - scanned_pages * 100 / pages_emitted ≥ scan_threshold
 /// Otherwise null (the field is omitted from the summary record).
-const MIN_PAGES_FOR_SCAN_FLAG: u32 = 3;
-fn computeScanFlag(pages_emitted: u32, scanned_pages: u32, has_fonts: bool, scan_threshold: u8) ?[]const u8 {
+pub const MIN_PAGES_FOR_SCAN_FLAG: u32 = 3;
+pub fn computeScanFlag(pages_emitted: u32, scanned_pages: u32, has_fonts: bool, scan_threshold: u8) ?[]const u8 {
     if (pages_emitted < MIN_PAGES_FOR_SCAN_FLAG or !has_fonts) return null;
-    const pct = scanned_pages * 100 / pages_emitted;
+    // PR-11 codex r2 P3: widen to u64 before multiply. `scanned_pages
+    // * 100` would overflow u32 above ~42M scanned pages; widening
+    // makes the helper correct across the full u32 domain.
+    const pct = @as(u64, scanned_pages) * 100 / pages_emitted;
     if (pct >= scan_threshold) return "scanned";
     return null;
 }
