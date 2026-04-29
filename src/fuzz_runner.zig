@@ -654,21 +654,49 @@ fn fuzzLatticePassBSpans(rng: std.Random, allocator: std.mem.Allocator, scratch:
     // appendSlice is safe regardless of arena ordering.
     const text_pool = [_][]const u8{ "a", "ab", "abc", "abcd", "abcde" };
 
+    // Pick column-line indices for "center exactly on line" cases.
+    // col_lines = [left, ..., right]. Choosing center == col_lines[k]
+    // hits locateBin's bin-edge tie-break (inclusive lower, exclusive
+    // upper). Same for row_lines.
+    const col_count = n_v;
+    const row_count = n_h;
+
     var s: usize = 0;
     while (s < n_spans) : (s += 1) {
-        const x_choice = rng.intRangeAtMost(u8, 0, 3);
-        const x0: f64 = switch (x_choice) {
-            0 => left - 10.0, // outside
-            1 => left, // on boundary
-            2 => right, // on far boundary (exclusive)
+        // Glyph-center mode (the binner reads center = (x0+x1)/2).
+        // Generate centers directly, then derive a 5-pt-wide span
+        // around them.
+        const x_choice = rng.intRangeAtMost(u8, 0, 5);
+        const cx: f64 = switch (x_choice) {
+            0 => left - 5.0, // outside left
+            1 => right + 5.0, // outside right
+            2 => left, // on lower boundary (inclusive)
+            3 => right, // on upper boundary (exclusive — should miss)
+            4 => blk: { // on an interior column line (tie-break)
+                const k = rng.intRangeAtMost(usize, 1, col_count - 2);
+                break :blk left + (@as(f64, @floatFromInt(k)) /
+                    @as(f64, @floatFromInt(col_count - 1))) * (right - left);
+            },
             else => left + rng.float(f64) * (right - left),
         };
-        const y0: f64 = bottom + rng.float(f64) * (top - bottom);
+        const y_choice = rng.intRangeAtMost(u8, 0, 5);
+        const cy: f64 = switch (y_choice) {
+            0 => bottom - 5.0,
+            1 => top + 5.0,
+            2 => bottom,
+            3 => top,
+            4 => blk: {
+                const k = rng.intRangeAtMost(usize, 1, row_count - 2);
+                break :blk bottom + (@as(f64, @floatFromInt(k)) /
+                    @as(f64, @floatFromInt(row_count - 1))) * (top - bottom);
+            },
+            else => bottom + rng.float(f64) * (top - bottom),
+        };
         try spans.append(aa, .{
-            .x0 = x0,
-            .y0 = y0,
-            .x1 = x0 + 5.0,
-            .y1 = y0 + 5.0,
+            .x0 = cx - 2.5,
+            .y0 = cy - 2.5,
+            .x1 = cx + 2.5,
+            .y1 = cy + 2.5,
             .text = text_pool[rng.intRangeAtMost(usize, 0, text_pool.len - 1)],
             .font_size = 10.0,
         });

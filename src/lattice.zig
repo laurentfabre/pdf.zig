@@ -999,16 +999,26 @@ fn clusterByCoord(
     const first_c = if (filtered.items[0].isHorizontal()) filtered.items[0].y0 else filtered.items[0].x0;
     var current_coord = first_c;
     var current = Cluster{ .coord = current_coord, .members = .empty };
+    // Codex review v1.2-rc4 PR-4 round 2 [P3 fallout]: `current` holds
+    // an in-flight ArrayList that is NOT yet owned by `out`. Without
+    // this guard, an OOM from `current.members.append` or the next
+    // `out.append(current)` leaks `current.members`'s buffer. Cleared
+    // after each successful transfer of `current` into `out`.
+    var current_owned = true;
+    errdefer if (current_owned) current.members.deinit(allocator);
     for (filtered.items) |s| {
         const c = if (s.isHorizontal()) s.y0 else s.x0;
         if (@abs(c - current_coord) > COORD_TOLERANCE) {
             try out.append(allocator, current);
+            current_owned = false;
             current_coord = c;
             current = Cluster{ .coord = c, .members = .empty };
+            current_owned = true;
         }
         try current.members.append(allocator, s);
     }
     try out.append(allocator, current);
+    current_owned = false;
     return out.toOwnedSlice(allocator);
 }
 
@@ -1310,6 +1320,44 @@ test "extractFromStrokes builds a 2x3 grid from synthetic strokes" {
     try std.testing.expectEqual(@as(u32, 3), out[0].n_cols);
     try std.testing.expectEqual(@as(usize, 6), out[0].cells.len);
     try std.testing.expectEqual(tables.Engine.lattice, out[0].engine);
+}
+
+// Codex review v1.2-rc4 PR-4 round 2 [P3]: stress R1/R2/R3 errdefer
+// paths with FailingAllocator. Each fail_index from 0..N forces
+// allocator.alloc to fail at exactly that step, exercising every
+// errdefer between buildLatticeCellsWithText (toOwnedSlice failure
+// scenarios) and extractFromStrokes (cells_owned flag flip).
+test "extractFromStrokes survives every allocation failure index" {
+    const strokes = [_]Stroke{
+        .{ .x0 = 50, .y0 = 100, .x1 = 350, .y1 = 100 },
+        .{ .x0 = 50, .y0 = 200, .x1 = 350, .y1 = 200 },
+        .{ .x0 = 50, .y0 = 300, .x1 = 350, .y1 = 300 },
+        .{ .x0 = 50, .y0 = 100, .x1 = 50, .y1 = 300 },
+        .{ .x0 = 150, .y0 = 100, .x1 = 150, .y1 = 300 },
+        .{ .x0 = 250, .y0 = 100, .x1 = 250, .y1 = 300 },
+        .{ .x0 = 350, .y0 = 100, .x1 = 350, .y1 = 300 },
+    };
+    // Spans place glyph centers in 4 of the 6 cells (2×3 grid).
+    const spans = [_]layout.TextSpan{
+        .{ .x0 = 95, .y0 = 145, .x1 = 105, .y1 = 155, .text = "a", .font_size = 10 },
+        .{ .x0 = 195, .y0 = 145, .x1 = 205, .y1 = 155, .text = "bc", .font_size = 10 },
+        .{ .x0 = 295, .y0 = 145, .x1 = 305, .y1 = 155, .text = "def", .font_size = 10 },
+        .{ .x0 = 95, .y0 = 245, .x1 = 105, .y1 = 255, .text = "ghij", .font_size = 10 },
+    };
+
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const result = extractFromStrokes(failing.allocator(), &strokes, 1, &spans);
+        if (result) |out| {
+            tables.freeTables(failing.allocator(), out);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Either way, FailingAllocator's underlying gpa would have
+        // detected leaks at deinit; std.testing.allocator is a leak-
+        // checking allocator, so any leak crashes the test.
+    }
 }
 
 test "extractFromStrokes populates cell text from spans" {
