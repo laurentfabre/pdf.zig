@@ -122,6 +122,16 @@ updated: 2026-04-27
   > **Test strategy.** Mirror `lattice.zig` "extractFromStrokes survives every allocation failure index".
   > **Codex gate.** Verify R5 P2 finding from PR-4 round-2 review is fully resolved.
 
+- [ ] **PR-4d · fix: stream_table.zig late-fail allocation paths (buildCellsWithText bufs)**
+  > [!info]- Details
+  > **Why.** PR-4b fixed the three R5 leak shapes (extractFromSpans outer errdefer, buildCellsWithText cells_initialised, cells_owned around out.append) plus uncovered pre-existing fixes in groupIntoRows (span_slice ownership, sorted_owned) and findColumnAnchors (peaks_owned). The new FailingAllocator stress passes indices 0..15 cleanly, but indices ≥16 still trigger an integer-overflow panic from inside `buildCellsWithText`'s `bufs.deinit` errdefer when `bufs[idx].appendSlice` fails after some bufs grew. Suspected ArrayList / DebugAllocator interaction or an additional ownership transfer that needs guarding.
+  > **Files-touched envelope.** `src/stream_table.zig` (buildCellsWithText only), test bound bumped from 16 → 128.
+  > **Acceptance gate.**
+  > - `test "extractFromSpans survives every allocation failure index"` passes for `fail_index < 128`.
+  > - No regression in current 405/405 tests.
+  >
+  > **Test strategy.** Bump bound + observe no panic + no leak.
+
 - [ ] **PR-4c · fix: fuzz harness target_filter UAF + check arena reset/seed lifetimes**
   > [!info]- Details
   > **Why.** Discovered while extending the fuzz harness for PR-4: `target_filter` is allocated from `arena_alloc` but the in-target loop calls `arena.reset(.retain_capacity)` every 4096 iters, leaving `target_filter` dangling. Crashes the harness at `mem.eql(u8, f, target.name)` when `PDFZIG_FUZZ_TARGET` is set and the target is fast enough that reset fires inside its iter loop.
