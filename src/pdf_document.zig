@@ -750,7 +750,7 @@ test "page tree shape: /Count + /Parent on 11-page doc (codex r1 P2)" {
     while (i < 11) : (i += 1) _ = try doc.addPage(.{ 0, 0, 612, 792 });
     const bytes = try doc.write();
     defer allocator.free(bytes);
-    try assertPageTreeShape(allocator, bytes,11);
+    try assertPageTreeShape(allocator, bytes, 11);
 }
 
 test "page tree shape: /Count + /Parent on 999-page doc (codex r1 P2)" {
@@ -761,7 +761,7 @@ test "page tree shape: /Count + /Parent on 999-page doc (codex r1 P2)" {
     while (i < 999) : (i += 1) _ = try doc.addPage(.{ 0, 0, 612, 792 });
     const bytes = try doc.write();
     defer allocator.free(bytes);
-    try assertPageTreeShape(allocator, bytes,999);
+    try assertPageTreeShape(allocator, bytes, 999);
 }
 
 test "DocumentBuilder writes 1000-page balanced tree (PR-W2 stress gate)" {
