@@ -605,7 +605,13 @@ fn makeLine(allocator: std.mem.Allocator, spans: []const TextSpan) !TextLine {
         prev_x1 = span.x1;
     }
     if (current_word_spans.items.len > 0) {
-        try words.append(allocator, try makeWord(allocator, current_word_spans.items));
+        // PR-9 codex r2 P1: same makeWord ownership-transfer guard
+        // as the mid-loop site above.
+        const word = try makeWord(allocator, current_word_spans.items);
+        var word_owned = true;
+        errdefer if (word_owned) allocator.free(word.spans);
+        try words.append(allocator, word);
+        word_owned = false;
     }
     current_word_spans.deinit(allocator);
     current_word_spans_owned = false;
