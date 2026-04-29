@@ -414,7 +414,19 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     // increasing page numbers; if the user picks an out-of-order
     // subset, disable section emission for this run rather than
     // emit `end_page < start_page`.
-    var section_emission_enabled = true;
+    // Pre-scan `want_pages` so section_emission_enabled is final
+    // BEFORE the page loop emits any records (codex r2: detecting
+    // non-monotonic at iteration time is too late — earlier
+    // sections may already have been emitted by then).
+    const section_emission_enabled = blk: {
+        var prev: u32 = 0;
+        for (want_pages) |idx| {
+            const p: u32 = @intCast(idx + 1);
+            if (p <= prev) break :blk false;
+            prev = p;
+        }
+        break :blk true;
+    };
     defer if (current_section_title) |t| allocator.free(t);
 
     var collected = std.ArrayList(chunk.Page).empty;
@@ -430,14 +442,11 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
             return if (sig == std.posix.SIG.TERM) .interrupted_term else .interrupted_int;
         }
 
-        // PR-17 codex r1 F1+F2: maintain `last_page_seen` and
-        // `section_emission_enabled` for every iteration regardless
-        // of whether extractMarkdown later succeeds or fails.
-        // Out-of-order or duplicate page selections (e.g.
-        // `--pages 5,1`) disable section emission so a failed
-        // close doesn't produce `end_page < start_page`.
+        // PR-17 codex r1 F1: keep `last_page_seen` updated regardless
+        // of whether extractMarkdown later succeeds or fails. The
+        // monotonic gate (codex r2) was moved to a pre-scan above
+        // so it can disable emission BEFORE any records are written.
         const cur_page: u32 = @intCast(page_idx + 1);
-        if (cur_page <= last_page_seen) section_emission_enabled = false;
         last_page_seen = cur_page;
 
         // .text mode streams plain text via the upstream extractor — no
