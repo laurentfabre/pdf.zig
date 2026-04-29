@@ -117,10 +117,20 @@ updated: 2026-04-27
   > - `extractFromSpans` outer errdefer frees per-cell `text` before `t.cells`.
   > - `buildCellsWithText` has `cells_initialised` errdefer cleanup.
   > - `cells_owned` flag guards `out.append`.
-  > - New FailingAllocator unit test for `extractFromSpans` exercises every alloc-failure index.
+  > - New FailingAllocator unit test for `extractFromSpans` covers the early alloc-failure indices (0..15) for all five fixed surfaces. The full 0..127 sweep is gated on PR-4d (separate `buildCellsWithText` `bufs.deinit` issue) — see PR-4d entry.
   >
   > **Test strategy.** Mirror `lattice.zig` "extractFromStrokes survives every allocation failure index".
   > **Codex gate.** Verify R5 P2 finding from PR-4 round-2 review is fully resolved.
+
+- [ ] **PR-4d · fix: stream_table.zig late-fail allocation paths (buildCellsWithText bufs)**
+  > [!info]- Details
+  > **Why.** PR-4b fixed the three R5 leak shapes (extractFromSpans outer errdefer, buildCellsWithText cells_initialised, cells_owned around out.append) plus uncovered pre-existing fixes in groupIntoRows (span_slice ownership, sorted_owned) and findColumnAnchors (peaks_owned). The new FailingAllocator stress passes indices 0..15 cleanly, but indices ≥16 still trigger an integer-overflow panic from inside `buildCellsWithText`'s `bufs.deinit` errdefer when `bufs[idx].appendSlice` fails after some bufs grew. Suspected ArrayList / DebugAllocator interaction or an additional ownership transfer that needs guarding.
+  > **Files-touched envelope.** `src/stream_table.zig` (buildCellsWithText only), test bound bumped from 16 → 128.
+  > **Acceptance gate.**
+  > - `test "extractFromSpans survives every allocation failure index"` passes for `fail_index < 128`.
+  > - No regression in current 405/405 tests.
+  >
+  > **Test strategy.** Bump bound + observe no panic + no leak.
 
 - [ ] **PR-4c · fix: fuzz harness target_filter UAF + check arena reset/seed lifetimes**
   > [!info]- Details

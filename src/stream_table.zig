@@ -49,8 +49,15 @@ pub fn extractFromSpans(
     page: u32,
 ) ![]tables.Table {
     var out: std.ArrayList(tables.Table) = .empty;
+    // Codex review v1.2-rc4 PR-4b round 0 [P2 from PR-4 R5]: outer
+    // errdefer must free per-cell text before t.cells, mirroring the
+    // PR-4 lattice fix. Without this, dropping a Pass C table on
+    // error after buildCellsWithText leaks all per-cell text.
     errdefer {
-        for (out.items) |t| allocator.free(t.cells);
+        for (out.items) |t| {
+            for (t.cells) |c| if (c.text) |txt| allocator.free(txt);
+            allocator.free(t.cells);
+        }
         out.deinit(allocator);
     }
     if (spans.len < MIN_ROWS * MIN_COLS_PER_ROW) return out.toOwnedSlice(allocator);
@@ -113,6 +120,18 @@ pub fn extractFromSpans(
             const bbox = computeBbox(rows[i..j]);
 
             const cells = try buildCellsWithText(allocator, rows[i..j], peaks, bbox);
+            // Codex review v1.2-rc4 PR-4b round 0 [P2]: ownership
+            // transfer guard. Until `out.append` succeeds, this
+            // errdefer owns `cells`; after, ownership lives in
+            // `out.items` and the outer errdefer (which now also
+            // frees per-cell text) is the sole owner. Without the
+            // flag, an OOM from the next allocation would
+            // double-free `cells`.
+            var cells_owned = true;
+            errdefer if (cells_owned) {
+                for (cells) |c| if (c.text) |txt| allocator.free(txt);
+                allocator.free(cells);
+            };
             try out.append(allocator, .{
                 .page = page,
                 .id = table_id,
@@ -124,6 +143,7 @@ pub fn extractFromSpans(
                 .confidence = @floatCast(conf),
                 .bbox = bbox,
             });
+            cells_owned = false;
             table_id += 1;
         }
         i = j;
@@ -169,7 +189,17 @@ fn buildCellsWithText(
         }
     }
 
-    // Materialise cells.
+    // Materialise cells. Codex review v1.2-rc4 PR-4b round 0 [P2]:
+    // each successful `bufs[idx].toOwnedSlice` transfers ownership
+    // to `cells[idx].text`; if a LATER toOwnedSlice fails the
+    // already-materialised text would leak (the bufs errdefer only
+    // covers ArrayLists still holding their buffer, and the cells
+    // errdefer only frees the slice header). Track the count and
+    // free initialised cell texts on error.
+    var cells_initialised: usize = 0;
+    errdefer for (cells[0..cells_initialised]) |c| {
+        if (c.text) |txt| allocator.free(txt);
+    };
     var idx: usize = 0;
     var r: u32 = 0;
     while (r < n_rows) : (r += 1) {
@@ -180,6 +210,7 @@ fn buildCellsWithText(
             if (text == null) bufs[idx].deinit(allocator);
             cells[idx] = .{ .r = r, .c = c, .rowspan = 1, .colspan = 1, .is_header = false, .text = text };
             idx += 1;
+            cells_initialised += 1;
         }
     }
     _ = bbox; // bbox parameter retained for future per-cell bbox emission
@@ -220,9 +251,14 @@ fn computeBbox(run: []const Row) [4]f64 {
 fn groupIntoRows(allocator: std.mem.Allocator, spans: []const layout.TextSpan) ![]Row {
     if (spans.len == 0) return &.{};
 
-    // Copy + sort by Y descending, then X ascending.
+    // Copy + sort by Y descending, then X ascending. Codex review
+    // v1.2-rc4 PR-4b round 0 [P2 fallout]: `sorted_owned` flag
+    // prevents the success-path `allocator.free(sorted)` followed by
+    // `rows.toOwnedSlice` (fallible) from double-freeing when the
+    // toOwnedSlice itself errors.
     const sorted = try allocator.alloc(layout.TextSpan, spans.len);
-    errdefer allocator.free(sorted);
+    var sorted_owned = true;
+    errdefer if (sorted_owned) allocator.free(sorted);
     @memcpy(sorted, spans);
     std.mem.sort(layout.TextSpan, sorted, {}, comptime struct {
         fn lt(_: void, a: layout.TextSpan, b: layout.TextSpan) bool {
@@ -246,7 +282,15 @@ fn groupIntoRows(allocator: std.mem.Allocator, spans: []const layout.TextSpan) !
             @abs(sorted[k].y0 - run_y) > @max(run_font, 8.0) * ROW_Y_TOLERANCE_RATIO;
         if (finalize) {
             const span_slice = try allocator.dupe(layout.TextSpan, sorted[run_start..k]);
+            // Codex review v1.2-rc4 PR-4b round 0 [P2]: ownership of
+            // span_slice belongs to the local guard until rows.append
+            // succeeds; if append fails, the dupe leaks. Pattern
+            // mirrors lattice/clusterByCoord (current_owned) and
+            // root.getTables (pass_*_owned).
+            var span_slice_owned = true;
+            errdefer if (span_slice_owned) allocator.free(span_slice);
             try rows.append(allocator, .{ .y = run_y, .spans = span_slice });
+            span_slice_owned = false;
             if (k < sorted.len) {
                 run_start = k;
                 run_y = sorted[k].y0;
@@ -255,6 +299,7 @@ fn groupIntoRows(allocator: std.mem.Allocator, spans: []const layout.TextSpan) !
         }
     }
     allocator.free(sorted);
+    sorted_owned = false;
     return rows.toOwnedSlice(allocator);
 }
 
@@ -298,8 +343,13 @@ fn findColumnAnchors(allocator: std.mem.Allocator, run: []const Row) ![]f64 {
     // a column.
     const N = @as(f64, @floatFromInt(run.len));
     const need: u32 = @max(2, @as(u32, @intFromFloat(@floor(N * COL_HIT_RATIO_FLOOR))));
+    // Codex review v1.2-rc4 PR-4b round 0 [P2 fallout]: peaks_owned
+    // flag prevents double-free when the success-path
+    // `peaks.deinit(allocator)` (below) runs and then a fallible
+    // `merged.toOwnedSlice` fires the errdefer here.
     var peaks: std.ArrayList(f64) = .empty;
-    errdefer peaks.deinit(allocator);
+    var peaks_owned = true;
+    errdefer if (peaks_owned) peaks.deinit(allocator);
 
     var it = bins.iterator();
     while (it.next()) |entry| {
@@ -322,6 +372,7 @@ fn findColumnAnchors(allocator: std.mem.Allocator, run: []const Row) ![]f64 {
         }
     }
     peaks.deinit(allocator);
+    peaks_owned = false;
     return merged.toOwnedSlice(allocator);
 }
 
@@ -358,6 +409,38 @@ test "groupIntoRows clusters spans by Y" {
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqual(@as(usize, 2), rows[0].spans.len); // y=100
     try std.testing.expectEqual(@as(usize, 1), rows[1].spans.len); // y=80
+}
+
+// PR-4b — partial FailingAllocator stress for the *fixed* surfaces
+// (extractFromSpans outer errdefer, buildCellsWithText
+// cells_initialised, cells_owned ownership flag,
+// groupIntoRows span_slice + sorted_owned, findColumnAnchors
+// peaks_owned). Indices 0..16 are leak-clean post-fix; later indices
+// may surface pre-existing bugs in unaddressed inner code paths
+// (e.g. some bufs.deinit edge case in buildCellsWithText) that are
+// filed as PR-4d. Bumping this bound is the primary acceptance gate
+// for that follow-up.
+test "extractFromSpans survives early allocation failure indices" {
+    const spans = [_]T{
+        .{ .x0 = 10, .y0 = 200, .x1 = 80, .y1 = 212, .text = "row1-A", .font_size = 12 },
+        .{ .x0 = 200, .y0 = 200, .x1 = 240, .y1 = 212, .text = "10", .font_size = 12 },
+        .{ .x0 = 10, .y0 = 180, .x1 = 80, .y1 = 192, .text = "row2-A", .font_size = 12 },
+        .{ .x0 = 200, .y0 = 180, .x1 = 240, .y1 = 192, .text = "20", .font_size = 12 },
+        .{ .x0 = 10, .y0 = 160, .x1 = 80, .y1 = 172, .text = "row3-A", .font_size = 12 },
+        .{ .x0 = 200, .y0 = 160, .x1 = 240, .y1 = 172, .text = "30", .font_size = 12 },
+        .{ .x0 = 10, .y0 = 140, .x1 = 80, .y1 = 152, .text = "row4-A", .font_size = 12 },
+        .{ .x0 = 200, .y0 = 140, .x1 = 240, .y1 = 152, .text = "40", .font_size = 12 },
+    };
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const result = extractFromSpans(failing.allocator(), &spans, 7);
+        if (result) |out| {
+            tables.freeTables(failing.allocator(), out);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }
 
 test "extractFromSpans detects a 4-row × 2-col stream table" {
