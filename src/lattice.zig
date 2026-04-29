@@ -1099,13 +1099,23 @@ fn buildLatticeCellsWithText(
     errdefer for (cells[0..cells_initialised]) |c| {
         if (c.text) |txt| allocator.free(txt);
     };
+    // Codex review v1.2-rc4 PR-4d round 0 [P1 latent]: parallel to
+    // stream_table.zig — do NOT call `bufs[idx].deinit(allocator)`
+    // for empty cells. ArrayList.deinit sets `self.* = undefined`
+    // (0xaa under safe build); a subsequent toOwnedSlice failure
+    // would re-fire the bufs errdefer and dereference the poisoned
+    // entries. Empty bufs (capacity = 0) are no-op-deinit at the
+    // errdefer site anyway, so dropping the explicit call is safe.
+    // This was unreached in the existing FailingAllocator test
+    // because the test data places all non-empty cells before
+    // empty ones, but the latent bug would surface with different
+    // data; keep the fix in lock-step with stream_table.
     var idx: usize = 0;
     var r: u32 = 0;
     while (r < n_rows) : (r += 1) {
         var c: u32 = 0;
         while (c < n_cols) : (c += 1) {
             const text = if (bufs[idx].items.len > 0) try bufs[idx].toOwnedSlice(allocator) else null;
-            if (text == null) bufs[idx].deinit(allocator);
             cells[idx] = .{ .r = r, .c = c, .rowspan = 1, .colspan = 1, .is_header = false, .text = text };
             idx += 1;
             cells_initialised += 1;
