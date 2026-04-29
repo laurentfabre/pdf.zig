@@ -477,122 +477,60 @@ test "generate incremental PDF" {
     try std.testing.expect(std.mem.indexOf(u8, pdf_data, "Updated Text") != null);
 }
 
-/// Generate a PDF with metadata in the /Info dictionary
+/// PR-W6.2 [refactor]: metadata fixture via DocumentBuilder.
+/// Exercises `setInfoDict` (W6 escape-hatch surface). Trailer
+/// `/Info N 0 R` is wired automatically by the writer.
 pub fn generateMetadataPdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
-
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
-
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    const content = "BT\n/F1 12 Tf\n100 700 Td\n(Metadata Test) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Object 6: Info dictionary
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /Title (Test Document) /Author (Test Author) ");
-    try writer.writeAll("/Subject (Test Subject) /Keywords (test, pdf, zpdf) ");
-    try writer.writeAll("/Creator (TestGenerator) /Producer (zpdf) >>\nendobj\n");
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 7\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-
-    try writer.writeAll("trailer\n<< /Size 7 /Root 1 0 R /Info 6 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    _ = try doc.setInfoDict(
+        "<< /Title (Test Document) /Author (Test Author) " ++
+            "/Subject (Test Subject) /Keywords (test, pdf, zpdf) " ++
+            "/Creator (TestGenerator) /Producer (zpdf) >>",
+    );
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, "Metadata Test");
+    return doc.write();
 }
 
-/// Generate a PDF with an outline (bookmarks / TOC)
+/// PR-W6.2 [refactor]: outline (bookmark / TOC) fixture via
+/// DocumentBuilder. Exercises `setInfoDict`, `reserveAuxiliaryObject`
+/// for the cyclic /Outlines ↔ item graph, and `setCatalogExtras` for
+/// the /Outlines ref in /Catalog.
 pub fn generateOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    _ = try doc.setInfoDict("<< /Title (Outline Test) >>");
 
-    // Object 1: Catalog with /Outlines
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R >>\nendobj\n");
+    const page1 = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page1.drawText(100, 700, .helvetica, 12, "Chapter 1 Content");
 
-    // Object 2: Pages with 2 pages
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R 9 0 R] /Count 2 >>\nendobj\n");
+    const page2 = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page2.drawText(100, 700, .helvetica, 12, "Chapter 2 Content");
 
-    // Page 1
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+    // Cyclic refs: outlines /First → item, item /Parent → outlines.
+    const outlines = try doc.reserveAuxiliaryObject();
+    const item = try doc.reserveAuxiliaryObject();
 
-    const content1 = "BT\n/F1 12 Tf\n100 700 Td\n(Chapter 1 Content) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content1.len, content1 });
+    var outlines_buf: [128]u8 = undefined;
+    try doc.setAuxiliaryPayload(outlines, try std.fmt.bufPrint(
+        &outlines_buf,
+        "<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count 1 >>",
+        .{ item, item },
+    ));
 
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+    var item_buf: [128]u8 = undefined;
+    try doc.setAuxiliaryPayload(item, try std.fmt.bufPrint(
+        &item_buf,
+        "<< /Title (Chapter 1) /Parent {d} 0 R /Dest [{d} 0 R /Fit] >>",
+        .{ outlines, page1.objNum() },
+    ));
 
-    // Object 6: Info
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /Title (Outline Test) >>\nendobj\n");
+    var extras_buf: [64]u8 = undefined;
+    try doc.setCatalogExtras(try std.fmt.bufPrint(&extras_buf, "/Outlines {d} 0 R", .{outlines}));
 
-    // Object 7: Outlines root
-    const obj7_offset = pdf.items.len;
-    try writer.writeAll("7 0 obj\n<< /Type /Outlines /First 8 0 R /Last 8 0 R /Count 1 >>\nendobj\n");
-
-    // Object 8: Outline item "Chapter 1" pointing to page 1 (obj 3)
-    const obj8_offset = pdf.items.len;
-    try writer.writeAll("8 0 obj\n<< /Title (Chapter 1) /Parent 7 0 R /Dest [3 0 R /Fit] >>\nendobj\n");
-
-    // Page 2
-    const obj9_offset = pdf.items.len;
-    try writer.writeAll("9 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 10 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    const content2 = "BT\n/F1 12 Tf\n100 700 Td\n(Chapter 2 Content) Tj\nET\n";
-    const obj10_offset = pdf.items.len;
-    try writer.print("10 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content2.len, content2 });
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 11\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj10_offset});
-
-    try writer.writeAll("trailer\n<< /Size 11 /Root 1 0 R /Info 6 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// Generate a PDF with link annotations
@@ -770,13 +708,14 @@ test "generate metadata PDF" {
     const pdf_data = try generateMetadataPdf(std.testing.allocator);
     defer std.testing.allocator.free(pdf_data);
     try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Title (Test Document)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Info 6 0 R") != null);
+    // Object numbers are writer-assigned; check the trailer signal instead.
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Info ") != null);
 }
 
 test "generate outline PDF" {
     const pdf_data = try generateOutlinePdf(std.testing.allocator);
     defer std.testing.allocator.free(pdf_data);
-    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Outlines 7 0 R") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Outlines ") != null);
     try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Title (Chapter 1)") != null);
 }
 
@@ -800,81 +739,54 @@ test "generate page label PDF" {
     try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/PageLabels") != null);
 }
 
-/// Generate a PDF with a nested outline (multiple levels, siblings, GoTo actions)
+/// PR-W6.2 [refactor]: nested outline (multi-level, sibling, GoTo
+/// action) fixture via DocumentBuilder.
+/// Hierarchy: /Outlines → Part I (with child Section 1.1) and Part II
+/// (sibling, via /A GoTo). Mirrors the old hand-rolled object layout
+/// modulo numbering.
 pub fn generateNestedOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    const page1 = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page1.drawText(100, 700, .helvetica, 12, "Page One");
 
-    // Object 1: Catalog with Outlines
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 6 0 R >>\nendobj\n");
+    const page2 = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page2.drawText(100, 700, .helvetica, 12, "Page Two");
 
-    // Object 2: Pages (2 pages)
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R 10 0 R] /Count 2 >>\nendobj\n");
+    const outlines = try doc.reserveAuxiliaryObject();
+    const part1 = try doc.reserveAuxiliaryObject();
+    const part2 = try doc.reserveAuxiliaryObject();
+    const section11 = try doc.reserveAuxiliaryObject();
 
-    // Page 1
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+    var buf: [256]u8 = undefined;
+    try doc.setAuxiliaryPayload(outlines, try std.fmt.bufPrint(
+        &buf,
+        "<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count 2 >>",
+        .{ part1, part2 },
+    ));
+    try doc.setAuxiliaryPayload(part1, try std.fmt.bufPrint(
+        &buf,
+        "<< /Title (Part I) /Parent {d} 0 R /Next {d} 0 R " ++
+            "/First {d} 0 R /Last {d} 0 R /Count 1 /Dest [{d} 0 R /Fit] >>",
+        .{ outlines, part2, section11, section11, page1.objNum() },
+    ));
+    try doc.setAuxiliaryPayload(part2, try std.fmt.bufPrint(
+        &buf,
+        "<< /Title (Part II) /Parent {d} 0 R " ++
+            "/A << /S /GoTo /D [{d} 0 R /Fit] >> >>",
+        .{ outlines, page2.objNum() },
+    ));
+    try doc.setAuxiliaryPayload(section11, try std.fmt.bufPrint(
+        &buf,
+        "<< /Title (Section 1.1) /Parent {d} 0 R /Dest [{d} 0 R /Fit] >>",
+        .{ part1, page1.objNum() },
+    ));
 
-    const c1 = "BT\n/F1 12 Tf\n100 700 Td\n(Page One) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ c1.len, c1 });
+    var extras_buf: [64]u8 = undefined;
+    try doc.setCatalogExtras(try std.fmt.bufPrint(&extras_buf, "/Outlines {d} 0 R", .{outlines}));
 
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Object 6: Outlines root
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /Type /Outlines /First 7 0 R /Last 8 0 R /Count 2 >>\nendobj\n");
-
-    // Object 7: "Part I" — top level, has child 9, next sibling 8, dest = page 1
-    const obj7_offset = pdf.items.len;
-    try writer.writeAll("7 0 obj\n<< /Title (Part I) /Parent 6 0 R /Next 8 0 R ");
-    try writer.writeAll("/First 9 0 R /Last 9 0 R /Count 1 /Dest [3 0 R /Fit] >>\nendobj\n");
-
-    // Object 8: "Part II" — top level, via /A GoTo action, dest = page 2
-    const obj8_offset = pdf.items.len;
-    try writer.writeAll("8 0 obj\n<< /Title (Part II) /Parent 6 0 R ");
-    try writer.writeAll("/A << /S /GoTo /D [10 0 R /Fit] >> >>\nendobj\n");
-
-    // Object 9: "Section 1.1" — child of Part I, level 1, dest = page 1
-    const obj9_offset = pdf.items.len;
-    try writer.writeAll("9 0 obj\n<< /Title (Section 1.1) /Parent 7 0 R /Dest [3 0 R /Fit] >>\nendobj\n");
-
-    // Page 2
-    const obj10_offset = pdf.items.len;
-    try writer.writeAll("10 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 11 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-
-    const c2 = "BT\n/F1 12 Tf\n100 700 Td\n(Page Two) Tj\nET\n";
-    const obj11_offset = pdf.items.len;
-    try writer.print("11 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ c2.len, c2 });
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 12\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj10_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj11_offset});
-
-    try writer.writeAll("trailer\n<< /Size 12 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// Generate a PDF with multiple link annotations: URI, GoTo internal, and a non-link annotation
@@ -2140,56 +2052,36 @@ pub fn generateFormXObjectIndirectRefsPdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
-/// Generate a PDF with UTF-16BE encoded metadata and outline title
+/// PR-W6.2 [refactor]: UTF-16BE-titled outline fixture via
+/// DocumentBuilder. The single outline item carries a hex-string
+/// /Title `<FEFF00430061006600E9>` ("Café" in UTF-16BE with BOM) —
+/// straight bytes through `setAuxiliaryPayload`, no escaping needed.
 pub fn generateUtf16BePdf(allocator: std.mem.Allocator) ![]u8 {
-    var pdf: std.ArrayList(u8) = .empty;
-    errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
 
-    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, "UTF16 test");
 
-    // Catalog with Outlines
-    const obj1_offset = pdf.items.len;
-    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 6 0 R >>\nendobj\n");
+    const outlines = try doc.reserveAuxiliaryObject();
+    const item = try doc.reserveAuxiliaryObject();
 
-    const obj2_offset = pdf.items.len;
-    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    var buf: [192]u8 = undefined;
+    try doc.setAuxiliaryPayload(outlines, try std.fmt.bufPrint(
+        &buf,
+        "<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count 1 >>",
+        .{ item, item },
+    ));
+    try doc.setAuxiliaryPayload(item, try std.fmt.bufPrint(
+        &buf,
+        "<< /Title <FEFF00430061006600E9> /Parent {d} 0 R /Dest [{d} 0 R /Fit] >>",
+        .{ outlines, page.objNum() },
+    ));
 
-    const obj3_offset = pdf.items.len;
-    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
-    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+    var extras_buf: [64]u8 = undefined;
+    try doc.setCatalogExtras(try std.fmt.bufPrint(&extras_buf, "/Outlines {d} 0 R", .{outlines}));
 
-    const content = "BT\n/F1 12 Tf\n100 700 Td\n(UTF16 test) Tj\nET\n";
-    const obj4_offset = pdf.items.len;
-    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
-
-    const obj5_offset = pdf.items.len;
-    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
-    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
-
-    // Object 6: Outlines root
-    const obj6_offset = pdf.items.len;
-    try writer.writeAll("6 0 obj\n<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>\nendobj\n");
-
-    // Object 7: Outline item with UTF-16BE title "Café" = FE FF 0043 0061 0066 00E9
-    const obj7_offset = pdf.items.len;
-    try writer.writeAll("7 0 obj\n<< /Title <FEFF00430061006600E9> /Parent 6 0 R /Dest [3 0 R /Fit] >>\nendobj\n");
-
-    const xref_offset = pdf.items.len;
-    try writer.writeAll("xref\n0 8\n");
-    try writer.writeAll("0000000000 65535 f \n");
-    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
-    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
-
-    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
-    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
-
-    return pdf.toOwnedSlice(allocator);
+    return doc.write();
 }
 
 /// PR-3: a single-page tagged PDF with a 2-row × 3-column table.
