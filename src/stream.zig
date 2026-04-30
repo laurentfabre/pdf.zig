@@ -99,6 +99,20 @@ pub const LinkItem = struct {
     dest_page: ?u32 = null,
 };
 
+/// PR-18 [feat]: per-span text + bbox payload for the `--bboxes`
+/// citation-grade extraction mode. Emitted as a parallel
+/// `spans:[{text, bbox:[x0,y0,x1,y1], font_size, font_name}]` array
+/// on `kind:"page"` records when the flag is set.
+pub const SpanInfo = struct {
+    text: []const u8,
+    /// PDF user-space bbox: [x0, y0, x1, y1], bottom-left origin.
+    bbox: [4]f64,
+    font_size: f64,
+    /// Reserved for a future pass that threads font name through
+    /// `SpanCollector`. v1 emits `null` (skipped from JSON).
+    font_name: ?[]const u8 = null,
+};
+
 pub const FormFieldType = enum { text, button, choice, signature, unknown };
 
 pub const FormFieldItem = struct {
@@ -237,6 +251,50 @@ pub const Envelope = struct {
             try writeJsonString(self.writer, w.code);
             try self.writer.writeAll(",\"message\":");
             try writeJsonString(self.writer, w.message);
+            try self.writer.writeAll("}");
+        }
+        try self.writer.writeAll("]");
+        try self.endRecord();
+    }
+
+    /// PR-18 [feat]: same as `emitPage`, plus a parallel
+    /// `spans:[{text, bbox:[x0,y0,x1,y1], font_size, font_name}]`
+    /// array. The array order matches the per-span emission order from
+    /// `extractTextWithBounds` (PDF stream order). Used by the
+    /// `--bboxes` flag in `runExtract` to surface citation-grade
+    /// extraction.
+    pub fn emitPageWithSpans(
+        self: *Envelope,
+        page_number: u32,
+        markdown: []const u8,
+        warnings: []const Warning,
+        spans: []const SpanInfo,
+    ) !void {
+        try self.beginRecord(.page);
+        try self.writer.print(",\"page\":{d}", .{page_number});
+        try self.writeStringField("markdown", markdown);
+        try self.writer.writeAll(",\"warnings\":[");
+        for (warnings, 0..) |w, i| {
+            if (i > 0) try self.writer.writeAll(",");
+            try self.writer.writeAll("{\"code\":");
+            try writeJsonString(self.writer, w.code);
+            try self.writer.writeAll(",\"message\":");
+            try writeJsonString(self.writer, w.message);
+            try self.writer.writeAll("}");
+        }
+        try self.writer.writeAll("],\"spans\":[");
+        for (spans, 0..) |s, i| {
+            if (i > 0) try self.writer.writeAll(",");
+            try self.writer.writeAll("{\"text\":");
+            try writeJsonString(self.writer, s.text);
+            try self.writer.print(
+                ",\"bbox\":[{d:.2},{d:.2},{d:.2},{d:.2}],\"font_size\":{d:.2}",
+                .{ s.bbox[0], s.bbox[1], s.bbox[2], s.bbox[3], s.font_size },
+            );
+            if (s.font_name) |fn_| {
+                try self.writer.writeAll(",\"font_name\":");
+                try writeJsonString(self.writer, fn_);
+            }
             try self.writer.writeAll("}");
         }
         try self.writer.writeAll("]");
@@ -653,6 +711,43 @@ test "page record with warnings array" {
     const written = aw.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"page\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"code\":\"cmap_missing\"") != null);
+}
+
+test "PR-18: emitPageWithSpans appends spans:[] with bbox + font_size" {
+    var buf: [4096]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitPageWithSpans(1, "Hello world", &.{}, &.{
+        .{ .text = "Hello", .bbox = .{ 72, 720, 100, 732 }, .font_size = 12 },
+        .{ .text = "world", .bbox = .{ 105, 720, 140, 732 }, .font_size = 12 },
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"spans\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"text\":\"Hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"bbox\":[72.00,720.00,100.00,732.00]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"font_size\":12.00") != null);
+    // font_name is null by default; should NOT appear in the JSON.
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"font_name\"") == null);
+}
+
+test "PR-18: emitPageWithSpans omits font_name when null but emits when set" {
+    var buf: [4096]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitPageWithSpans(1, "x", &.{}, &.{
+        .{ .text = "x", .bbox = .{ 0, 0, 10, 10 }, .font_size = 12, .font_name = "Helvetica" },
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"font_name\":\"Helvetica\"") != null);
+}
+
+test "PR-18: emitPageWithSpans handles empty spans array as []" {
+    var buf: [1024]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitPageWithSpans(1, "no text", &.{}, &.{});
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"spans\":[]") != null);
 }
 
 test "fatal record carries error kind + recoverable" {
