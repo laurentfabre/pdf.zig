@@ -860,7 +860,7 @@ test "image detection" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
     defer doc.close();
 
-    const images = try doc.getPageImages(0, allocator);
+    const images = try doc.getPageImages(0, allocator, false);
     defer zpdf.Document.freeImages(allocator, images);
 
     try std.testing.expectEqual(@as(usize, 1), images.len);
@@ -884,7 +884,7 @@ test "PR-19 follow-up: getPageImages surfaces /Filter as encoding" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
     defer doc.close();
 
-    const images = try doc.getPageImages(0, allocator);
+    const images = try doc.getPageImages(0, allocator, false);
     defer zpdf.Document.freeImages(allocator, images);
 
     try std.testing.expectEqual(@as(usize, 1), images.len);
@@ -901,7 +901,7 @@ test "images returns empty for page without images" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
     defer doc.close();
 
-    const images = try doc.getPageImages(0, allocator);
+    const images = try doc.getPageImages(0, allocator, false);
     defer allocator.free(images);
 
     try std.testing.expectEqual(@as(usize, 0), images.len);
@@ -916,8 +916,63 @@ test "images out of range page returns error" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
     defer doc.close();
 
-    const result = doc.getPageImages(999, allocator);
+    const result = doc.getPageImages(999, allocator, false);
     try std.testing.expectError(error.PageNotFound, result);
+}
+
+test "PR-19 base64: DCTDecode payload is non-null and equals raw stream bytes" {
+    const allocator = std.testing.allocator;
+
+    // generateImagePdfWithFilter embeds a 1-byte stream (\xFF) with /Filter /DCTDecode.
+    const pdf_data = try testpdf.generateImagePdfWithFilter(allocator, "DCTDecode");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const images = try doc.getPageImages(0, allocator, true);
+    defer zpdf.Document.freeImages(allocator, images);
+
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    try std.testing.expectEqualStrings("DCTDecode", images[0].encoding.?);
+    // DCTDecode is passthrough-friendly: payload must be the raw stream bytes.
+    try std.testing.expect(images[0].payload != null);
+    try std.testing.expectEqual(@as(u8, 0xFF), images[0].payload.?[0]);
+}
+
+test "PR-19 base64: FlateDecode payload is null (not passthrough-friendly)" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateImagePdfWithFilter(allocator, "FlateDecode");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const images = try doc.getPageImages(0, allocator, true);
+    defer zpdf.Document.freeImages(allocator, images);
+
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    try std.testing.expectEqualStrings("FlateDecode", images[0].encoding.?);
+    // FlateDecode is not passthrough-friendly: payload must be null.
+    try std.testing.expect(images[0].payload == null);
+}
+
+test "PR-19 base64: include_payload=false always yields null payload" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateImagePdfWithFilter(allocator, "DCTDecode");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const images = try doc.getPageImages(0, allocator, false);
+    defer zpdf.Document.freeImages(allocator, images);
+
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    // Even for DCTDecode, payload must be null when include_payload is false.
+    try std.testing.expect(images[0].payload == null);
 }
 
 // =========================================================================
@@ -1723,7 +1778,7 @@ test "getPageImages survives cm with a name in the matrix" {
 
     var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
     defer doc.close();
-    const images = try doc.getPageImages(0, allocator);
+    const images = try doc.getPageImages(0, allocator, false);
     defer allocator.free(images);
     // No assertion on image count — the gate is "did not panic".
 }

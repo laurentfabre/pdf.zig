@@ -543,7 +543,7 @@ export fn zpdf_get_page_images(handle: ?*ZpdfDocument, page_num: c_int, out: *?[
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
         if (page_num < 0) return -1;
 
-        const images = doc.getPageImages(@intCast(page_num), c_allocator) catch return -1;
+        const images = doc.getPageImages(@intCast(page_num), c_allocator, false) catch return -1;
 
         if (images.len == 0) {
             c_allocator.free(images);

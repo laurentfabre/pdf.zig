@@ -2007,11 +2007,20 @@ pub const Document = struct {
         /// Borrowed from the document's parsing arena — valid until `Document.close`.
         /// `null` when no /Filter is set (uncompressed sample data).
         encoding: ?[]const u8 = null,
+        /// Raw stream bytes for passthrough-friendly filters (DCTDecode → JPEG,
+        /// JPXDecode → JPEG-2000, CCITTFaxDecode → fax).  Borrowed from the
+        /// document's data slice — valid until `Document.close`.
+        /// Always `null` when `include_payload` was `false`, or when the filter
+        /// is not passthrough-friendly (FlateDecode, none, etc.).
+        payload: ?[]const u8 = null,
     };
 
     /// Detect images on a page and report their positions and dimensions.
+    /// When `include_payload` is true, `ImageInfo.payload` is set to the raw
+    /// compressed stream bytes for DCTDecode / JPXDecode / CCITTFaxDecode images
+    /// (borrowed slice — valid until `Document.close`); other filters yield null.
     /// Caller must free the returned slice.
-    pub fn getPageImages(self: *Document, page_idx: usize, allocator: std.mem.Allocator) ![]ImageInfo {
+    pub fn getPageImages(self: *Document, page_idx: usize, allocator: std.mem.Allocator, include_payload: bool) ![]ImageInfo {
         if (page_idx >= self.pages.items.len) return error.PageNotFound;
 
         const arena = self.parsing_arena.allocator();
@@ -2078,6 +2087,7 @@ pub const Document = struct {
                             .width = img_info.width,
                             .height = img_info.height,
                             .encoding = img_info.encoding,
+                            .payload = if (include_payload) img_info.payload else null,
                         });
                     }
                 }
@@ -2100,7 +2110,7 @@ pub const Document = struct {
         };
     }
 
-    const XObjectImageInfo = struct { width: u32, height: u32, encoding: ?[]const u8 };
+    const XObjectImageInfo = struct { width: u32, height: u32, encoding: ?[]const u8, payload: ?[]const u8 };
 
     fn resolveXObjectImage(self: *Document, page: Page, name: []const u8) ?XObjectImageInfo {
         const arena = self.parsing_arena.allocator();
@@ -2153,7 +2163,20 @@ pub const Document = struct {
             break :blk null;
         };
 
-        return .{ .width = width, .height = height, .encoding = filter_name };
+        // For DCTDecode / JPXDecode / CCITTFaxDecode the raw stream bytes ARE
+        // the encoded image payload (JPEG / JPEG-2000 / fax).  Surface them for
+        // the --images=base64 passthrough mode.  FlateDecode and uncompressed
+        // images are not passthrough-friendly: no decompression here (PR-W4).
+        const payload: ?[]const u8 = if (filter_name) |fn_| blk: {
+            if (std.mem.eql(u8, fn_, "DCTDecode") or
+                std.mem.eql(u8, fn_, "JPXDecode") or
+                std.mem.eql(u8, fn_, "CCITTFaxDecode"))
+                break :blk xobj_stream.data
+            else
+                break :blk null;
+        } else null;
+
+        return .{ .width = width, .height = height, .encoding = filter_name, .payload = payload };
     }
 
     pub fn freeImages(allocator: std.mem.Allocator, images: []ImageInfo) void {
