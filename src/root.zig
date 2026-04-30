@@ -2003,6 +2003,10 @@ pub const Document = struct {
         rect: [4]f64,
         width: u32,
         height: u32,
+        /// First entry of the image XObject's /Filter (name or array head).
+        /// Borrowed from the document's parsing arena — valid until `Document.close`.
+        /// `null` when no /Filter is set (uncompressed sample data).
+        encoding: ?[]const u8 = null,
     };
 
     /// Detect images on a page and report their positions and dimensions.
@@ -2073,6 +2077,7 @@ pub const Document = struct {
                             },
                             .width = img_info.width,
                             .height = img_info.height,
+                            .encoding = img_info.encoding,
                         });
                     }
                 }
@@ -2095,7 +2100,7 @@ pub const Document = struct {
         };
     }
 
-    const XObjectImageInfo = struct { width: u32, height: u32 };
+    const XObjectImageInfo = struct { width: u32, height: u32, encoding: ?[]const u8 };
 
     fn resolveXObjectImage(self: *Document, page: Page, name: []const u8) ?XObjectImageInfo {
         const arena = self.parsing_arena.allocator();
@@ -2133,7 +2138,22 @@ pub const Document = struct {
         const width: u32 = if (xobj_stream.dict.getInt("Width")) |w| @intCast(w) else return null;
         const height: u32 = if (xobj_stream.dict.getInt("Height")) |h| @intCast(h) else return null;
 
-        return .{ .width = width, .height = height };
+        // /Filter may be a single name (`/DCTDecode`) or an array of names
+        // (`[/ASCII85Decode /FlateDecode]`). We surface only the first entry —
+        // it's the codec consumers actually care about (DCTDecode → JPEG,
+        // FlateDecode → raw, JPXDecode → JPEG-2000, CCITTFaxDecode → fax).
+        const filter_name: ?[]const u8 = blk: {
+            if (xobj_stream.dict.getName("Filter")) |n| break :blk n;
+            if (xobj_stream.dict.getArray("Filter")) |arr| {
+                for (arr) |item| switch (item) {
+                    .name => |n| break :blk n,
+                    else => {},
+                };
+            }
+            break :blk null;
+        };
+
+        return .{ .width = width, .height = height, .encoding = filter_name };
     }
 
     pub fn freeImages(allocator: std.mem.Allocator, images: []ImageInfo) void {
