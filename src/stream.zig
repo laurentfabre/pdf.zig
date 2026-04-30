@@ -42,6 +42,10 @@ pub const RecordKind = enum {
     /// and pixel dimensions. Image bytes / encoding / base64 / path
     /// modes are deferred to a PR-19 follow-up.
     image,
+    /// PR-21 [feat]: per-document PDF/UA structure tree. Single
+    /// record carrying the full /StructTreeRoot walk as a JSON tree.
+    /// Off by default (records can be very large on long documents).
+    struct_tree,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -58,6 +62,7 @@ pub const RecordKind = enum {
             .section => "section",
             .annotations => "annotations",
             .image => "image",
+            .struct_tree => "struct_tree",
         };
     }
 };
@@ -395,6 +400,27 @@ pub const Envelope = struct {
         }
         try self.writer.writeAll("]");
         try self.endRecord();
+    }
+
+    /// PR-21 [feat]: open a `kind:"struct_tree"` record. The caller
+    /// is responsible for writing the body (the JSON tree); this
+    /// helper writes the leading `,"root":` separator and closes the
+    /// record on `endStructTreeRecord`. Layered like this so
+    /// `stream.zig` doesn't need to know about `structtree`'s types.
+    pub fn beginStructTreeRecord(self: *Envelope) !void {
+        try self.beginRecord(.struct_tree);
+        try self.writer.writeAll(",\"root\":");
+    }
+
+    pub fn endStructTreeRecord(self: *Envelope) !void {
+        try self.endRecord();
+    }
+
+    /// Caller-side helper for the (rare) case of an empty struct tree.
+    pub fn emitStructTreeEmpty(self: *Envelope) !void {
+        try self.beginStructTreeRecord();
+        try self.writer.writeAll("null");
+        try self.endStructTreeRecord();
     }
 
     /// PR-19 [feat]: emit `kind:"image"` for one image. The caller
@@ -898,6 +924,29 @@ test "PR-19: emitImage emits page + bbox + pixel dims" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\"bbox\":[100.00,500.00,300.00,650.00]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"width_px\":200") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"height_px\":150") != null);
+}
+
+test "PR-21: emitStructTreeEmpty produces null root" {
+    var buf: [1024]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitStructTreeEmpty();
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"struct_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"root\":null") != null);
+}
+
+test "PR-21: beginStructTreeRecord + write body + end emits well-formed JSON" {
+    var buf: [2048]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.beginStructTreeRecord();
+    // Caller-controlled body — minimal hand-written tree.
+    try env.writer.writeAll("{\"type\":\"Document\",\"mcid_refs\":[],\"children\":[]}");
+    try env.endStructTreeRecord();
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"struct_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"root\":{\"type\":\"Document\"") != null);
 }
 
 test "fatal record carries error kind + recoverable" {

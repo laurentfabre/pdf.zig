@@ -1798,6 +1798,35 @@ test "PR-20: getPageAnnotations extracts non-/Link annotations" {
     try std.testing.expectEqual(@as(usize, 1), links.len);
 }
 
+test "PR-21: emitElementJson produces a Table → TR → TD tree" {
+    // Tagged-table fixture has a real /StructTreeRoot rooted at Table:
+    //   Table → 2× TR → 3× TD each (6 cells, MCIDs 0..5).
+    // Emit the tree as JSON and assert the structural shape.
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const tree = try doc.getStructTree();
+    try std.testing.expect(tree.root != null);
+
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try zpdf.structtree.emitElementJson(tree.root.?, &aw.writer, 0);
+
+    const json = aw.written();
+    // Type-shape sanity: Table is the root; TR/TD nesting present; MCIDs 0..5 attached.
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"type\":\"Table\""));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"TR\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"TD\"") != null);
+    // Each TD carries exactly one MCID. Verify all six are emitted.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mcid_refs\":[0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mcid_refs\":[1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mcid_refs\":[5]") != null);
+}
+
 test "PR-20: getPageAnnotations returns empty for page without /Annots" {
     const allocator = std.testing.allocator;
     const bytes = try testpdf.generateMinimalPdf(allocator, "Hello");

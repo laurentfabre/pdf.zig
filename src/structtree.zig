@@ -14,6 +14,7 @@ const std = @import("std");
 const parser = @import("parser.zig");
 const pagetree = @import("pagetree.zig");
 const xref_mod = @import("xref.zig");
+const stream = @import("stream.zig");
 
 const Object = parser.Object;
 const ObjRef = parser.ObjRef;
@@ -86,6 +87,72 @@ pub const StructTree = struct {
         return result;
     }
 };
+
+/// PR-21 [feat]: emit a `StructElement` (and its full subtree) as
+/// JSON into `writer`. Schema per node:
+///
+///   { "type": "Sect",
+///     ["alt": "Section title",]
+///     ["page_obj": <PDF object number>,]
+///     "mcid_refs": [3, 4, 5],
+///     "children": [<recursive>] }
+///
+/// `mcid_refs` collects every direct-child MCID; `children` collects
+/// only direct-child elements (so the tree shape is recursive on
+/// `children` alone). Depth is bounded by `MAX_STRUCT_DEPTH` to match
+/// the parser's invariant. `page_obj` is emitted as the raw PDF
+/// object number (not a 0-based page index) — the consumer correlates
+/// against `kind:"meta"` / `kind:"page"` records if they need indices.
+pub fn emitElementJson(elem: *const StructElement, writer: *std.io.Writer, depth: u32) !void {
+    if (depth >= MAX_STRUCT_DEPTH) {
+        // Safety net: emit a marker leaf to keep the JSON parseable.
+        try writer.writeAll("{\"type\":\"_truncated_max_depth\",\"mcid_refs\":[],\"children\":[]}");
+        return;
+    }
+
+    try writer.writeAll("{\"type\":");
+    try stream.writeJsonString(writer, elem.struct_type);
+    if (elem.alt_text) |alt| {
+        try writer.writeAll(",\"alt\":");
+        try stream.writeJsonString(writer, alt);
+    }
+    if (elem.title) |t| {
+        try writer.writeAll(",\"title\":");
+        try stream.writeJsonString(writer, t);
+    }
+    if (elem.page_ref) |pr| {
+        try writer.print(",\"page_obj\":{d}", .{pr.num});
+    }
+
+    // Direct-child MCIDs first.
+    try writer.writeAll(",\"mcid_refs\":[");
+    var first_mcid = true;
+    for (elem.children) |c| {
+        switch (c) {
+            .mcid => |m| {
+                if (!first_mcid) try writer.writeAll(",");
+                try writer.print("{d}", .{m.mcid});
+                first_mcid = false;
+            },
+            .element => {},
+        }
+    }
+
+    // Direct-child elements (recursive).
+    try writer.writeAll("],\"children\":[");
+    var first_elem = true;
+    for (elem.children) |c| {
+        switch (c) {
+            .element => |e| {
+                if (!first_elem) try writer.writeAll(",");
+                try emitElementJson(e, writer, depth + 1);
+                first_elem = false;
+            },
+            .mcid => {},
+        }
+    }
+    try writer.writeAll("]}");
+}
 
 const MAX_STRUCT_DEPTH: u32 = 256;
 

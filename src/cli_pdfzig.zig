@@ -56,6 +56,10 @@ pub const ExtractArgs = struct {
     /// (bbox + pixel dims). `--images=base64` and `--images=path`
     /// payload modes are deferred to a follow-up.
     images: bool = false,
+    /// PR-21 [feat]: when true, emit a single `kind:"struct_tree"`
+    /// document-level record carrying the full /StructTreeRoot walk
+    /// as a JSON tree. Off by default (records can be very large).
+    struct_tree: bool = false,
 };
 
 pub const InfoArgs = struct {
@@ -171,6 +175,8 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             out.bboxes = true;
         } else if (std.mem.eql(u8, a, "--images")) {
             out.images = true;
+        } else if (std.mem.eql(u8, a, "--struct-tree")) {
+            out.struct_tree = true;
         } else if (std.mem.eql(u8, a, "--scan-threshold")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -426,6 +432,22 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                         });
                     }
                     try env.emitToc(toc_items.items);
+                }
+            }
+            // PR-21 [feat]: emit the document's PDF/UA structure tree
+            // (single record, doc-level) when --struct-tree is set.
+            if (args.struct_tree) {
+                const tree = doc.getStructTree() catch null;
+                if (tree) |t| {
+                    if (t.root) |root| {
+                        env.beginStructTreeRecord() catch |e| return mapWriteErr(e);
+                        zpdf.structtree.emitElementJson(root, env.writer, 0) catch |e| return mapWriteErr(e);
+                        env.endStructTreeRecord() catch |e| return mapWriteErr(e);
+                    } else {
+                        env.emitStructTreeEmpty() catch |e| return mapWriteErr(e);
+                    }
+                } else {
+                    env.emitStructTreeEmpty() catch |e| return mapWriteErr(e);
                 }
             }
             try writer.flush();
@@ -991,6 +1013,7 @@ fn writeHelp() !void {
         \\  --scan-threshold PCT        flag doc as "scanned" when ≥PCT% of pages have <50B text (default 50)
         \\  --bboxes                    add per-span text + bbox + font_size to kind:"page" records (citation-grade)
         \\  --images                    emit kind:"image" records (metadata-only: page, bbox, width_px, height_px)
+        \\  --struct-tree               emit kind:"struct_tree" with full PDF/UA structure tree (off by default; large)
         \\
         \\New options:
         \\  -o, --output-file FILE      output PDF path (required)
@@ -1194,6 +1217,14 @@ test "PR-19: --images flag is accepted and defaults off" {
 
     const cmd_on = try parseArgs(&.{ "extract", "--images", "foo.pdf" });
     try std.testing.expect(cmd_on.extract.images);
+}
+
+test "PR-21: --struct-tree flag is accepted and defaults off" {
+    const cmd_off = try parseArgs(&.{ "extract", "foo.pdf" });
+    try std.testing.expect(!cmd_off.extract.struct_tree);
+
+    const cmd_on = try parseArgs(&.{ "extract", "--struct-tree", "foo.pdf" });
+    try std.testing.expect(cmd_on.extract.struct_tree);
 }
 
 test "page range: null spec → all pages" {
