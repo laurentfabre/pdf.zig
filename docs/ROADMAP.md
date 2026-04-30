@@ -358,7 +358,7 @@ updated: 2026-04-27
   > **Test strategy.** Single fixture, single integration test.
   > **Codex gate.** Schema covers PDF spec annotation types correctly; timestamps ISO-8601 (PDF dates are not).
 
-- [ ] **PR-21 · feat: PDF/UA structure-tree NDJSON output**
+- [x] **PR-21 · feat: PDF/UA structure-tree NDJSON output** _(shipped via #36)_
   > [!info]- Details
   > **Files-touched envelope.** `src/structtree.zig` (new emission helper), `src/cli_pdfzig.zig` (`--struct-tree` flag), `src/integration_test.zig`.
   > **Acceptance gate.**
