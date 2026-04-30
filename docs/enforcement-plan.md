@@ -9,7 +9,7 @@ Adapted from the zlsx companion repo's enforcement plan (`/Users/lf/Projects/Pro
 | Phase | Description | Status |
 |---|---|---|
 | 1 | Free wins: branch protection, repo merge settings, CODEOWNERS, PR template | **Local files done; gh-api side pending** |
-| 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | **Done (advisory; promote to required after a few green runs)** |
+| 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | **Done — gates promoted to required_status_checks (2026-04-30, after #28/#29/#30 ran clean)** |
 | 3 | Worktree + subagent conventions: helper script, commit-msg trailer, PR template fields | Not started |
 | 4 | Agent-as-reviewer CI job (codex-review-on-PR) | Not started |
 | 5 | Optional: coverage gate, TDAD map, mutation testing | Deferred |
@@ -202,7 +202,16 @@ Plus repo-level: disable merge-commit style, enable auto-delete on merge.
   - **ABI gate** correctly fails on `15c62829` ("v1.5 RC: capi exports + Python binding wired into release"), which touched `src/capi.zig` + `python/zpdf/_cdef.h` but not `python/zpdf/_ffi.py`. Would have caught the real historical ABI lockstep gap.
   - **Test-presence gate** correctly fails on `2f073f6` (PR-W6.4) — the AcroForm fixture migration. Expected behavior: the gate doesn't know `testpdf.zig` is itself a test fixture file. The right answer for a refactor PR is the `no-test-needed` label; the escape label was verified to skip the gate cleanly.
   - **Monotonic gate** correctly fires on a synthetic `337 → 314` regression (HEAD compared against pre-W6 history); the `delete-tests-ok` escape skips cleanly.
-- [ ] **Pending** — promote gates to `required_status_checks` after a few green PR runs. Three contexts to add: `Test-presence check`, `C ABI 3-file transaction`, `Monotonic test count`. Keep them advisory until at least one PR exercises each escape label so we know the escape actually works in CI (not only locally).
+- [x] **Done (2026-04-30)** — promoted gates to `required_status_checks` after green runs on #28/#29/#30. Branch protection now requires all four contexts on every PR to `main`:
+  ```
+  Build + test (Linux x86_64)
+  Test-presence check
+  C ABI 3-file transaction
+  Monotonic test count
+  ```
+  Restore-current-state: `gh api repos/laurentfabre/pdf.zig/branches/main/protection`.
+
+  Escape labels are stable from local smoke + a future PR that needs one will exercise the live path. The first such PR to use an escape label should be documented in this section.
 
 ### Local invocation (debugging a gate)
 
