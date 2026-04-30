@@ -612,11 +612,38 @@ pub const Document = struct {
     }
 
     /// Analyze page layout (columns, paragraphs, reading order)
-    pub fn analyzePageLayout(self: *Document, page_num: usize, allocator: std.mem.Allocator) !LayoutResult {
+    /// PR-W6 follow-up: result wrapper for `analyzePageLayout` that owns
+    /// both the layout result AND the input span buffer it was built
+    /// from. `LayoutResult` alone doesn't free the input — its
+    /// `.spans[i].text` slices are aliased views of bytes allocated by
+    /// `extractTextWithBounds`. Bundling them here makes `deinit`
+    /// release everything in one call.
+    pub const PageLayout = struct {
+        result: LayoutResult,
+        input_spans: []TextSpan,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *PageLayout) void {
+            // Free the LayoutResult first: its `deinit` only releases
+            // the wrapper array storage (lines/columns/paragraphs/order
+            // and the spans-slice header) — NOT the per-span text bytes,
+            // which are still owned by `input_spans`. We then call
+            // `freeTextSpans` to release the input array + its text
+            // bytes. Order is intentional: any post-deinit access to
+            // `.result.spans` is UB; this avoids freeing text under a
+            // still-live alias.
+            self.result.deinit();
+            Document.freeTextSpans(self.allocator, self.input_spans);
+        }
+    };
+
+    pub fn analyzePageLayout(self: *Document, page_num: usize, allocator: std.mem.Allocator) !PageLayout {
         const spans = try self.extractTextWithBounds(page_num, allocator);
+        errdefer Document.freeTextSpans(allocator, spans);
         const page = self.pages.items[page_num];
         const page_width = page.media_box[2] - page.media_box[0];
-        return layout.analyzeLayout(allocator, spans, page_width);
+        const result = try layout.analyzeLayout(allocator, spans, page_width);
+        return .{ .result = result, .input_spans = spans, .allocator = allocator };
     }
 
     /// Check if the document has a structure tree (is tagged)

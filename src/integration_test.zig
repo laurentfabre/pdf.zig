@@ -1708,6 +1708,23 @@ test "getPageImages survives cm with a name in the matrix" {
     // No assertion on image count — the gate is "did not panic".
 }
 
+test "analyzePageLayout does not leak the input spans array" {
+    // Regression for the PR-W6 fuzz follow-up: extractTextWithBounds
+    // allocates a `[]TextSpan` that analyzeLayout `@memcpy`s into its
+    // own buffer; the input array used to leak. This test runs the
+    // analyzePageLayout path on a tiny known-good fixture and relies
+    // on std.testing.allocator's leak detection to catch a regression.
+    const allocator = std.testing.allocator;
+    const bytes = try testpdf.generateMinimalPdf(allocator, "Hello");
+    defer allocator.free(bytes);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    var layout_result = try doc.analyzePageLayout(0, allocator);
+    defer layout_result.deinit();
+    // No assertion on layout content — the gate is "no leak detected".
+}
+
 test "extractMarkdown survives BDC with non-name property dict (MCID extraction)" {
     const allocator = std.testing.allocator;
     // `42 /Tag BDC` — first operand should be /Tag (name), second is the
