@@ -32,6 +32,11 @@ pub const RecordKind = enum {
     /// chunkers, citation tools) use it to anchor references to
     /// logical document divisions.
     section,
+    /// PR-20 [feat]: per-page non-/Link annotations (highlight,
+    /// underline, strikeout, ink, text/sticky-note, freetext, …).
+    /// Existing `kind:"links"` is unchanged; `/Link` and `/Widget`
+    /// subtypes are filtered out of `kind:"annotations"`.
+    annotations,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -46,6 +51,7 @@ pub const RecordKind = enum {
             .form => "form",
             .table => "table",
             .section => "section",
+            .annotations => "annotations",
         };
     }
 };
@@ -97,6 +103,24 @@ pub const LinkItem = struct {
     uri: ?[]const u8 = null,
     /// 1-based destination page if this is an internal link.
     dest_page: ?u32 = null,
+};
+
+/// PR-20 [feat]: non-/Link annotation payload. `subtype` is the
+/// raw `/Subtype` name lower-cased (e.g. `"highlight"`, `"underline"`,
+/// `"strikeout"`, `"ink"`, `"text"`, `"freetext"`). Emitted via
+/// `Envelope.emitAnnotations` as one `kind:"annotations"` record per
+/// page that has any non-link annotation.
+pub const AnnotationItem = struct {
+    subtype: []const u8,
+    /// PDF page rect: [x0, y0, x1, y1] in user-space points.
+    rect: [4]f64,
+    /// `/Contents` entry — text content of the annotation.
+    contents: ?[]const u8 = null,
+    /// `/T` entry — annotation author / title.
+    author: ?[]const u8 = null,
+    /// `/M` entry — modification date as the raw PDF date string
+    /// (e.g. `"D:20260430123045Z"`); not parsed.
+    modified: ?[]const u8 = null,
 };
 
 /// PR-18 [feat]: per-span text + bbox payload for the `--bboxes`
@@ -347,6 +371,38 @@ pub const Envelope = struct {
                 try writeJsonString(self.writer, u);
             }
             if (item.dest_page) |p| try self.writer.print(",\"dest_page\":{d}", .{p});
+            try self.writer.writeAll("}");
+        }
+        try self.writer.writeAll("]");
+        try self.endRecord();
+    }
+
+    /// PR-20 [feat]: emit `kind:"annotations"` for non-/Link
+    /// annotations on a page. Caller filters /Link upstream
+    /// (`Document.getPageAnnotations` does this).
+    pub fn emitAnnotations(self: *Envelope, page_number: u32, items: []const AnnotationItem) !void {
+        try self.beginRecord(.annotations);
+        try self.writer.print(",\"page\":{d},\"items\":[", .{page_number});
+        for (items, 0..) |item, i| {
+            if (i > 0) try self.writer.writeAll(",");
+            try self.writer.writeAll("{\"type\":");
+            try writeJsonString(self.writer, item.subtype);
+            try self.writer.print(
+                ",\"rect\":[{d:.2},{d:.2},{d:.2},{d:.2}]",
+                .{ item.rect[0], item.rect[1], item.rect[2], item.rect[3] },
+            );
+            if (item.contents) |s| {
+                try self.writer.writeAll(",\"contents\":");
+                try writeJsonString(self.writer, s);
+            }
+            if (item.author) |s| {
+                try self.writer.writeAll(",\"author\":");
+                try writeJsonString(self.writer, s);
+            }
+            if (item.modified) |s| {
+                try self.writer.writeAll(",\"modified\":");
+                try writeJsonString(self.writer, s);
+            }
             try self.writer.writeAll("}");
         }
         try self.writer.writeAll("]");
@@ -748,6 +804,54 @@ test "PR-18: emitPageWithSpans handles empty spans array as []" {
     try env.emitPageWithSpans(1, "no text", &.{}, &.{});
     const written = aw.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"spans\":[]") != null);
+}
+
+test "PR-20: emitAnnotations basic shape (subtype + rect)" {
+    var buf: [4096]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitAnnotations(1, &.{
+        .{ .subtype = "highlight", .rect = .{ 100, 200, 300, 220 } },
+        .{ .subtype = "ink", .rect = .{ 50, 60, 70, 80 } },
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"annotations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"page\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"highlight\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"ink\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"rect\":[100.00,200.00,300.00,220.00]") != null);
+    // Optional fields absent → not in JSON.
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"contents\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"author\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"modified\"") == null);
+}
+
+test "PR-20: emitAnnotations emits contents/author/modified when present" {
+    var buf: [4096]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitAnnotations(2, &.{
+        .{
+            .subtype = "text",
+            .rect = .{ 0, 0, 10, 10 },
+            .contents = "Sticky note here",
+            .author = "Reviewer A",
+            .modified = "D:20260430123045Z",
+        },
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"contents\":\"Sticky note here\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"author\":\"Reviewer A\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"modified\":\"D:20260430123045Z\"") != null);
+}
+
+test "PR-20: emitAnnotations with empty list still emits the record" {
+    var buf: [1024]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitAnnotations(1, &.{});
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"items\":[]") != null);
 }
 
 test "fatal record carries error kind + recoverable" {

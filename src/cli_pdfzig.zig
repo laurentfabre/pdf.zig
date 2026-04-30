@@ -621,6 +621,26 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                         env.emitLinks(@intCast(page_idx + 1), items.items) catch |e| return mapWriteErr(e);
                     }
                 } else |_| {}
+                // PR-20 [feat]: emit a kind:"annotations" record per page
+                // that has non-/Link annotations (highlight, underline,
+                // strikeout, ink, text/sticky-note, freetext, …).
+                if (doc.getPageAnnotations(page_idx, allocator)) |annots| {
+                    defer zpdf.Document.freeAnnotations(allocator, annots);
+                    if (annots.len > 0) {
+                        var items: std.ArrayList(stream.AnnotationItem) = .empty;
+                        defer items.deinit(allocator);
+                        for (annots) |a| {
+                            try items.append(allocator, .{
+                                .subtype = a.subtype,
+                                .rect = a.rect,
+                                .contents = a.contents,
+                                .author = a.author,
+                                .modified = a.modified,
+                            });
+                        }
+                        env.emitAnnotations(@intCast(page_idx + 1), items.items) catch |e| return mapWriteErr(e);
+                    }
+                } else |_| {}
                 writer.flush() catch |e| return mapWriteErr(e);
             },
             .md => {
