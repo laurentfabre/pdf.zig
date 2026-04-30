@@ -37,6 +37,11 @@ pub const RecordKind = enum {
     /// Existing `kind:"links"` is unchanged; `/Link` and `/Widget`
     /// subtypes are filtered out of `kind:"annotations"`.
     annotations,
+    /// PR-19 [feat]: per-image metadata record. One record per image
+    /// XObject placed on a page. Carries page index, position bbox,
+    /// and pixel dimensions. Image bytes / encoding / base64 / path
+    /// modes are deferred to a PR-19 follow-up.
+    image,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -52,6 +57,7 @@ pub const RecordKind = enum {
             .table => "table",
             .section => "section",
             .annotations => "annotations",
+            .image => "image",
         };
     }
 };
@@ -121,6 +127,20 @@ pub const AnnotationItem = struct {
     /// `/M` entry — modification date as the raw PDF date string
     /// (e.g. `"D:20260430123045Z"`); not parsed.
     modified: ?[]const u8 = null,
+};
+
+/// PR-19 [feat]: per-image metadata for the `--images` mode.
+/// Emitted as one `kind:"image"` record per image XObject placed on a
+/// page. v1: metadata only (bbox + pixel dims). Future: `encoding`
+/// (e.g. "DCTDecode"/"FlateDecode") + `payload_b64` (when --images=base64)
+/// + `path` (when --images=path).
+pub const ImageItem = struct {
+    /// PDF page bbox after CTM, in user-space points.
+    bbox: [4]f64,
+    /// Image XObject /Width.
+    width_px: u32,
+    /// Image XObject /Height.
+    height_px: u32,
 };
 
 /// PR-18 [feat]: per-span text + bbox payload for the `--bboxes`
@@ -374,6 +394,19 @@ pub const Envelope = struct {
             try self.writer.writeAll("}");
         }
         try self.writer.writeAll("]");
+        try self.endRecord();
+    }
+
+    /// PR-19 [feat]: emit `kind:"image"` for one image. The caller
+    /// loops per page and per image (one record per image, NOT one
+    /// record per page like links/annotations) to keep records flat
+    /// for embedding pipelines that batch on a per-image basis.
+    pub fn emitImage(self: *Envelope, page_number: u32, item: ImageItem) !void {
+        try self.beginRecord(.image);
+        try self.writer.print(
+            ",\"page\":{d},\"bbox\":[{d:.2},{d:.2},{d:.2},{d:.2}],\"width_px\":{d},\"height_px\":{d}",
+            .{ page_number, item.bbox[0], item.bbox[1], item.bbox[2], item.bbox[3], item.width_px, item.height_px },
+        );
         try self.endRecord();
     }
 
@@ -852,6 +885,19 @@ test "PR-20: emitAnnotations with empty list still emits the record" {
     try env.emitAnnotations(1, &.{});
     const written = aw.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"items\":[]") != null);
+}
+
+test "PR-19: emitImage emits page + bbox + pixel dims" {
+    var buf: [2048]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitImage(3, .{ .bbox = .{ 100, 500, 300, 650 }, .width_px = 200, .height_px = 150 });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"page\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"bbox\":[100.00,500.00,300.00,650.00]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"width_px\":200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"height_px\":150") != null);
 }
 
 test "fatal record carries error kind + recoverable" {

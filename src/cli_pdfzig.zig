@@ -51,6 +51,11 @@ pub const ExtractArgs = struct {
     /// parallel `spans:[{text, bbox, font_size, font_name}]` array.
     /// Citation-grade extraction; off by default.
     bboxes: bool = false,
+    /// PR-19 [feat]: when true, emit a `kind:"image"` record per
+    /// image XObject placed on a page. v1 mode is metadata-only
+    /// (bbox + pixel dims). `--images=base64` and `--images=path`
+    /// payload modes are deferred to a follow-up.
+    images: bool = false,
 };
 
 pub const InfoArgs = struct {
@@ -164,6 +169,8 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             out.no_warnings = true;
         } else if (std.mem.eql(u8, a, "--bboxes")) {
             out.bboxes = true;
+        } else if (std.mem.eql(u8, a, "--images")) {
+            out.images = true;
         } else if (std.mem.eql(u8, a, "--scan-threshold")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -641,6 +648,21 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                         env.emitAnnotations(@intCast(page_idx + 1), items.items) catch |e| return mapWriteErr(e);
                     }
                 } else |_| {}
+                // PR-19 [feat]: emit one kind:"image" record per image
+                // XObject placed on the page (metadata-only mode).
+                // Future: --images=base64 / --images=path payload modes.
+                if (args.images) {
+                    if (doc.getPageImages(page_idx, allocator)) |images| {
+                        defer allocator.free(images);
+                        for (images) |img| {
+                            env.emitImage(@intCast(page_idx + 1), .{
+                                .bbox = img.rect,
+                                .width_px = img.width,
+                                .height_px = img.height,
+                            }) catch |e| return mapWriteErr(e);
+                        }
+                    } else |_| {}
+                }
                 writer.flush() catch |e| return mapWriteErr(e);
             },
             .md => {
@@ -968,6 +990,7 @@ fn writeHelp() !void {
         \\  --no-warnings               suppress `warnings` array on page records
         \\  --scan-threshold PCT        flag doc as "scanned" when ≥PCT% of pages have <50B text (default 50)
         \\  --bboxes                    add per-span text + bbox + font_size to kind:"page" records (citation-grade)
+        \\  --images                    emit kind:"image" records (metadata-only: page, bbox, width_px, height_px)
         \\
         \\New options:
         \\  -o, --output-file FILE      output PDF path (required)
@@ -1163,6 +1186,14 @@ test "PR-18: --bboxes flag is accepted and defaults off" {
 
     const cmd_on = try parseArgs(&.{ "extract", "--bboxes", "foo.pdf" });
     try std.testing.expect(cmd_on.extract.bboxes);
+}
+
+test "PR-19: --images flag is accepted and defaults off" {
+    const cmd_off = try parseArgs(&.{ "extract", "foo.pdf" });
+    try std.testing.expect(!cmd_off.extract.images);
+
+    const cmd_on = try parseArgs(&.{ "extract", "--images", "foo.pdf" });
+    try std.testing.expect(cmd_on.extract.images);
 }
 
 test "page range: null spec → all pages" {
