@@ -323,7 +323,7 @@ updated: 2026-04-27
   > **Test strategy.** Existing fixture + new test.
   > **Codex gate.** No false-trigger on inline `# ` characters in PDF text; ordering vs page records.
 
-- [ ] **PR-18 · feat: citation-grade `--bboxes` flag (`spans:[]` per page)**
+- [x] **PR-18 · feat: citation-grade `--bboxes` flag (`spans:[]` per page)** (#30)
   > [!info]- Details
   > **Files-touched envelope.** `src/cli_pdfzig.zig` (flag + emission), `src/stream.zig` (extend `page` record schema), `src/integration_test.zig`, README.
   > **Acceptance gate.**
