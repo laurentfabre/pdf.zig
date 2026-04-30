@@ -870,6 +870,26 @@ test "image detection" {
     // CTM was "200 0 0 150 100 500 cm"
     try std.testing.expectApproxEqRel(@as(f64, 100), images[0].rect[0], 0.01);
     try std.testing.expectApproxEqRel(@as(f64, 500), images[0].rect[1], 0.01);
+
+    // Fixture has no /Filter, so encoding stays null.
+    try std.testing.expect(images[0].encoding == null);
+}
+
+test "PR-19 follow-up: getPageImages surfaces /Filter as encoding" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateImagePdfWithFilter(allocator, "DCTDecode");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const images = try doc.getPageImages(0, allocator);
+    defer zpdf.Document.freeImages(allocator, images);
+
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    try std.testing.expect(images[0].encoding != null);
+    try std.testing.expectEqualStrings("DCTDecode", images[0].encoding.?);
 }
 
 test "images returns empty for page without images" {

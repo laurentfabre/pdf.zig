@@ -681,6 +681,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                                 .bbox = img.rect,
                                 .width_px = img.width,
                                 .height_px = img.height,
+                                .encoding = img.encoding,
                             }) catch |e| return mapWriteErr(e);
                         }
                     } else |_| {}
@@ -1012,7 +1013,7 @@ fn writeHelp() !void {
         \\  --no-warnings               suppress `warnings` array on page records
         \\  --scan-threshold PCT        flag doc as "scanned" when ≥PCT% of pages have <50B text (default 50)
         \\  --bboxes                    add per-span text + bbox + font_size to kind:"page" records (citation-grade)
-        \\  --images                    emit kind:"image" records (metadata-only: page, bbox, width_px, height_px)
+        \\  --images                    emit kind:"image" records (metadata-only: page, bbox, width_px, height_px, encoding)
         \\  --struct-tree               emit kind:"struct_tree" with full PDF/UA structure tree (off by default; large)
         \\
         \\New options:

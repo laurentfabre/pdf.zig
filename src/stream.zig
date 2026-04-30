@@ -136,9 +136,9 @@ pub const AnnotationItem = struct {
 
 /// PR-19 [feat]: per-image metadata for the `--images` mode.
 /// Emitted as one `kind:"image"` record per image XObject placed on a
-/// page. v1: metadata only (bbox + pixel dims). Future: `encoding`
-/// (e.g. "DCTDecode"/"FlateDecode") + `payload_b64` (when --images=base64)
-/// + `path` (when --images=path).
+/// page. v1: metadata only (bbox + pixel dims + optional encoding).
+/// Future: `payload_b64` (when --images=base64) + `path` (when
+/// --images=path).
 pub const ImageItem = struct {
     /// PDF page bbox after CTM, in user-space points.
     bbox: [4]f64,
@@ -146,6 +146,10 @@ pub const ImageItem = struct {
     width_px: u32,
     /// Image XObject /Height.
     height_px: u32,
+    /// First entry of the image XObject's /Filter (e.g. "DCTDecode",
+    /// "FlateDecode", "JPXDecode", "CCITTFaxDecode"), or `null` for
+    /// uncompressed sample data. Borrowed slice — caller does not own.
+    encoding: ?[]const u8 = null,
 };
 
 /// PR-18 [feat]: per-span text + bbox payload for the `--bboxes`
@@ -433,6 +437,10 @@ pub const Envelope = struct {
             ",\"page\":{d},\"bbox\":[{d:.2},{d:.2},{d:.2},{d:.2}],\"width_px\":{d},\"height_px\":{d}",
             .{ page_number, item.bbox[0], item.bbox[1], item.bbox[2], item.bbox[3], item.width_px, item.height_px },
         );
+        if (item.encoding) |enc| {
+            try self.writer.writeAll(",\"encoding\":");
+            try writeJsonString(self.writer, enc);
+        }
         try self.endRecord();
     }
 
@@ -924,6 +932,22 @@ test "PR-19: emitImage emits page + bbox + pixel dims" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\"bbox\":[100.00,500.00,300.00,650.00]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"width_px\":200") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"height_px\":150") != null);
+    // No encoding → field should be omitted entirely from the record.
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"encoding\"") == null);
+}
+
+test "PR-19: emitImage surfaces /Filter as encoding when set" {
+    var buf: [2048]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitImage(1, .{
+        .bbox = .{ 0, 0, 100, 100 },
+        .width_px = 32,
+        .height_px = 32,
+        .encoding = "DCTDecode",
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"encoding\":\"DCTDecode\"") != null);
 }
 
 test "PR-21: emitStructTreeEmpty produces null root" {

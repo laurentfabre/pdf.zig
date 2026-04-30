@@ -834,6 +834,53 @@ pub fn generateImagePdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Generate a PDF with a single image XObject that carries a /Filter
+/// entry (e.g. "DCTDecode" for a JPEG passthrough). The stream payload
+/// itself is one byte of garbage — the parser only reads /Width,
+/// /Height, /Filter; it never decodes the body. Used by PR-19
+/// follow-up tests that exercise the `encoding` field surfaced via
+/// `getPageImages`.
+pub fn generateImagePdfWithFilter(allocator: std.mem.Allocator, filter_name: []const u8) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>\nendobj\n");
+
+    const content = "200 0 0 150 100 500 cm\n/Im1 Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /XObject /Subtype /Image /Width 100 /Height 100 ");
+    try writer.print("/Filter /{s} /Length 1 >>\n", .{filter_name});
+    try writer.writeAll("stream\n\xFF\nendstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
 /// Generate a single-page PDF whose only page-level content stream
 /// emits `/TableForm Do`, where `TableForm` is a Form XObject that
 /// draws a 3×3 ruled table using stroke ops on absolute coordinates.
