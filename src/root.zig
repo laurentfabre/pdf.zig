@@ -646,6 +646,17 @@ pub const Document = struct {
         return .{ .result = result, .input_spans = spans, .allocator = allocator };
     }
 
+    /// PR-21 [feat]: parse and return the document's PDF/UA structure
+    /// tree. Returned `StructTree` is allocated on the parsing arena
+    /// and lives for the document's lifetime — caller must NOT
+    /// `deinit` it. If the document has no /StructTreeRoot the
+    /// returned tree's `.root` is null. Errors only on a parser-level
+    /// allocation failure.
+    pub fn getStructTree(self: *Document) !structtree.StructTree {
+        const arena = self.parsing_arena.allocator();
+        return structtree.parseStructTree(arena, self.data, &self.xref_table, &self.object_cache);
+    }
+
     /// Check if the document has a structure tree (is tagged)
     pub fn hasStructureTree(self: *Document) bool {
         const arena = self.parsing_arena.allocator();
