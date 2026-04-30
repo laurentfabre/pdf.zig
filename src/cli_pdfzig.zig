@@ -47,6 +47,10 @@ pub const ExtractArgs = struct {
     /// to flag the document as scanned. Default 50 = ≥half the
     /// extracted pages are below 50 bytes of extracted text.
     scan_threshold: u8 = 50,
+    /// PR-18 [feat]: when true, augment `kind:"page"` records with a
+    /// parallel `spans:[{text, bbox, font_size, font_name}]` array.
+    /// Citation-grade extraction; off by default.
+    bboxes: bool = false,
 };
 
 pub const InfoArgs = struct {
@@ -158,6 +162,8 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             out.no_toc = true;
         } else if (std.mem.eql(u8, a, "--no-warnings")) {
             out.no_warnings = true;
+        } else if (std.mem.eql(u8, a, "--bboxes")) {
+            out.bboxes = true;
         } else if (std.mem.eql(u8, a, "--scan-threshold")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -562,10 +568,42 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
 
         switch (args.output_mode) {
             .ndjson => {
-                env.emitPage(@intCast(page_idx + 1), md, &.{}) catch |e| {
-                    allocator.free(md);
-                    return mapWriteErr(e);
-                };
+                if (args.bboxes) {
+                    // PR-18 [feat]: extract spans + emit with parallel
+                    // bbox payload. extractTextWithBounds allocates a
+                    // []TextSpan with per-span heap text; freeTextSpans
+                    // releases both. SpanInfo is built on the stack-fed
+                    // ArrayList for O(N) emission.
+                    const spans_raw = doc.extractTextWithBounds(page_idx, allocator) catch |e| {
+                        allocator.free(md);
+                        return mapWriteErr(e);
+                    };
+                    defer zpdf.Document.freeTextSpans(allocator, spans_raw);
+
+                    var span_infos: std.ArrayList(stream.SpanInfo) = .empty;
+                    defer span_infos.deinit(allocator);
+                    span_infos.ensureTotalCapacity(allocator, spans_raw.len) catch |e| {
+                        allocator.free(md);
+                        return mapWriteErr(e);
+                    };
+                    for (spans_raw) |s| {
+                        span_infos.appendAssumeCapacity(.{
+                            .text = s.text,
+                            .bbox = .{ s.x0, s.y0, s.x1, s.y1 },
+                            .font_size = s.font_size,
+                        });
+                    }
+
+                    env.emitPageWithSpans(@intCast(page_idx + 1), md, &.{}, span_infos.items) catch |e| {
+                        allocator.free(md);
+                        return mapWriteErr(e);
+                    };
+                } else {
+                    env.emitPage(@intCast(page_idx + 1), md, &.{}) catch |e| {
+                        allocator.free(md);
+                        return mapWriteErr(e);
+                    };
+                }
                 allocator.free(md);
                 // Hyperlinks (v1.0.1): emit a kind:"links" record per page that has any.
                 if (doc.getPageLinks(page_idx, allocator)) |links| {
@@ -909,6 +947,7 @@ fn writeHelp() !void {
         \\  --no-toc                    suppress `toc` record (NDJSON only)
         \\  --no-warnings               suppress `warnings` array on page records
         \\  --scan-threshold PCT        flag doc as "scanned" when ≥PCT% of pages have <50B text (default 50)
+        \\  --bboxes                    add per-span text + bbox + font_size to kind:"page" records (citation-grade)
         \\
         \\New options:
         \\  -o, --output-file FILE      output PDF path (required)
@@ -1096,6 +1135,14 @@ test "parse rejects --max-tokens 0" {
 
 test "parse rejects unknown --output value" {
     try std.testing.expectError(error.InvalidOutputMode, parseArgs(&.{ "extract", "--output", "bogus", "foo.pdf" }));
+}
+
+test "PR-18: --bboxes flag is accepted and defaults off" {
+    const cmd_off = try parseArgs(&.{ "extract", "foo.pdf" });
+    try std.testing.expect(!cmd_off.extract.bboxes);
+
+    const cmd_on = try parseArgs(&.{ "extract", "--bboxes", "foo.pdf" });
+    try std.testing.expect(cmd_on.extract.bboxes);
 }
 
 test "page range: null spec → all pages" {
