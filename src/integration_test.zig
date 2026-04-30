@@ -1708,6 +1708,108 @@ test "getPageImages survives cm with a name in the matrix" {
     // No assertion on image count — the gate is "did not panic".
 }
 
+test "PR-20: getPageAnnotations extracts non-/Link annotations" {
+    // Builds a PDF via DocumentBuilder with four hand-crafted annotation
+    // aux objects covering the primary subtypes (text, highlight,
+    // underline, ink), then verifies getPageAnnotations returns them
+    // with correct fields and skips a /Link annotation that's also on
+    // the page (handled by getPageLinks).
+    const allocator = std.testing.allocator;
+    const document = @import("pdf_document.zig");
+
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "Annotated body");
+
+    const text_annot = try doc.addAuxiliaryObject(
+        "<< /Type /Annot /Subtype /Text /Rect [50 700 70 720] " ++
+            "/Contents (Sticky note) /T (Reviewer A) " ++
+            "/M (D:20260430123045Z) >>",
+    );
+    const hi_annot = try doc.addAuxiliaryObject(
+        "<< /Type /Annot /Subtype /Highlight /Rect [72 720 200 736] " ++
+            "/Contents (Important) >>",
+    );
+    const ul_annot = try doc.addAuxiliaryObject(
+        "<< /Type /Annot /Subtype /Underline /Rect [72 720 200 722] >>",
+    );
+    const ink_annot = try doc.addAuxiliaryObject(
+        "<< /Type /Annot /Subtype /Ink /Rect [100 600 300 620] >>",
+    );
+    const link_annot = try doc.addAuxiliaryObject(
+        "<< /Type /Annot /Subtype /Link /Rect [10 10 100 30] " ++
+            "/A << /S /URI /URI (https://example.com) >> >>",
+    );
+
+    var extras_buf: [192]u8 = undefined;
+    try page.setPageExtras(try std.fmt.bufPrint(
+        &extras_buf,
+        "/Annots [{d} 0 R {d} 0 R {d} 0 R {d} 0 R {d} 0 R]",
+        .{ text_annot, hi_annot, ul_annot, ink_annot, link_annot },
+    ));
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var parsed = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer parsed.close();
+
+    const annots = try parsed.getPageAnnotations(0, allocator);
+    defer zpdf.Document.freeAnnotations(allocator, annots);
+
+    // Exactly 4 non-link annotations.
+    try std.testing.expectEqual(@as(usize, 4), annots.len);
+
+    // Index annotations by subtype for stable assertions (order is
+    // page-Annots-array order, but we don't rely on it here).
+    var found_text = false;
+    var found_highlight = false;
+    var found_underline = false;
+    var found_ink = false;
+    for (annots) |a| {
+        if (std.mem.eql(u8, a.subtype, "text")) {
+            found_text = true;
+            try std.testing.expectEqualStrings("Sticky note", a.contents.?);
+            try std.testing.expectEqualStrings("Reviewer A", a.author.?);
+            try std.testing.expectEqualStrings("D:20260430123045Z", a.modified.?);
+        } else if (std.mem.eql(u8, a.subtype, "highlight")) {
+            found_highlight = true;
+            try std.testing.expectEqualStrings("Important", a.contents.?);
+        } else if (std.mem.eql(u8, a.subtype, "underline")) {
+            found_underline = true;
+            try std.testing.expect(a.contents == null);
+        } else if (std.mem.eql(u8, a.subtype, "ink")) {
+            found_ink = true;
+        } else {
+            // /Link must NOT appear here — it's filtered upstream.
+            return error.UnexpectedSubtype;
+        }
+    }
+    try std.testing.expect(found_text);
+    try std.testing.expect(found_highlight);
+    try std.testing.expect(found_underline);
+    try std.testing.expect(found_ink);
+
+    // /Link still surfaces via getPageLinks.
+    const links = try parsed.getPageLinks(0, allocator);
+    defer zpdf.Document.freeLinks(allocator, links);
+    try std.testing.expectEqual(@as(usize, 1), links.len);
+}
+
+test "PR-20: getPageAnnotations returns empty for page without /Annots" {
+    const allocator = std.testing.allocator;
+    const bytes = try testpdf.generateMinimalPdf(allocator, "Hello");
+    defer allocator.free(bytes);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+    const annots = try doc.getPageAnnotations(0, allocator);
+    defer zpdf.Document.freeAnnotations(allocator, annots);
+    try std.testing.expectEqual(@as(usize, 0), annots.len);
+}
+
 test "analyzePageLayout does not leak the input spans array" {
     // Regression for the PR-W6 fuzz follow-up: extractTextWithBounds
     // allocates a `[]TextSpan` that analyzeLayout `@memcpy`s into its

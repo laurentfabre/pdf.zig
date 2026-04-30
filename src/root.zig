@@ -1829,6 +1829,113 @@ pub const Document = struct {
         allocator.free(links);
     }
 
+    /// PR-20 [feat]: per-page annotation other than `/Link` (which has
+    /// its own dedicated extractor `getPageLinks`). `subtype` is the
+    /// raw `/Subtype` name (lower-cased; e.g. `"highlight"`,
+    /// `"underline"`, `"strikeout"`, `"ink"`, `"text"`, `"freetext"`).
+    /// `rect` is the PDF user-space `/Rect` `[x0, y0, x1, y1]`.
+    /// `contents`/`author`/`modified` come from `/Contents`, `/T`,
+    /// `/M` respectively; any may be null when the source PDF omits
+    /// them.
+    pub const Annotation = struct {
+        subtype: []const u8,
+        rect: [4]f64,
+        contents: ?[]const u8 = null,
+        author: ?[]const u8 = null,
+        modified: ?[]const u8 = null,
+    };
+
+    pub fn getPageAnnotations(self: *Document, page_idx: usize, allocator: std.mem.Allocator) ![]Annotation {
+        if (page_idx >= self.pages.items.len) return error.PageNotFound;
+
+        const arena = self.parsing_arena.allocator();
+        const page = self.pages.items[page_idx];
+
+        const annots_obj = page.dict.get("Annots") orelse return allocator.alloc(Annotation, 0);
+
+        const annots_arr = switch (annots_obj) {
+            .array => |a| a,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch
+                    return allocator.alloc(Annotation, 0);
+                break :blk switch (obj) {
+                    .array => |a| a,
+                    else => return allocator.alloc(Annotation, 0),
+                };
+            },
+            else => return allocator.alloc(Annotation, 0),
+        };
+
+        var out: std.ArrayList(Annotation) = .empty;
+        errdefer {
+            for (out.items) |a| {
+                allocator.free(a.subtype);
+                if (a.contents) |s| allocator.free(s);
+                if (a.author) |s| allocator.free(s);
+                if (a.modified) |s| allocator.free(s);
+            }
+            out.deinit(allocator);
+        }
+
+        for (annots_arr) |annot_obj| {
+            const annot_dict = switch (annot_obj) {
+                .dict => |d| d,
+                .reference => |r| blk: {
+                    const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch continue;
+                    break :blk switch (obj) {
+                        .dict => |d| d,
+                        else => continue,
+                    };
+                },
+                else => continue,
+            };
+
+            const subtype_raw = annot_dict.getName("Subtype") orelse continue;
+            // Skip /Link (handled by getPageLinks) and /Widget (form fields
+            // have their own /AcroForm-based extractor).
+            if (std.mem.eql(u8, subtype_raw, "Link") or std.mem.eql(u8, subtype_raw, "Widget")) continue;
+
+            const rect = parseRect(annot_dict) orelse continue;
+
+            const subtype = try lowercaseDupe(allocator, subtype_raw);
+            errdefer allocator.free(subtype);
+
+            var item = Annotation{ .subtype = subtype, .rect = rect };
+            if (annot_dict.getString("Contents")) |s| {
+                item.contents = try allocator.dupe(u8, s);
+            }
+            errdefer if (item.contents) |s| allocator.free(s);
+            if (annot_dict.getString("T")) |s| {
+                item.author = try allocator.dupe(u8, s);
+            }
+            errdefer if (item.author) |s| allocator.free(s);
+            if (annot_dict.getString("M")) |s| {
+                item.modified = try allocator.dupe(u8, s);
+            }
+            errdefer if (item.modified) |s| allocator.free(s);
+
+            try out.append(allocator, item);
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    pub fn freeAnnotations(allocator: std.mem.Allocator, annotations: []Annotation) void {
+        for (annotations) |a| {
+            allocator.free(a.subtype);
+            if (a.contents) |s| allocator.free(s);
+            if (a.author) |s| allocator.free(s);
+            if (a.modified) |s| allocator.free(s);
+        }
+        allocator.free(annotations);
+    }
+
+    fn lowercaseDupe(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+        const buf = try allocator.alloc(u8, src.len);
+        for (src, 0..) |b, i| buf[i] = std.ascii.toLower(b);
+        return buf;
+    }
+
     fn parseRect(dict: Object.Dict) ?[4]f64 {
         const rect_arr = dict.getArray("Rect") orelse return null;
         if (rect_arr.len < 4) return null;
