@@ -347,7 +347,7 @@ updated: 2026-04-27
   > **Test strategy.** Three integration tests (one per mode).
   > **Codex gate.** Base64 payload doesn't break NDJSON line-buffering on multi-MB images (cap or stream-as-array); path-mode doesn't escape the output dir.
 
-- [ ] **PR-20 · feat: annotation extraction (non-link)**
+- [x] **PR-20 · feat: annotation extraction (non-link)** (#33)
   > [!info]- Details
   > **Files-touched envelope.** `src/cli_pdfzig.zig`, `src/stream.zig` (new `annotations` kind), upstream parser glue.
   > **Acceptance gate.**
