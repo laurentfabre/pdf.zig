@@ -692,10 +692,11 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                             if (args.images_mode == .base64) {
                                 if (img.payload) |raw| {
                                     // Passthrough filter — base64-encode the raw bytes.
-                                    const b64_len = std.base64.standard.calcSize(raw.len);
+                                    const Encoder = std.base64.standard.Encoder;
+                                    const b64_len = Encoder.calcSize(raw.len);
                                     const b64_buf = try allocator.alloc(u8, b64_len);
                                     defer allocator.free(b64_buf);
-                                    const b64 = std.base64.standard.encode(b64_buf, raw);
+                                    const b64 = Encoder.encode(b64_buf, raw);
                                     env.emitImage(@intCast(page_idx + 1), .{
                                         .bbox = img.rect,
                                         .width_px = img.width,
