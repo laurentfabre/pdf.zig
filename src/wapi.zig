@@ -85,16 +85,18 @@ export fn zpdf_extract_page(handle: i32, page_num: i32, out_len: *usize) ?[*]u8 
     const idx: usize = @intCast(handle);
 
     if (documents[idx]) |doc| {
-        var buffer: std.ArrayList(u8) = .empty;
-        doc.extractText(@intCast(page_num), buffer.writer(wasm_allocator)) catch return null;
+        var aw = std.Io.Writer.Allocating.init(wasm_allocator);
+        errdefer aw.deinit();
+        doc.extractText(@intCast(page_num), &aw.writer) catch return null;
 
         // Handle empty buffer - toOwnedSlice returns undefined ptr for empty slice
-        if (buffer.items.len == 0) {
+        if (aw.written().len == 0) {
+            aw.deinit();
             out_len.* = 0;
             return null;
         }
 
-        const slice = buffer.toOwnedSlice(wasm_allocator) catch return null;
+        const slice = aw.toOwnedSlice() catch return null;
         out_len.* = slice.len;
         return slice.ptr;
     }

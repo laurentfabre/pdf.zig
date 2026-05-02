@@ -7,7 +7,7 @@ upstream: Lulzx/zpdf @ 5eba7ad
 licence: CC0-1.0 (matches upstream)
 binary_size: 647 KB (ReleaseSafe, aarch64-macos)
 languages: [zig, python, markdown]
-toolchain: zig 0.15.2 (homebrew-pinned)
+toolchain: zig 0.16.0
 default_branch: main
 tags:
   - project/pdf-zig

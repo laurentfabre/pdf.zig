@@ -29,13 +29,13 @@ test "extract text from minimal PDF" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
     defer doc.close();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
 
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, &output.writer);
 
     // Should contain our test text
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "Test123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Test123") != null);
 }
 
 test "parse multi-page PDF" {
@@ -61,13 +61,13 @@ test "extract all text from multi-page PDF" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
     defer doc.close();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
 
-    try doc.extractAllText(output.writer(allocator));
+    try doc.extractAllText(&output.writer);
 
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "PageA") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "PageB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "PageA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "PageB") != null);
 }
 
 test "parse TJ operator PDF" {
@@ -79,14 +79,14 @@ test "parse TJ operator PDF" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
     defer doc.close();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
 
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, &output.writer);
 
     // TJ with spacing should produce "Hello World" (with space from -200 adjustment)
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "Hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "World") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "World") != null);
 }
 
 test "page info extraction" {
@@ -256,15 +256,15 @@ test "extract text from incremental PDF - gets updated content" {
     // Should have 1 page
     try std.testing.expectEqual(@as(usize, 1), doc.pageCount());
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
 
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, &output.writer);
 
     // Should extract "Updated Text" NOT "Original Text"
     // because incremental update replaced object 4
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "Updated") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "Original") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Updated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Original") == null);
 }
 
 test "page tree tolerates leaf node without /Type" {
@@ -279,10 +279,10 @@ test "page tree tolerates leaf node without /Type" {
 
     try std.testing.expectEqual(@as(usize, 1), doc.pageCount());
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "NoTypeTest") != null);
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try doc.extractText(0, &output.writer);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "NoTypeTest") != null);
 }
 
 test "inline image does not corrupt text extraction" {
@@ -294,13 +294,13 @@ test "inline image does not corrupt text extraction" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
     defer doc.close();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try doc.extractText(0, &output.writer);
 
     // Both text spans surrounding the inline image must be present (Fix 1: BI/EI skip)
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "Before") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "After") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "After") != null);
 }
 
 // =========================================================================
@@ -1061,18 +1061,18 @@ test "superscript positioning does not insert spurious newline" {
     const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
     defer doc.close();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try doc.extractText(0, &output.writer);
 
     // All three text chunks must be present
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "Hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "World") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "World") != null);
 
     // No newline should appear between them: the 7-unit Y shift for the
     // superscript is below the threshold max(7,12)*0.7=8.4 (Fix 8)
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\n") == null);
 }
 
 // PR-1 — Pass B (lattice) recurses into Form XObject `Do` operator,
@@ -1887,7 +1887,7 @@ test "PR-21: emitElementJson produces a Table → TR → TD tree" {
     const tree = try doc.getStructTree();
     try std.testing.expect(tree.root != null);
 
-    var aw = std.io.Writer.Allocating.init(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     try zpdf.structtree.emitElementJson(tree.root.?, &aw.writer, 0);
 

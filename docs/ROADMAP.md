@@ -5,7 +5,7 @@ status: active
 current: v1.2-rc3
 next: v1.2-rc4
 default_branch: main
-toolchain: zig 0.15.2
+toolchain: zig 0.16.0
 loop:
   pick: "/next-pr"
   review_fix: "/pr-cycle"
@@ -422,9 +422,9 @@ updated: 2026-04-27
   > **Test strategy.** 14 unit tests (one per BuiltinFont) + round-trip integration test.
   > **Codex gate.** WinAnsi encoding completeness vs the standard; backslash-escape edge cases; empty-text drawText is a no-op (not malformed BT/ET).
 
-- [ ] **PR-W4 · feat: FlateDecode content-stream compression** (deferred — Zig 0.15.2 stdlib gap)
-  > [!warning] Blocked on Zig stdlib
-  > Both `std.compress.flate.Compress` (high-level) and `std.compress.flate.Compress.Simple` are non-functional in Zig 0.15.2. `Compress.drain` calls `@panic("TODO")` and `Simple.finish` has a compile-time error in `hasher.container()` (Container is an enum, not callable). Until upstream Zig completes the deflate encoder, this PR can't ship without either (a) writing a hand-rolled deflate encoder (~500 LOC, scope creep), (b) shelling out to `zlib` (breaks the no-deps story), or (c) waiting for Zig 0.16+.
+- [ ] **PR-W4 · feat: FlateDecode content-stream compression**
+  > [!info] Unblocked by the 0.16 toolchain bump
+  > 0.15.2's `std.compress.flate.Compress` was non-functional (`Compress.drain` panicked, `Simple.finish` had a compile error in `hasher.container()`). 0.16.0 ships a working deflate encoder with `container: .zlib` — exactly what PDF `/FlateDecode` expects. This PR wires it into `pdf_writer.Writer.writeStreamCompressed` and adds a `compress_content_streams: bool` flag on `DocumentBuilder`.
   > **Files-touched envelope.** `src/pdf_writer.zig`, `src/pdf_document.zig`, `src/integration_test.zig`.
   > **Acceptance gate.**
   > - Streams >256 B compress with `/Filter /FlateDecode`; smaller stay raw.

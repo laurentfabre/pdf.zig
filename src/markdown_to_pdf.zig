@@ -48,10 +48,10 @@ pub fn render(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
     var iter = std.mem.splitScalar(u8, markdown, '\n');
     var skip_blank: bool = false;
     while (iter.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, " \t\r");
+        const line = std.mem.trimEnd(u8, raw_line, " \t\r");
 
         // Page break marker: a line containing only `---`.
-        if (std.mem.eql(u8, std.mem.trimLeft(u8, line, " \t"), "---")) {
+        if (std.mem.eql(u8, std.mem.trimStart(u8, line, " \t"), "---")) {
             try renderer.beginPage();
             skip_blank = true;
             continue;
@@ -65,7 +65,7 @@ pub fn render(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
         }
         skip_blank = false;
 
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
         if (std.mem.startsWith(u8, trimmed, "# ") and !std.mem.startsWith(u8, trimmed, "## ")) {
             try renderer.heading(trimmed[2..], H1_SIZE);
         } else if (std.mem.startsWith(u8, trimmed, "## ") and !std.mem.startsWith(u8, trimmed, "### ")) {
