@@ -43,7 +43,7 @@ pdf.zig ships in three loosely-coupled layers, and the layers split into **reade
   - High level: `pdf_document.DocumentBuilder` — single-use builder with balanced `/Pages` tree (fan-out 10), `addPage` returning a `*PageBuilder`, `addAuxiliaryObject` / `reserveAuxiliaryObject` + `setAuxiliaryPayload` (cyclic graphs like /Outlines ↔ items), `setInfoDict`, `setCatalogExtras`. Writes `/Info` ref into the trailer automatically when set. After `write()` the builder is consumed (`written = true`); subsequent mutations return `error.DocumentAlreadyWritten`.
   - Page level: `PageBuilder.drawText(x, y, font, size, text)` — typed `BT … Tj ET` op composer with auto-resource emission; `appendContent` for raw content streams (TJ kerning, Tm matrices, etc.); `setResourcesRaw` to override the auto `/Resources/Font` dict; `setPageExtras` for `/Annots`/`/Group`/`/StructParents`. `markFontUsed(font)` returns the resource name (`/F0`..`/F13`) for `Tf` operators in raw streams.
   - Fonts: 14 standard PDF Type 1 base-14 fonts via `BuiltinFont` enum; WinAnsiEncoding for the 12 ASCII-friendly ones, native encoding for Symbol/ZapfDingbats.
-- **What the writer does NOT do**: TrueType subsetting / UTF-8 outside WinAnsi; charts; images; encryption; signatures; linearization. Tier-1 = readable, valid PDFs with text-only content. FlateDecode content-stream compression is available (PR-W4, `compress_content_streams: bool` on `DocumentBuilder`) but opt-in.
+- **What the writer does NOT do**: FlateDecode content-stream compression (PR-W4 pending — Zig 0.16.0 stdlib is ready, implementation in progress); TrueType subsetting / UTF-8 outside WinAnsi; charts; images; encryption; signatures; linearization. Tier-1 = readable, valid PDFs with text-only content. Output is uncompressed (4-5× larger than typical) but every viewer reads it.
 - **Quality evidence** (per README *Status* + audit):
   - 0 crashes on Alfred's 1,776-PDF corpus.
   - 11 fuzz targets × 1M iters each (`zig build fuzz`).
@@ -138,7 +138,7 @@ Unlike a build system, pdf.zig has no compilation targets at the user level — 
 - **Don't ignore the terminal `{"kind":"fatal"}` record** — it's the contract for parser death. SIGABRT is suppressed in release; if your pipeline doesn't surface fatal records, you'll see "exit 1, no error message".
 - **Don't load the entire NDJSON output into a buffer before parsing** — the per-page flush is meaningless if you re-buffer.
 - **Don't pass `**bold**` / fenced code / tables to `pdf.zig new`** — it preserves them as raw chars (no inline formatting in Tier-1). For richer output, fall back to `pandoc` + a real Markdown→PDF engine.
-- **Don't expect `pdf.zig new` to compress streams** — Tier-1 emits raw uncompressed content. Files are 4-5× typical size; readable by every viewer. (PR-W4 deferred until Zig 0.16+ ships a working flate compressor.)
+- **Don't expect `pdf.zig new` to compress streams** — Tier-1 emits raw uncompressed content. Files are 4-5× typical size; readable by every viewer. (PR-W4 pending — Zig 0.16.0 stdlib is ready, implementation in progress.)
 
 ---
 
@@ -244,7 +244,7 @@ pdf.zig is the default for ~90% of PDF → text work but **deliberately doesn't 
 | Figures, captions, document understanding | `docling` | full document-AI pipeline |
 | Form field extraction | `pypdf` / `pdfplumber` | pdf.zig's reader exposes /AcroForm fields (PR-17) but does not validate / fill them |
 | Encrypted PDF (password protected) | `qpdf --decrypt` then re-run pdf.zig, or `pypdf` | parser does not implement password-decrypt |
-| FlateDecode compression on emitted PDFs | pdf.zig `DocumentBuilder` with `compress_content_streams: true` | PR-W4 shipped; opt-in per-document |
+| FlateDecode compression on emitted PDFs | (none — accept 4-5× size) | PR-W4 pending; Zig 0.16.0 stdlib is ready, implementation in progress |
 
 ### Fallback recipe (CLI)
 
@@ -464,7 +464,7 @@ Upstream `Lulzx/zpdf` ships weekly. pdf.zig's `src/` mirrors upstream; quarterly
 1. **Default to the CLI**: `pdf.zig new -o out.pdf doc.md`. Tier-1 only — confirm the input is plain ASCII paragraphs/headings/lists.
 2. **Programmatic in Zig** → `DocumentBuilder` + `PageBuilder` from `pdf_document.zig`. Use `setInfoDict`, `setCatalogExtras`, `addPage`, `drawText` for the standard surface. For aux objects with cyclic refs, use `reserveAuxiliaryObject` + `setAuxiliaryPayload`.
 3. **Need bold/italic/code/tables/images** → fall back to `pandoc` + `wkhtmltopdf` / `weasyprint`. pdf.zig's writer is Tier-1 by design.
-4. **Need compressed output** → not yet supported (PR-W4 deferred). Files are 4-5× typical size but readable everywhere.
+4. **Need compressed output** → not yet available (PR-W4 pending — Zig 0.16.0 stdlib is ready, implementation in progress). Files are 4-5× typical size but readable everywhere.
 
 ### When asked "is pdf.zig installed?"
 
@@ -581,7 +581,7 @@ pdf.zig extract decrypted.pdf
 - **Mutate a parsed `Document`** — it's read-only; build a fresh one via `DocumentBuilder`.
 - **Reuse a `DocumentBuilder` after `write()`** — single-use; build fresh per output.
 - **Pass non-ASCII to `pdf.zig new`** — bytes drop silently; transliterate first or use pandoc.
-- **Expect compressed output from `pdf.zig new` by default** — compression is opt-in via `compress_content_streams: true` on `DocumentBuilder` (PR-W4); the CLI does not yet expose a flag.
+- **Expect compressed output from `pdf.zig new`** — Tier-1 emits raw uncompressed streams (PR-W4 pending); accept the 4-5× size.
 - **Pipe `pdf.zig extract` into `pdf.zig new`** — the modes don't roundtrip; extract gives Markdown, new takes Markdown, but the writer is Tier-1 only and would lose all formatting/structure.
 
 ---
