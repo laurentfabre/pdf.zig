@@ -138,7 +138,7 @@ Unlike a build system, pdf.zig has no compilation targets at the user level — 
 - **Don't ignore the terminal `{"kind":"fatal"}` record** — it's the contract for parser death. SIGABRT is suppressed in release; if your pipeline doesn't surface fatal records, you'll see "exit 1, no error message".
 - **Don't load the entire NDJSON output into a buffer before parsing** — the per-page flush is meaningless if you re-buffer.
 - **Don't pass `**bold**` / fenced code / tables to `pdf.zig new`** — it preserves them as raw chars (no inline formatting in Tier-1). For richer output, fall back to `pandoc` + a real Markdown→PDF engine.
-- **Don't expect `pdf.zig new` to compress streams** — Tier-1 emits raw uncompressed content. Files are 4-5× typical size; readable by every viewer. (PR-W4 deferred until Zig 0.16+ ships a working flate compressor.)
+- **Don't expect compressed output from `pdf.zig new` by default** — the CLI doesn't expose a compression flag; use `DocumentBuilder.compress_content_streams = true` from Zig code (PR-W4). Tier-1 `pdf.zig new` stays uncompressed; file sizes are 4-5× typical.
 
 ---
 
@@ -464,7 +464,7 @@ Upstream `Lulzx/zpdf` ships weekly. pdf.zig's `src/` mirrors upstream; quarterly
 1. **Default to the CLI**: `pdf.zig new -o out.pdf doc.md`. Tier-1 only — confirm the input is plain ASCII paragraphs/headings/lists.
 2. **Programmatic in Zig** → `DocumentBuilder` + `PageBuilder` from `pdf_document.zig`. Use `setInfoDict`, `setCatalogExtras`, `addPage`, `drawText` for the standard surface. For aux objects with cyclic refs, use `reserveAuxiliaryObject` + `setAuxiliaryPayload`.
 3. **Need bold/italic/code/tables/images** → fall back to `pandoc` + `wkhtmltopdf` / `weasyprint`. pdf.zig's writer is Tier-1 by design.
-4. **Need compressed output** → not yet supported (PR-W4 deferred). Files are 4-5× typical size but readable everywhere.
+4. **Need compressed output** → set `compress_content_streams = true` on `DocumentBuilder` (PR-W4, Zig API only — the CLI doesn't expose a flag yet). Only streams > 256 bytes are compressed.
 
 ### When asked "is pdf.zig installed?"
 
