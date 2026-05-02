@@ -103,7 +103,7 @@ pub const StructTree = struct {
 /// the parser's invariant. `page_obj` is emitted as the raw PDF
 /// object number (not a 0-based page index) — the consumer correlates
 /// against `kind:"meta"` / `kind:"page"` records if they need indices.
-pub fn emitElementJson(elem: *const StructElement, writer: *std.io.Writer, depth: u32) !void {
+pub fn emitElementJson(elem: *const StructElement, writer: *std.Io.Writer, depth: u32) !void {
     if (depth >= MAX_STRUCT_DEPTH) {
         // Safety net: emit a marker leaf to keep the JSON parseable.
         try writer.writeAll("{\"type\":\"_truncated_max_depth\",\"mcid_refs\":[],\"children\":[]}");

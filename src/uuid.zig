@@ -17,11 +17,14 @@ pub const Bytes = [16]u8;
 pub const String = [36]u8;
 
 pub fn v7Bytes() Bytes {
-    const ts_ms: u64 = @intCast(@max(0, std.time.milliTimestamp()));
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    const ts_ms: u64 = @as(u64, @intCast(ts.sec)) * 1000 +
+        @as(u64, @intCast(ts.nsec)) / 1_000_000;
     var bytes: Bytes = undefined;
 
     std.mem.writeInt(u64, bytes[0..8], ts_ms << 16, .big);
-    std.crypto.random.bytes(bytes[6..16]);
+    _ = std.os.linux.getrandom(bytes[6..16].ptr, 10, 0);
 
     bytes[6] = (bytes[6] & 0x0F) | 0x70;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
@@ -84,7 +87,8 @@ test "v7 bytes version + variant bits" {
 
 test "v7 is time-ordered across milliseconds" {
     const a = v7Bytes();
-    std.Thread.sleep(2 * std.time.ns_per_ms);
+    const sleep_ts = std.os.linux.timespec{ .sec = 0, .nsec = 2_000_000 };
+    _ = std.os.linux.nanosleep(&sleep_ts, null);
     const c = v7Bytes();
     // Compare the 48-bit timestamp prefix only.
     const ts_a = std.mem.readInt(u64, a[0..8], .big) >> 16;

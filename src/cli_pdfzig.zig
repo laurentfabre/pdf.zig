@@ -260,7 +260,7 @@ fn parseOutputMode(s: []const u8) !OutputMode {
 pub fn findH1Heading(md: []const u8) ?[]const u8 {
     var iter = std.mem.splitScalar(u8, md, '\n');
     while (iter.next()) |line| {
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
         if (!std.mem.startsWith(u8, trimmed, "# ")) continue;
         if (std.mem.startsWith(u8, trimmed, "## ")) continue; // skip H2+
         const title = std.mem.trim(u8, trimmed[2..], " \t\r");
@@ -909,6 +909,7 @@ fn extensionForFilter(filter: ?[]const u8) ?[]const u8 {
 /// the metadata / base64 / path branches so the main loop in `runExtract`
 /// stays readable.
 fn emitImageRecord(
+    io: std.Io,
     allocator: std.mem.Allocator,
     env: *stream.Envelope,
     args: ExtractArgs,
@@ -968,7 +969,7 @@ fn emitImageRecord(
                     try allocator.dupe(u8, filename);
                 defer allocator.free(full_path);
 
-                std.fs.cwd().writeFile(.{ .sub_path = full_path, .data = img.payload.? }) catch {
+                std.Io.Dir.writeFile(std.Io.Dir.cwd(), io, .{ .sub_path = full_path, .data = img.payload.? }) catch {
                     // I/O failed — fall through to the warning emission below.
                     var warn_buf: [128]u8 = undefined;
                     const warn_str = std.fmt.bufPrint(
@@ -1045,7 +1046,7 @@ fn mapOpenErrorToExit(err: anyerror) ExitCode {
     };
 }
 
-fn fatalFromOpenError(env: *stream.Envelope, writer: *std.io.Writer, err: anyerror) !ExitCode {
+fn fatalFromOpenError(env: *stream.Envelope, writer: *std.Io.Writer, err: anyerror) !ExitCode {
     const fk: stream.FatalErrorKind = switch (err) {
         error.OutOfMemory => .oom,
         error.FileNotFound, error.AccessDenied => .io,
@@ -1468,12 +1469,14 @@ test "PR-19 follow-up: path mode writes DCT image to disk + emits relative path"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    var real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real_n = try tmp.dir.realPath(std.testing.io, &real_buf);
+    const tmp_path = try allocator.dupe(u8, real_buf[0..real_n]);
     defer allocator.free(tmp_path);
 
     const fixed_doc_id: [36]u8 = "01234567-89ab-7cde-8f01-23456789abcd".*;
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", fixed_doc_id);
 
     const args: ExtractArgs = .{
@@ -1490,7 +1493,7 @@ test "PR-19 follow-up: path mode writes DCT image to disk + emits relative path"
         .payload = fake_payload,
     };
 
-    const ec = try emitImageRecord(allocator, &env, args, "doc", 1, 1, img);
+    const ec = try emitImageRecord(std.testing.io, allocator, &env, args, "doc", 1, 1, img);
     try std.testing.expectEqual(ExitCode.ok, ec);
 
     // The NDJSON record must reference the relative path under tmp_path.
@@ -1500,7 +1503,7 @@ test "PR-19 follow-up: path mode writes DCT image to disk + emits relative path"
     try std.testing.expect(std.mem.indexOf(u8, written, "\"warnings\":") == null);
 
     // The file must be on disk and contain the original payload.
-    const file_data = try tmp.dir.readFileAlloc(allocator, "doc-page1-img1.jpg", 1024);
+    const file_data = try tmp.dir.readFileAlloc(std.testing.io, "doc-page1-img1.jpg", allocator, .limited(1024));
     defer allocator.free(file_data);
     try std.testing.expectEqualSlices(u8, fake_payload, file_data);
 }
@@ -1510,7 +1513,7 @@ test "PR-19 follow-up: path mode emits warning for unsupported filter" {
 
     const fixed_doc_id: [36]u8 = "01234567-89ab-7cde-8f01-23456789abcd".*;
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", fixed_doc_id);
 
     const args: ExtractArgs = .{ .input = "x.pdf", .images_mode = .path };
@@ -1521,7 +1524,7 @@ test "PR-19 follow-up: path mode emits warning for unsupported filter" {
         .encoding = "FlateDecode",
         .payload = null,
     };
-    const ec = try emitImageRecord(allocator, &env, args, "doc", 1, 1, img);
+    const ec = try emitImageRecord(std.testing.io, allocator, &env, args, "doc", 1, 1, img);
     try std.testing.expectEqual(ExitCode.ok, ec);
 
     const written = aw.buffered();

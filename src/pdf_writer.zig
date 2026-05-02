@@ -141,7 +141,7 @@ pub const Writer = struct {
             .in_use = true,
             .allocated = true,
         };
-        try self.buf.writer(self.allocator).print("{d} {d} obj\n", .{ num, generation });
+        try self.buf.print(self.allocator, "{d} {d} obj\n", .{ num, generation });
         self.in_object = true;
     }
 
@@ -164,7 +164,7 @@ pub const Writer = struct {
         try self.buf.append(self.allocator, '/');
         for (name) |b| {
             if (b < 0x21 or b > 0x7e or isDelimiter(b) or b == '#') {
-                try self.buf.writer(self.allocator).print("#{x:0>2}", .{b});
+                try self.buf.print(self.allocator, "#{x:0>2}", .{b});
             } else {
                 try self.buf.append(self.allocator, b);
             }
@@ -187,7 +187,7 @@ pub const Writer = struct {
                 0x0c => try self.buf.appendSlice(self.allocator, "\\f"),
                 else => {
                     if (b < 0x20 or b == 0x7f) {
-                        try self.buf.writer(self.allocator).print("\\{o:0>3}", .{b});
+                        try self.buf.print(self.allocator, "\\{o:0>3}", .{b});
                     } else {
                         try self.buf.append(self.allocator, b);
                     }
@@ -201,13 +201,13 @@ pub const Writer = struct {
     pub fn writeStringHex(self: *Writer, bytes: []const u8) Error!void {
         try self.buf.append(self.allocator, '<');
         for (bytes) |b| {
-            try self.buf.writer(self.allocator).print("{x:0>2}", .{b});
+            try self.buf.print(self.allocator, "{x:0>2}", .{b});
         }
         try self.buf.append(self.allocator, '>');
     }
 
     pub fn writeInt(self: *Writer, n: i64) Error!void {
-        try self.buf.writer(self.allocator).print("{d}", .{n});
+        try self.buf.print(self.allocator, "{d}", .{n});
     }
 
     /// Emit a real number per §7.3.3 (no exponent form). Rejects NaN/inf
@@ -226,7 +226,7 @@ pub const Writer = struct {
 
     /// Emit `N G R` (indirect reference, §7.3.10).
     pub fn writeRef(self: *Writer, num: u32, generation: u16) Error!void {
-        try self.buf.writer(self.allocator).print("{d} {d} R", .{ num, generation });
+        try self.buf.print(self.allocator, "{d} {d} R", .{ num, generation });
     }
 
     /// Emit a stream object: `<< /Length N >>\nstream\n<body>\nendstream\n`.
@@ -238,7 +238,8 @@ pub const Writer = struct {
         extra_dict: []const u8,
     ) Error!void {
         if (!self.in_object) return error.UnbalancedObject;
-        try self.buf.writer(self.allocator).print(
+        try self.buf.print(
+            self.allocator,
             "<< /Length {d}{s} >>\nstream\n",
             .{ body.len, extra_dict },
         );
@@ -266,7 +267,8 @@ pub const Writer = struct {
             if (obj.allocated and !obj.in_use) return error.DanglingObjectAllocation;
         }
         const xref_offset = self.buf.items.len;
-        try self.buf.writer(self.allocator).print(
+        try self.buf.print(
+            self.allocator,
             "xref\n0 {d}\n",
             .{self.objects.items.len},
         );
@@ -274,7 +276,8 @@ pub const Writer = struct {
             // §7.5.4: each entry is exactly 20 bytes including the trailing
             // 2-byte newline. `f` = free, `n` = in-use.
             const marker: u8 = if (obj.in_use) 'n' else 'f';
-            try self.buf.writer(self.allocator).print(
+            try self.buf.print(
+                self.allocator,
                 "{d:0>10} {d:0>5} {c} \n",
                 .{ obj.offset, obj.generation, marker },
             );
@@ -294,14 +297,16 @@ pub const Writer = struct {
         // writer is generation-0 only so we hardcode `0 R`.
         try self.assertEmittedRef(root_obj);
         if (info_obj) |inum| try self.assertEmittedRef(inum);
-        try self.buf.writer(self.allocator).print(
+        try self.buf.print(
+            self.allocator,
             "trailer\n<< /Size {d} /Root {d} 0 R",
             .{ self.objects.items.len, root_obj },
         );
         if (info_obj) |inum| {
-            try self.buf.writer(self.allocator).print(" /Info {d} 0 R", .{inum});
+            try self.buf.print(self.allocator, " /Info {d} 0 R", .{inum});
         }
-        try self.buf.writer(self.allocator).print(
+        try self.buf.print(
+            self.allocator,
             " >>\nstartxref\n{d}\n%%EOF\n",
             .{xref_offset},
         );

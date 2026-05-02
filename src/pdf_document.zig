@@ -251,9 +251,9 @@ pub const PageBuilder = struct {
 
         // Compose into a scratch buffer first so a partial-failure
         // doesn't leave the page's content stream half-written.
-        var scratch: std.ArrayList(u8) = .empty;
-        defer scratch.deinit(self.allocator);
-        const ws = scratch.writer(self.allocator);
+        var scratch_aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer scratch_aw.deinit();
+        const ws = &scratch_aw.writer;
 
         try ws.print("BT {s} ", .{font.resourceName()});
         try writeRealTo(ws, size);
@@ -284,7 +284,7 @@ pub const PageBuilder = struct {
         }
         try ws.writeAll(") Tj ET\n");
 
-        try self.content.appendSlice(self.allocator, scratch.items);
+        try self.content.appendSlice(self.allocator, scratch_aw.writer.buffer[0..scratch_aw.writer.end]);
     }
 };
 

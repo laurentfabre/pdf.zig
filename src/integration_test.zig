@@ -32,7 +32,11 @@ test "extract text from minimal PDF" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try doc.extractText(0, output.writer(allocator));
+    {
+        var aw_ = std.Io.Writer.Allocating.fromArrayList(allocator, &output);
+        try doc.extractText(0, &aw_.writer);
+        output = aw_.toArrayList();
+    }
 
     // Should contain our test text
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Test123") != null);
@@ -64,7 +68,11 @@ test "extract all text from multi-page PDF" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try doc.extractAllText(output.writer(allocator));
+    {
+        var aw_ = std.Io.Writer.Allocating.fromArrayList(allocator, &output);
+        try doc.extractAllText(&aw_.writer);
+        output = aw_.toArrayList();
+    }
 
     try std.testing.expect(std.mem.indexOf(u8, output.items, "PageA") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "PageB") != null);
@@ -82,7 +90,11 @@ test "parse TJ operator PDF" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try doc.extractText(0, output.writer(allocator));
+    {
+        var aw_ = std.Io.Writer.Allocating.fromArrayList(allocator, &output);
+        try doc.extractText(0, &aw_.writer);
+        output = aw_.toArrayList();
+    }
 
     // TJ with spacing should produce "Hello World" (with space from -200 adjustment)
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Hello") != null);
@@ -259,7 +271,11 @@ test "extract text from incremental PDF - gets updated content" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try doc.extractText(0, output.writer(allocator));
+    {
+        var aw_ = std.Io.Writer.Allocating.fromArrayList(allocator, &output);
+        try doc.extractText(0, &aw_.writer);
+        output = aw_.toArrayList();
+    }
 
     // Should extract "Updated Text" NOT "Original Text"
     // because incremental update replaced object 4
@@ -281,7 +297,11 @@ test "page tree tolerates leaf node without /Type" {
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
+    {
+        var aw_ = std.Io.Writer.Allocating.fromArrayList(allocator, &output);
+        try doc.extractText(0, &aw_.writer);
+        output = aw_.toArrayList();
+    }
     try std.testing.expect(std.mem.indexOf(u8, output.items, "NoTypeTest") != null);
 }
 
@@ -296,7 +316,11 @@ test "inline image does not corrupt text extraction" {
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
+    {
+        var aw_ = std.Io.Writer.Allocating.fromArrayList(allocator, &output);
+        try doc.extractText(0, &aw_.writer);
+        output = aw_.toArrayList();
+    }
 
     // Both text spans surrounding the inline image must be present (Fix 1: BI/EI skip)
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Before") != null);
@@ -1063,7 +1087,11 @@ test "superscript positioning does not insert spurious newline" {
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
+    {
+        var aw_ = std.Io.Writer.Allocating.fromArrayList(allocator, &output);
+        try doc.extractText(0, &aw_.writer);
+        output = aw_.toArrayList();
+    }
 
     // All three text chunks must be present
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Hello") != null);
@@ -1887,7 +1915,7 @@ test "PR-21: emitElementJson produces a Table → TR → TD tree" {
     const tree = try doc.getStructTree();
     try std.testing.expect(tree.root != null);
 
-    var aw = std.io.Writer.Allocating.init(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     try zpdf.structtree.emitElementJson(tree.root.?, &aw.writer, 0);
 

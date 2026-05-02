@@ -93,7 +93,7 @@ fn fuzzStreamJsonString(rng: std.Random, allocator: std.mem.Allocator, scratch: 
     // Worst-case escape: every byte → 6-char \u00XX (e.g. all 0x01s).
     // Double again for the surrounding quotes + slack.
     var out_buf: [98304]u8 = undefined;
-    var aw = std.io.Writer.fixed(&out_buf);
+    var aw = std.Io.Writer.fixed(&out_buf);
     try stream.writeJsonString(&aw, scratch[0..len]);
 
     const written = aw.buffered();
@@ -126,7 +126,7 @@ fn fuzzStreamEnvelopeMeta(rng: std.Random, allocator: std.mem.Allocator, scratch
     rng.bytes(scratch[src_len + title_len .. src_len + title_len + author_len]);
 
     var out_buf: [32768]u8 = undefined;
-    var aw = std.io.Writer.fixed(&out_buf);
+    var aw = std.Io.Writer.fixed(&out_buf);
     var env = stream.Envelope.init(&aw, scratch[0..src_len]);
     try env.emitMeta(.{
         .pages = rng.int(u32),
@@ -145,7 +145,7 @@ fn fuzzStreamEnvelopePage(rng: std.Random, allocator: std.mem.Allocator, scratch
     const md_len = rng.intRangeAtMost(usize, 0, scratch.len);
     rng.bytes(scratch[0..md_len]);
 
-    var aw = std.io.Writer.Allocating.init(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     var env = stream.Envelope.init(&aw.writer, "fuzz.pdf");
     try env.emitPage(rng.int(u32), scratch[0..md_len], &.{});
@@ -169,7 +169,7 @@ fn fuzzChunkBreakFinder(rng: std.Random, allocator: std.mem.Allocator, scratch: 
     // Each chunk record can be up to ~6× input (escape worst-case) plus
     // envelope overhead; with many small chunks the cumulative output
     // can exceed input by ~10×. Grow as needed via Allocating writer.
-    var aw = std.io.Writer.Allocating.init(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     var env = stream.Envelope.initWithId(&aw.writer, "fuzz.pdf", "01234567-89ab-7cde-8f01-23456789abcd".*);
     const t = tokenizer.Tokenizer.init(.heuristic);
