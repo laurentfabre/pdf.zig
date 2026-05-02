@@ -335,14 +335,14 @@ updated: 2026-04-27
   > **Test strategy.** New integration_test `bboxes_round_trip`.
   > **Codex gate.** Schema is consumer-friendly (parallel array, not nested); flag-off keeps zero overhead.
 
-- [ ] **PR-19 · feat: image extraction (`kind:"image"`)**
+- [ ] **PR-19 · feat: image extraction (`kind:"image"`)** — _partial: `--images` (#35), `encoding` field (#38), `--images=base64` (#39); `--images=path` still pending_
   > [!info]- Details
   > **Files-touched envelope.** `src/cli_pdfzig.zig` (flag + emission), `src/stream.zig` (new record kind), `src/integration_test.zig`, upstream `src/parser.zig` (image XObject access).
   > **Acceptance gate.**
-  > - `--images` flag emits `kind:"image"` `{page, bbox, width_px, height_px, encoding}` (no payload by default).
-  > - `--images=base64` adds `payload_b64`.
-  > - `--images=path` extracts to `<output_dir>/<doc_id>-<page>-<image_id>.png` and emits `path` field.
-  > - On `audit/sample/with-images.pdf`, all images detected.
+  > - [x] `--images` flag emits `kind:"image"` `{page, bbox, width_px, height_px, encoding}` (no payload by default). _(#35 + #38)_
+  > - [x] `--images=base64` adds `payload_b64` for DCT/JPX/CCITTFax passthrough; `warnings` array for unsupported filters. _(#39)_
+  > - [ ] `--images=path` extracts to `<output_dir>/<doc_id>-<page>-<image_id>.<ext>` and emits `path` field.
+  > - [x] On the `generateImagePdfWithFilter` fixture, images detected with correct encoding + base64 round-trip.
   >
   > **Test strategy.** Three integration tests (one per mode).
   > **Codex gate.** Base64 payload doesn't break NDJSON line-buffering on multi-MB images (cap or stream-as-array); path-mode doesn't escape the output dir.
