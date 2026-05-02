@@ -422,18 +422,10 @@ updated: 2026-04-27
   > **Test strategy.** 14 unit tests (one per BuiltinFont) + round-trip integration test.
   > **Codex gate.** WinAnsi encoding completeness vs the standard; backslash-escape edge cases; empty-text drawText is a no-op (not malformed BT/ET).
 
-- [ ] **PR-W4 · feat: FlateDecode content-stream compression** (deferred — Zig 0.15.2 stdlib gap)
-  > [!warning] Blocked on Zig stdlib
-  > Both `std.compress.flate.Compress` (high-level) and `std.compress.flate.Compress.Simple` are non-functional in Zig 0.15.2. `Compress.drain` calls `@panic("TODO")` and `Simple.finish` has a compile-time error in `hasher.container()` (Container is an enum, not callable). Until upstream Zig completes the deflate encoder, this PR can't ship without either (a) writing a hand-rolled deflate encoder (~500 LOC, scope creep), (b) shelling out to `zlib` (breaks the no-deps story), or (c) waiting for Zig 0.16+.
-  > **Files-touched envelope.** `src/pdf_writer.zig`, `src/pdf_document.zig`, `src/integration_test.zig`.
-  > **Acceptance gate.**
-  > - Streams >256 B compress with `/Filter /FlateDecode`; smaller stay raw.
-  > - Compressed output round-trips through the existing reader (which already handles FlateDecode).
-  > - Compression ratio ≥ 50% on a 3-page text PDF.
-  >
-  > **Test strategy.** Compression-ratio assertion + round-trip extract.
-  > **Codex gate.** No off-by-one in length-after-compression; `/Length` reflects compressed bytes; `/DL` field if predictor used (tier-1: no predictor).
-  > **Workaround.** Tier-1 emits raw uncompressed content streams. Files are 4-5× larger than necessary but readable by every PDF viewer; the existing `decompress.zig` already handles compressed streams from third-party PDFs without issue.
+- [x] **PR-W4 · feat: FlateDecode content-stream compression** ✅ shipped (Zig 0.16.0 migration unblocked this)
+  > **Implementation.** `compress_content_streams: bool = false` field on `DocumentBuilder`. When `true`, content streams >256 bytes are compressed via `std.compress.flate.Compress` with `container: .zlib` (zlib-wrapped DEFLATE = PDF FlateDecode). Streams ≤256 bytes stay raw.
+  > **Files-touched.** `src/pdf_document.zig`.
+  > **Tests.** 5 new unit tests: default-off guard, FlateDecode marker present, round-trip through reader, ≥50% compression ratio on 3-page PDF, short-content bypass. All 1413/1413 tests pass.
 
 - [x] **PR-W5 · feat: `pdf.zig new` CLI subcommand (markdown → PDF)**
   > [!info]- Details

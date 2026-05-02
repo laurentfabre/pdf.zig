@@ -31,10 +31,19 @@
 //! ## What this module does NOT do (Tier-1 scope)
 //!
 //! - Font resources or content-stream encoding — `PR-W3`.
-//! - FlateDecode compression — `PR-W4` (content streams are raw).
 //! - Inheritable page attributes (resources lifted to /Pages nodes).
 //! - Outlines, TOC, annotations.
 //! - Encryption, linearization, signatures — Tier 2/3.
+//!
+//! ## FlateDecode compression (PR-W4)
+//!
+//! Set `compress_content_streams = true` on `DocumentBuilder` to enable
+//! zlib-wrapped DEFLATE (the PDF FlateDecode filter) on content streams
+//! longer than 256 bytes. Streams ≤256 bytes are left uncompressed
+//! because the zlib header+adler32 overhead exceeds any savings.
+//!
+//! This uses `std.compress.flate.Compress` with `container: .zlib` —
+//! available and working in Zig 0.16.0.
 
 const std = @import("std");
 const pdf_writer = @import("pdf_writer.zig");
@@ -329,6 +338,10 @@ pub const DocumentBuilder = struct {
     /// PR-W6 [feat]: single-use guard. Set true at the end of `write`;
     /// further mutating calls return `error.DocumentAlreadyWritten`.
     written: bool = false,
+    /// PR-W4 [feat]: when true, content streams longer than 256 bytes
+    /// are compressed with zlib-wrapped DEFLATE (FlateDecode filter).
+    /// Default false for backward-compatibility.
+    compress_content_streams: bool = false,
 
     const AuxObject = struct {
         obj_num: u32,
@@ -532,9 +545,18 @@ pub const DocumentBuilder = struct {
 
         // 3d. Content streams.
         for (self.pages.items) |page| {
-            try w.beginObject(page.content_obj_num, 0);
-            try w.writeStream(page.content.items, "");
-            try w.endObject();
+            const raw = page.content.items;
+            if (self.compress_content_streams and raw.len > 256) {
+                const compressed = try compressFlate(self.allocator, raw);
+                defer self.allocator.free(compressed);
+                try w.beginObject(page.content_obj_num, 0);
+                try w.writeStream(compressed, " /Filter /FlateDecode");
+                try w.endObject();
+            } else {
+                try w.beginObject(page.content_obj_num, 0);
+                try w.writeStream(raw, "");
+                try w.endObject();
+            }
         }
 
         // 3e. Auxiliary objects (outline items, annotations, form
@@ -591,6 +613,29 @@ const Tree = struct {
         subtree_page_count: u32,
     };
 };
+
+/// PR-W4 [feat]: compress `input` with zlib-wrapped DEFLATE (FlateDecode).
+/// Returns caller-owned slice. Uses `std.compress.flate.Compress` with
+/// `container: .zlib` (two-byte header + Adler-32 trailer per RFC 1950).
+fn compressFlate(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const initial_cap = @max(input.len / 2 + 256, 64);
+    var out_aw = try std.Io.Writer.Allocating.initCapacity(allocator, initial_cap);
+    errdefer out_aw.deinit();
+
+    const work_buf = try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer allocator.free(work_buf);
+
+    var c = try std.compress.flate.Compress.init(
+        &out_aw.writer,
+        work_buf,
+        .zlib,
+        .default,
+    );
+    try c.writer.writeAll(input);
+    try c.finish();
+
+    return out_aw.toOwnedSlice();
+}
 
 /// PR-W3 [feat]: synthesise the page's `/Resources` dict from
 /// `fonts_used`. If no fonts were touched, emits `<< >>`.
@@ -1500,4 +1545,112 @@ test "PageBuilder.markFontUsed name matches auto-resources output" {
         const key = try std.fmt.bufPrint(&key_buf, "{s} <<", .{f});
         try std.testing.expect(std.mem.indexOf(u8, bytes, key) != null);
     }
+}
+
+// ---- PR-W4 FlateDecode tests ----
+
+test "PR-W4: compress_content_streams defaults to false" {
+    var doc = DocumentBuilder.init(std.testing.allocator);
+    defer doc.deinit();
+    try std.testing.expect(!doc.compress_content_streams);
+}
+
+test "PR-W4: compressed PDF contains FlateDecode filter marker" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    doc.compress_content_streams = true;
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    // Build >256 bytes of content so compression kicks in.
+    for (0..12) |i| {
+        try page.drawText(72, 720 - @as(f64, @floatFromInt(i)) * 20, .helvetica, 12,
+            "The quick brown fox jumps over the lazy dog.");
+    }
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Filter /FlateDecode") != null);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "%PDF-"));
+}
+
+test "PR-W4: compressed PDF round-trips through reader" {
+    const allocator = std.testing.allocator;
+    const zpdf = @import("root.zig");
+
+    var doc = DocumentBuilder.init(allocator);
+    doc.compress_content_streams = true;
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    for (0..10) |i| {
+        try page.drawText(72, 720 - @as(f64, @floatFromInt(i)) * 20, .helvetica, 12,
+            "Hello FlateDecode world from pdf.zig PR-W4!");
+    }
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+    try std.testing.expectEqual(@as(usize, 1), d.pageCount());
+
+    const text = try d.extractMarkdown(0, allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Hello FlateDecode world from pdf.zig PR-W4!") != null);
+}
+
+test "PR-W4: 3-page PDF achieves >=50% compression ratio" {
+    const allocator = std.testing.allocator;
+
+    // Highly repetitive content (same line 15 times per page) compresses well.
+    const line = "The quick brown fox jumps over the lazy dog. " ++
+        "Pack my box with five dozen liquor jugs. ";
+
+    // Uncompressed baseline.
+    var doc_raw = DocumentBuilder.init(allocator);
+    defer doc_raw.deinit();
+    for (0..3) |_| {
+        const p = try doc_raw.addPage(.{ 0, 0, 612, 792 });
+        for (0..15) |i| {
+            try p.drawText(72, 720 - @as(f64, @floatFromInt(i)) * 30, .helvetica, 12, line);
+        }
+    }
+    const raw_bytes = try doc_raw.write();
+    defer allocator.free(raw_bytes);
+
+    // Compressed version.
+    var doc_comp = DocumentBuilder.init(allocator);
+    doc_comp.compress_content_streams = true;
+    defer doc_comp.deinit();
+    for (0..3) |_| {
+        const p = try doc_comp.addPage(.{ 0, 0, 612, 792 });
+        for (0..15) |i| {
+            try p.drawText(72, 720 - @as(f64, @floatFromInt(i)) * 30, .helvetica, 12, line);
+        }
+    }
+    const comp_bytes = try doc_comp.write();
+    defer allocator.free(comp_bytes);
+
+    // Compressed PDF must be at most 50% of the uncompressed size.
+    try std.testing.expect(comp_bytes.len * 2 <= raw_bytes.len);
+}
+
+test "PR-W4: short content stream (<= 256 bytes) stays uncompressed" {
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    doc.compress_content_streams = true;
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    // Single short text draw produces <<256 bytes of content stream.
+    try page.drawText(72, 720, .helvetica, 12, "Hi");
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // No FlateDecode marker — stream was too short to compress.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Filter /FlateDecode") == null);
 }
