@@ -39,7 +39,9 @@ pub const OutputMode = enum { ndjson, md, chunks, text };
 ///   off      — no image records (default)
 ///   metadata — bbox + pixel dims + encoding only
 ///   base64   — adds payload_b64 for DCT/JPX/CCITTFax; warnings for others
-pub const ImagesMode = enum { off, metadata, base64 };
+///   path     — extracts DCT/JPX images to disk and emits relative `path`;
+///              CCITTFax/Flate/uncompressed get warnings (no decoder).
+pub const ImagesMode = enum { off, metadata, base64, path };
 
 pub const ExtractArgs = struct {
     input: []const u8,
@@ -61,8 +63,13 @@ pub const ExtractArgs = struct {
     ///   --images            → metadata (bbox + dims + encoding)
     ///   --images=base64     → adds payload_b64 for passthrough filters;
     ///                         warnings array for unsupported ones
+    ///   --images=path       → writes DCT/JPX images to --images-dir
+    ///                         (default: cwd) and emits relative `path`
     ///   (omitted)           → off (no image records)
     images_mode: ImagesMode = .off,
+    /// PR-19 follow-up (path mode): output directory for extracted
+    /// image files. Null means cwd. Sanitized — never traversed up.
+    images_dir: ?[]const u8 = null,
     /// PR-21 [feat]: when true, emit a single `kind:"struct_tree"`
     /// document-level record carrying the full /StructTreeRoot walk
     /// as a JSON tree. Off by default (records can be very large).
@@ -185,6 +192,12 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             out.images_mode = .metadata;
         } else if (std.mem.eql(u8, a, "--images=base64")) {
             out.images_mode = .base64;
+        } else if (std.mem.eql(u8, a, "--images=path")) {
+            out.images_mode = .path;
+        } else if (std.mem.eql(u8, a, "--images-dir")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            out.images_dir = args[i];
         } else if (std.mem.startsWith(u8, a, "--images=")) {
             return error.InvalidImagesMode;
         } else if (std.mem.eql(u8, a, "--struct-tree")) {
@@ -520,6 +533,18 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
         collected.deinit(allocator);
     }
 
+    // PR-19 follow-up: doc_id + output dir setup for --images=path mode.
+    // doc_id is the sanitized basename of the input file (or "stdin");
+    // it lifts into the per-image filename `<doc_id>-page<N>-img<idx>.<ext>`.
+    var doc_id_buf: []const u8 = &[_]u8{};
+    defer if (doc_id_buf.len > 0) allocator.free(doc_id_buf);
+    if (args.images_mode == .path) {
+        doc_id_buf = try deriveDocId(allocator, args.input);
+        if (args.images_dir) |dir| {
+            std.fs.cwd().makePath(dir) catch {};
+        }
+    }
+
     for (want_pages) |page_idx| {
         if (stream.wasInterrupted()) |sig| {
             try env.emitInterrupted(sig);
@@ -683,54 +708,22 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                     }
                 } else |_| {}
                 // PR-19 follow-up: emit kind:"image" records per the
-                // chosen mode (metadata-only or base64 payload).
+                // chosen mode (metadata-only / base64 / path).
                 if (args.images_mode != .off) {
-                    const want_payload = args.images_mode == .base64;
+                    const want_payload = args.images_mode == .base64 or args.images_mode == .path;
                     if (doc.getPageImages(page_idx, allocator, want_payload)) |images| {
                         defer allocator.free(images);
-                        for (images) |img| {
-                            if (args.images_mode == .base64) {
-                                if (img.payload) |raw| {
-                                    // Passthrough filter — base64-encode the raw bytes.
-                                    const Encoder = std.base64.standard.Encoder;
-                                    const b64_len = Encoder.calcSize(raw.len);
-                                    const b64_buf = try allocator.alloc(u8, b64_len);
-                                    defer allocator.free(b64_buf);
-                                    const b64 = Encoder.encode(b64_buf, raw);
-                                    env.emitImage(@intCast(page_idx + 1), .{
-                                        .bbox = img.rect,
-                                        .width_px = img.width,
-                                        .height_px = img.height,
-                                        .encoding = img.encoding,
-                                        .payload_b64 = b64,
-                                    }) catch |e| return mapWriteErr(e);
-                                } else {
-                                    // Unsupported filter — emit null payload + warning.
-                                    const filter_name = img.encoding orelse "uncompressed";
-                                    var warn_buf: [64]u8 = undefined;
-                                    const warn_str = std.fmt.bufPrint(
-                                        &warn_buf,
-                                        "unsupported_filter:{s}",
-                                        .{filter_name},
-                                    ) catch "unsupported_filter";
-                                    const warn_arr = [1][]const u8{warn_str};
-                                    env.emitImage(@intCast(page_idx + 1), .{
-                                        .bbox = img.rect,
-                                        .width_px = img.width,
-                                        .height_px = img.height,
-                                        .encoding = img.encoding,
-                                        .warnings = &warn_arr,
-                                    }) catch |e| return mapWriteErr(e);
-                                }
-                            } else {
-                                // Metadata-only mode.
-                                env.emitImage(@intCast(page_idx + 1), .{
-                                    .bbox = img.rect,
-                                    .width_px = img.width,
-                                    .height_px = img.height,
-                                    .encoding = img.encoding,
-                                }) catch |e| return mapWriteErr(e);
-                            }
+                        for (images, 0..) |img, img_idx| {
+                            const ec = try emitImageRecord(
+                                allocator,
+                                &env,
+                                args,
+                                doc_id_buf,
+                                @intCast(page_idx + 1),
+                                @intCast(img_idx + 1),
+                                img,
+                            );
+                            if (ec != .ok) return ec;
                         }
                     } else |_| {}
                 }
@@ -872,6 +865,147 @@ fn sourceBasename(path: []const u8) []const u8 {
     return path[idx + 1 ..];
 }
 
+/// PR-19 follow-up: derive a filesystem-safe document identifier from
+/// the input path. Strips the directory and trailing `.pdf` (case-
+/// insensitive), then maps every byte not in `[A-Za-z0-9._-]` to `_`.
+/// Returns `"stdin"` when reading from stdin (`args.input == "-"`).
+/// Caller owns the returned slice.
+fn deriveDocId(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    if (std.mem.eql(u8, input, "-")) return try allocator.dupe(u8, "stdin");
+
+    const slash_idx = std.mem.lastIndexOfScalar(u8, input, '/');
+    const base = if (slash_idx) |i| input[i + 1 ..] else input;
+
+    var end = base.len;
+    if (end >= 4) {
+        const tail = base[end - 4 ..];
+        if (std.ascii.eqlIgnoreCase(tail, ".pdf")) end -= 4;
+    }
+    if (end == 0) return try allocator.dupe(u8, "stdin");
+
+    const out = try allocator.alloc(u8, end);
+    for (base[0..end], 0..) |c, i| {
+        out[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-') c else '_';
+    }
+    return out;
+}
+
+/// PR-19 follow-up: file extension for an image XObject's first /Filter
+/// in `--images=path` mode.  We only support codecs whose raw stream
+/// bytes are a self-contained, standalone image file:
+///   - DCTDecode  → JPEG bytes (.jpg)
+///   - JPXDecode  → JPEG-2000 bytes (.jp2)
+/// CCITTFaxDecode is excluded — its bytes are a raw fax bitstream that
+/// needs a TIFF wrapper to be readable. FlateDecode is gated on PR-W4.
+fn extensionForFilter(filter: ?[]const u8) ?[]const u8 {
+    const f = filter orelse return null;
+    if (std.mem.eql(u8, f, "DCTDecode")) return ".jpg";
+    if (std.mem.eql(u8, f, "JPXDecode")) return ".jp2";
+    return null;
+}
+
+/// PR-19 follow-up: emit one `kind:"image"` record, writing the bytes
+/// to disk first when `args.images_mode == .path`. The helper centralises
+/// the metadata / base64 / path branches so the main loop in `runExtract`
+/// stays readable.
+fn emitImageRecord(
+    allocator: std.mem.Allocator,
+    env: *stream.Envelope,
+    args: ExtractArgs,
+    doc_id: []const u8,
+    page_number: u32,
+    img_idx: u32,
+    img: zpdf.Document.ImageInfo,
+) !ExitCode {
+    var item: stream.ImageItem = .{
+        .bbox = img.rect,
+        .width_px = img.width,
+        .height_px = img.height,
+        .encoding = img.encoding,
+    };
+
+    switch (args.images_mode) {
+        .off, .metadata => {},
+        .base64 => {
+            if (img.payload) |raw| {
+                const Encoder = std.base64.standard.Encoder;
+                const b64_len = Encoder.calcSize(raw.len);
+                const b64_buf = try allocator.alloc(u8, b64_len);
+                defer allocator.free(b64_buf);
+                item.payload_b64 = Encoder.encode(b64_buf, raw);
+                env.emitImage(page_number, item) catch |e| return mapWriteErr(e);
+                return .ok;
+            }
+            // Unsupported filter — emit null payload + warning.
+            const filter_name = img.encoding orelse "uncompressed";
+            var warn_buf: [64]u8 = undefined;
+            const warn_str = std.fmt.bufPrint(
+                &warn_buf,
+                "unsupported_filter:{s}",
+                .{filter_name},
+            ) catch "unsupported_filter";
+            const warn_arr = [1][]const u8{warn_str};
+            item.warnings = &warn_arr;
+            env.emitImage(page_number, item) catch |e| return mapWriteErr(e);
+            return .ok;
+        },
+        .path => {
+            const ext = extensionForFilter(img.encoding);
+            if (img.payload != null and ext != null) {
+                // Build the filename: <doc_id>-page<N>-img<idx>.<ext>
+                const filename = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}-page{d}-img{d}{s}",
+                    .{ doc_id, page_number, img_idx, ext.? },
+                );
+                defer allocator.free(filename);
+
+                // Build the full filesystem path (with --images-dir prefix
+                // if set) and the relative path emitted in the NDJSON.
+                const full_path: []u8 = if (args.images_dir) |dir|
+                    try std.fs.path.join(allocator, &.{ dir, filename })
+                else
+                    try allocator.dupe(u8, filename);
+                defer allocator.free(full_path);
+
+                std.fs.cwd().writeFile(.{ .sub_path = full_path, .data = img.payload.? }) catch {
+                    // I/O failed — fall through to the warning emission below.
+                    var warn_buf: [128]u8 = undefined;
+                    const warn_str = std.fmt.bufPrint(
+                        &warn_buf,
+                        "image_write_failed:{s}",
+                        .{full_path},
+                    ) catch "image_write_failed";
+                    const warn_arr = [1][]const u8{warn_str};
+                    item.warnings = &warn_arr;
+                    env.emitImage(page_number, item) catch |e| return mapWriteErr(e);
+                    return .ok;
+                };
+
+                item.path = full_path;
+                env.emitImage(page_number, item) catch |e| return mapWriteErr(e);
+                return .ok;
+            }
+            // Unsupported filter or missing payload — warn.
+            const filter_name = img.encoding orelse "uncompressed";
+            var warn_buf: [64]u8 = undefined;
+            const warn_str = std.fmt.bufPrint(
+                &warn_buf,
+                "unsupported_filter:{s}",
+                .{filter_name},
+            ) catch "unsupported_filter";
+            const warn_arr = [1][]const u8{warn_str};
+            item.warnings = &warn_arr;
+            env.emitImage(page_number, item) catch |e| return mapWriteErr(e);
+            return .ok;
+        },
+    }
+
+    // Metadata-only mode (or off, which the caller already filters).
+    env.emitImage(page_number, item) catch |e| return mapWriteErr(e);
+    return .ok;
+}
+
 /// Read all of stdin into an owned slice. Cap at 256 MiB so a runaway
 /// producer doesn't OOM us; that ceiling sits safely above the largest
 /// expected hotel PDF (~50 MiB) and below the practical 32-bit limit.
@@ -979,7 +1113,7 @@ fn writeArgError(err: ArgError) !void {
         error.InvalidMaxTokens => "pdf.zig: --max-tokens must be a positive integer",
         error.InvalidOutputMode => "pdf.zig: --output must be one of ndjson|md|chunks|text",
         error.InvalidScanThreshold => "pdf.zig: --scan-threshold must be an integer in [0, 100]",
-        error.InvalidImagesMode => "pdf.zig: --images mode must be one of: (bare) or =base64",
+        error.InvalidImagesMode => "pdf.zig: --images mode must be one of: (bare), =base64, =path",
     };
     try w.print("{s}\n", .{msg});
 }
@@ -1064,6 +1198,8 @@ fn writeHelp() !void {
         \\  --bboxes                    add per-span text + bbox + font_size to kind:"page" records (citation-grade)
         \\  --images                    emit kind:"image" records (metadata: page, bbox, width_px, height_px, encoding)
         \\  --images=base64             same + payload_b64 for JPEG/JPEG-2000/CCITTFax images; warnings for others
+        \\  --images=path               same + writes JPEG/JPEG-2000 images to --images-dir and emits `path`
+        \\  --images-dir DIR            output directory for --images=path (default: cwd)
         \\  --struct-tree               emit kind:"struct_tree" with full PDF/UA structure tree (off by default; large)
         \\
         \\New options:
@@ -1275,11 +1411,122 @@ test "PR-19 follow-up: --images=base64 sets base64 mode" {
     try std.testing.expectEqual(ImagesMode.base64, cmd.extract.images_mode);
 }
 
+test "PR-19 follow-up: --images=path sets path mode" {
+    const cmd = try parseArgs(&.{ "extract", "--images=path", "foo.pdf" });
+    try std.testing.expectEqual(ImagesMode.path, cmd.extract.images_mode);
+}
+
+test "PR-19 follow-up: --images-dir threads through to ExtractArgs" {
+    const cmd = try parseArgs(&.{
+        "extract", "--images=path", "--images-dir", "/tmp/imgs", "foo.pdf",
+    });
+    try std.testing.expectEqual(ImagesMode.path, cmd.extract.images_mode);
+    try std.testing.expect(cmd.extract.images_dir != null);
+    try std.testing.expectEqualStrings("/tmp/imgs", cmd.extract.images_dir.?);
+}
+
 test "PR-19 follow-up: --images=unknown rejects with InvalidImagesMode" {
     try std.testing.expectError(
         error.InvalidImagesMode,
-        parseArgs(&.{ "extract", "--images=path", "foo.pdf" }),
+        parseArgs(&.{ "extract", "--images=foobar", "foo.pdf" }),
     );
+}
+
+test "PR-19 follow-up: deriveDocId strips .pdf, sanitizes, falls back to stdin" {
+    const allocator = std.testing.allocator;
+
+    const a = try deriveDocId(allocator, "foo.pdf");
+    defer allocator.free(a);
+    try std.testing.expectEqualStrings("foo", a);
+
+    const b = try deriveDocId(allocator, "/path/to/Hotel Rooms 2025.PDF");
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings("Hotel_Rooms_2025", b);
+
+    const c = try deriveDocId(allocator, "-");
+    defer allocator.free(c);
+    try std.testing.expectEqualStrings("stdin", c);
+
+    // Empty after stripping → fall back to stdin so we never produce an
+    // empty filename component.
+    const d = try deriveDocId(allocator, ".pdf");
+    defer allocator.free(d);
+    try std.testing.expectEqualStrings("stdin", d);
+}
+
+test "PR-19 follow-up: extensionForFilter only allows DCT and JPX" {
+    try std.testing.expectEqualStrings(".jpg", extensionForFilter("DCTDecode").?);
+    try std.testing.expectEqualStrings(".jp2", extensionForFilter("JPXDecode").?);
+    try std.testing.expect(extensionForFilter("CCITTFaxDecode") == null);
+    try std.testing.expect(extensionForFilter("FlateDecode") == null);
+    try std.testing.expect(extensionForFilter(null) == null);
+}
+
+test "PR-19 follow-up: path mode writes DCT image to disk + emits relative path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const fixed_doc_id: [36]u8 = "01234567-89ab-7cde-8f01-23456789abcd".*;
+    var buf: [4096]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = stream.Envelope.initWithId(&aw, "x.pdf", fixed_doc_id);
+
+    const args: ExtractArgs = .{
+        .input = "x.pdf",
+        .images_mode = .path,
+        .images_dir = tmp_path,
+    };
+    const fake_payload = "\x89JPEG-bytes-stand-in";
+    const img: zpdf.Document.ImageInfo = .{
+        .rect = .{ 0, 0, 100, 100 },
+        .width = 32,
+        .height = 32,
+        .encoding = "DCTDecode",
+        .payload = fake_payload,
+    };
+
+    const ec = try emitImageRecord(allocator, &env, args, "doc", 1, 1, img);
+    try std.testing.expectEqual(ExitCode.ok, ec);
+
+    // The NDJSON record must reference the relative path under tmp_path.
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"path\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "doc-page1-img1.jpg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"warnings\":") == null);
+
+    // The file must be on disk and contain the original payload.
+    const file_data = try tmp.dir.readFileAlloc(allocator, "doc-page1-img1.jpg", 1024);
+    defer allocator.free(file_data);
+    try std.testing.expectEqualSlices(u8, fake_payload, file_data);
+}
+
+test "PR-19 follow-up: path mode emits warning for unsupported filter" {
+    const allocator = std.testing.allocator;
+
+    const fixed_doc_id: [36]u8 = "01234567-89ab-7cde-8f01-23456789abcd".*;
+    var buf: [2048]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = stream.Envelope.initWithId(&aw, "x.pdf", fixed_doc_id);
+
+    const args: ExtractArgs = .{ .input = "x.pdf", .images_mode = .path };
+    const img: zpdf.Document.ImageInfo = .{
+        .rect = .{ 0, 0, 100, 100 },
+        .width = 32,
+        .height = 32,
+        .encoding = "FlateDecode",
+        .payload = null,
+    };
+    const ec = try emitImageRecord(allocator, &env, args, "doc", 1, 1, img);
+    try std.testing.expectEqual(ExitCode.ok, ec);
+
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"path\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"warnings\":[\"unsupported_filter:FlateDecode\"]") != null);
 }
 
 test "PR-21: --struct-tree flag is accepted and defaults off" {

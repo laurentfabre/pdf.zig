@@ -154,10 +154,16 @@ pub const ImageItem = struct {
     /// `--images=base64` mode; `null` in metadata mode or when the
     /// filter is unsupported (see `warnings`).  Borrowed — caller owns.
     payload_b64: ?[]const u8 = null,
-    /// Non-null in `--images=base64` mode when `payload_b64` could not
-    /// be populated (e.g. `["unsupported_filter:FlateDecode"]`).
-    /// Null in metadata mode.  Borrowed slice of slices — caller owns.
+    /// Non-null in `--images=base64` / `--images=path` modes when the
+    /// payload (or path) could not be populated (e.g.
+    /// `["unsupported_filter:FlateDecode"]`).  Null in metadata mode.
+    /// Borrowed slice of slices — caller owns.
     warnings: ?[]const []const u8 = null,
+    /// Path to the extracted image file, set only by `--images=path`
+    /// mode. The CLI writes the file before emitting the record;
+    /// the path is relative to the user-supplied --images-dir (or cwd
+    /// when omitted).  Null in other modes.  Borrowed slice — caller owns.
+    path: ?[]const u8 = null,
 };
 
 /// PR-18 [feat]: per-span text + bbox payload for the `--bboxes`
@@ -467,6 +473,10 @@ pub const Envelope = struct {
                 try writeJsonString(self.writer, w);
             }
             try self.writer.writeAll("]");
+        }
+        if (item.path) |p| {
+            try self.writer.writeAll(",\"path\":");
+            try writeJsonString(self.writer, p);
         }
         try self.endRecord();
     }
