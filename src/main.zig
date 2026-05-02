@@ -378,7 +378,7 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFor
 
                     // Images for this page
                     try writer.writeAll(",\n      \"images\": [");
-                    if (doc.getPageImages(page_num, allocator)) |images| {
+                    if (doc.getPageImages(page_num, allocator, false)) |images| {
                         defer zpdf.Document.freeImages(allocator, images);
                         for (images, 0..) |img, ii| {
                             if (ii > 0) try writer.writeAll(",");

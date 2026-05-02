@@ -35,6 +35,12 @@ pub const ExitCode = enum(u8) {
 
 pub const OutputMode = enum { ndjson, md, chunks, text };
 
+/// PR-19 follow-up: controls what kind:"image" records emit.
+///   off      — no image records (default)
+///   metadata — bbox + pixel dims + encoding only
+///   base64   — adds payload_b64 for DCT/JPX/CCITTFax; warnings for others
+pub const ImagesMode = enum { off, metadata, base64 };
+
 pub const ExtractArgs = struct {
     input: []const u8,
     output_path: ?[]const u8 = null,
@@ -51,11 +57,12 @@ pub const ExtractArgs = struct {
     /// parallel `spans:[{text, bbox, font_size, font_name}]` array.
     /// Citation-grade extraction; off by default.
     bboxes: bool = false,
-    /// PR-19 [feat]: when true, emit a `kind:"image"` record per
-    /// image XObject placed on a page. v1 mode is metadata-only
-    /// (bbox + pixel dims). `--images=base64` and `--images=path`
-    /// payload modes are deferred to a follow-up.
-    images: bool = false,
+    /// PR-19 follow-up: image record mode.
+    ///   --images            → metadata (bbox + dims + encoding)
+    ///   --images=base64     → adds payload_b64 for passthrough filters;
+    ///                         warnings array for unsupported ones
+    ///   (omitted)           → off (no image records)
+    images_mode: ImagesMode = .off,
     /// PR-21 [feat]: when true, emit a single `kind:"struct_tree"`
     /// document-level record carrying the full /StructTreeRoot walk
     /// as a JSON tree. Off by default (records can be very large).
@@ -94,6 +101,7 @@ pub const ArgError = error{
     InvalidMaxTokens,
     InvalidOutputMode,
     InvalidScanThreshold,
+    InvalidImagesMode,
 };
 
 /// Parse argv (excluding argv[0]) into a Command.
@@ -174,7 +182,11 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
         } else if (std.mem.eql(u8, a, "--bboxes")) {
             out.bboxes = true;
         } else if (std.mem.eql(u8, a, "--images")) {
-            out.images = true;
+            out.images_mode = .metadata;
+        } else if (std.mem.eql(u8, a, "--images=base64")) {
+            out.images_mode = .base64;
+        } else if (std.mem.startsWith(u8, a, "--images=")) {
+            return error.InvalidImagesMode;
         } else if (std.mem.eql(u8, a, "--struct-tree")) {
             out.struct_tree = true;
         } else if (std.mem.eql(u8, a, "--scan-threshold")) {
@@ -670,19 +682,55 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                         env.emitAnnotations(@intCast(page_idx + 1), items.items) catch |e| return mapWriteErr(e);
                     }
                 } else |_| {}
-                // PR-19 [feat]: emit one kind:"image" record per image
-                // XObject placed on the page (metadata-only mode).
-                // Future: --images=base64 / --images=path payload modes.
-                if (args.images) {
-                    if (doc.getPageImages(page_idx, allocator)) |images| {
+                // PR-19 follow-up: emit kind:"image" records per the
+                // chosen mode (metadata-only or base64 payload).
+                if (args.images_mode != .off) {
+                    const want_payload = args.images_mode == .base64;
+                    if (doc.getPageImages(page_idx, allocator, want_payload)) |images| {
                         defer allocator.free(images);
                         for (images) |img| {
-                            env.emitImage(@intCast(page_idx + 1), .{
-                                .bbox = img.rect,
-                                .width_px = img.width,
-                                .height_px = img.height,
-                                .encoding = img.encoding,
-                            }) catch |e| return mapWriteErr(e);
+                            if (args.images_mode == .base64) {
+                                if (img.payload) |raw| {
+                                    // Passthrough filter — base64-encode the raw bytes.
+                                    const Encoder = std.base64.standard.Encoder;
+                                    const b64_len = Encoder.calcSize(raw.len);
+                                    const b64_buf = try allocator.alloc(u8, b64_len);
+                                    defer allocator.free(b64_buf);
+                                    const b64 = Encoder.encode(b64_buf, raw);
+                                    env.emitImage(@intCast(page_idx + 1), .{
+                                        .bbox = img.rect,
+                                        .width_px = img.width,
+                                        .height_px = img.height,
+                                        .encoding = img.encoding,
+                                        .payload_b64 = b64,
+                                    }) catch |e| return mapWriteErr(e);
+                                } else {
+                                    // Unsupported filter — emit null payload + warning.
+                                    const filter_name = img.encoding orelse "uncompressed";
+                                    var warn_buf: [64]u8 = undefined;
+                                    const warn_str = std.fmt.bufPrint(
+                                        &warn_buf,
+                                        "unsupported_filter:{s}",
+                                        .{filter_name},
+                                    ) catch "unsupported_filter";
+                                    const warn_arr = [1][]const u8{warn_str};
+                                    env.emitImage(@intCast(page_idx + 1), .{
+                                        .bbox = img.rect,
+                                        .width_px = img.width,
+                                        .height_px = img.height,
+                                        .encoding = img.encoding,
+                                        .warnings = &warn_arr,
+                                    }) catch |e| return mapWriteErr(e);
+                                }
+                            } else {
+                                // Metadata-only mode.
+                                env.emitImage(@intCast(page_idx + 1), .{
+                                    .bbox = img.rect,
+                                    .width_px = img.width,
+                                    .height_px = img.height,
+                                    .encoding = img.encoding,
+                                }) catch |e| return mapWriteErr(e);
+                            }
                         }
                     } else |_| {}
                 }
@@ -931,6 +979,7 @@ fn writeArgError(err: ArgError) !void {
         error.InvalidMaxTokens => "pdf.zig: --max-tokens must be a positive integer",
         error.InvalidOutputMode => "pdf.zig: --output must be one of ndjson|md|chunks|text",
         error.InvalidScanThreshold => "pdf.zig: --scan-threshold must be an integer in [0, 100]",
+        error.InvalidImagesMode => "pdf.zig: --images mode must be one of: (bare) or =base64",
     };
     try w.print("{s}\n", .{msg});
 }
@@ -1013,7 +1062,8 @@ fn writeHelp() !void {
         \\  --no-warnings               suppress `warnings` array on page records
         \\  --scan-threshold PCT        flag doc as "scanned" when ≥PCT% of pages have <50B text (default 50)
         \\  --bboxes                    add per-span text + bbox + font_size to kind:"page" records (citation-grade)
-        \\  --images                    emit kind:"image" records (metadata-only: page, bbox, width_px, height_px, encoding)
+        \\  --images                    emit kind:"image" records (metadata: page, bbox, width_px, height_px, encoding)
+        \\  --images=base64             same + payload_b64 for JPEG/JPEG-2000/CCITTFax images; warnings for others
         \\  --struct-tree               emit kind:"struct_tree" with full PDF/UA structure tree (off by default; large)
         \\
         \\New options:
@@ -1212,12 +1262,24 @@ test "PR-18: --bboxes flag is accepted and defaults off" {
     try std.testing.expect(cmd_on.extract.bboxes);
 }
 
-test "PR-19: --images flag is accepted and defaults off" {
+test "PR-19: --images defaults off; bare --images → metadata mode" {
     const cmd_off = try parseArgs(&.{ "extract", "foo.pdf" });
-    try std.testing.expect(!cmd_off.extract.images);
+    try std.testing.expectEqual(ImagesMode.off, cmd_off.extract.images_mode);
 
-    const cmd_on = try parseArgs(&.{ "extract", "--images", "foo.pdf" });
-    try std.testing.expect(cmd_on.extract.images);
+    const cmd_meta = try parseArgs(&.{ "extract", "--images", "foo.pdf" });
+    try std.testing.expectEqual(ImagesMode.metadata, cmd_meta.extract.images_mode);
+}
+
+test "PR-19 follow-up: --images=base64 sets base64 mode" {
+    const cmd = try parseArgs(&.{ "extract", "--images=base64", "foo.pdf" });
+    try std.testing.expectEqual(ImagesMode.base64, cmd.extract.images_mode);
+}
+
+test "PR-19 follow-up: --images=unknown rejects with InvalidImagesMode" {
+    try std.testing.expectError(
+        error.InvalidImagesMode,
+        parseArgs(&.{ "extract", "--images=path", "foo.pdf" }),
+    );
 }
 
 test "PR-21: --struct-tree flag is accepted and defaults off" {

@@ -136,9 +136,8 @@ pub const AnnotationItem = struct {
 
 /// PR-19 [feat]: per-image metadata for the `--images` mode.
 /// Emitted as one `kind:"image"` record per image XObject placed on a
-/// page. v1: metadata only (bbox + pixel dims + optional encoding).
-/// Future: `payload_b64` (when --images=base64) + `path` (when
-/// --images=path).
+/// page.  Metadata fields are always present; the optional `payload_b64`
+/// and `warnings` fields appear only in `--images=base64` mode.
 pub const ImageItem = struct {
     /// PDF page bbox after CTM, in user-space points.
     bbox: [4]f64,
@@ -150,6 +149,15 @@ pub const ImageItem = struct {
     /// "FlateDecode", "JPXDecode", "CCITTFaxDecode"), or `null` for
     /// uncompressed sample data. Borrowed slice — caller does not own.
     encoding: ?[]const u8 = null,
+    /// Base64-encoded raw stream bytes for passthrough-friendly filters
+    /// (DCTDecode / JPXDecode / CCITTFaxDecode).  Set by the caller in
+    /// `--images=base64` mode; `null` in metadata mode or when the
+    /// filter is unsupported (see `warnings`).  Borrowed — caller owns.
+    payload_b64: ?[]const u8 = null,
+    /// Non-null in `--images=base64` mode when `payload_b64` could not
+    /// be populated (e.g. `["unsupported_filter:FlateDecode"]`).
+    /// Null in metadata mode.  Borrowed slice of slices — caller owns.
+    warnings: ?[]const []const u8 = null,
 };
 
 /// PR-18 [feat]: per-span text + bbox payload for the `--bboxes`
@@ -431,6 +439,11 @@ pub const Envelope = struct {
     /// loops per page and per image (one record per image, NOT one
     /// record per page like links/annotations) to keep records flat
     /// for embedding pipelines that batch on a per-image basis.
+    ///
+    /// `payload_b64` / `warnings` discipline (--images=base64 mode):
+    ///   - `payload_b64` non-null  → emit `"payload_b64":"<b64>"`
+    ///   - `payload_b64` null + `warnings` non-null → emit `"payload_b64":null`
+    ///   - both null (metadata mode) → `payload_b64` field absent entirely
     pub fn emitImage(self: *Envelope, page_number: u32, item: ImageItem) !void {
         try self.beginRecord(.image);
         try self.writer.print(
@@ -440,6 +453,20 @@ pub const Envelope = struct {
         if (item.encoding) |enc| {
             try self.writer.writeAll(",\"encoding\":");
             try writeJsonString(self.writer, enc);
+        }
+        if (item.payload_b64) |b64| {
+            try self.writer.writeAll(",\"payload_b64\":");
+            try writeJsonString(self.writer, b64);
+        } else if (item.warnings != null) {
+            try self.writer.writeAll(",\"payload_b64\":null");
+        }
+        if (item.warnings) |ws| {
+            try self.writer.writeAll(",\"warnings\":[");
+            for (ws, 0..) |w, i| {
+                if (i > 0) try self.writer.writeAll(",");
+                try writeJsonString(self.writer, w);
+            }
+            try self.writer.writeAll("]");
         }
         try self.endRecord();
     }
@@ -948,6 +975,55 @@ test "PR-19: emitImage surfaces /Filter as encoding when set" {
     });
     const written = aw.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"encoding\":\"DCTDecode\"") != null);
+}
+
+test "PR-19 base64: emitImage emits payload_b64 when set" {
+    var buf: [4096]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitImage(2, .{
+        .bbox = .{ 0, 0, 100, 100 },
+        .width_px = 10,
+        .height_px = 10,
+        .encoding = "DCTDecode",
+        .payload_b64 = "/w==",
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"payload_b64\":\"/w==\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"warnings\"") == null);
+}
+
+test "PR-19 base64: emitImage emits null payload_b64 + warnings for unsupported filter" {
+    var buf: [4096]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    const ws: []const []const u8 = &.{"unsupported_filter:FlateDecode"};
+    try env.emitImage(1, .{
+        .bbox = .{ 0, 0, 100, 100 },
+        .width_px = 10,
+        .height_px = 10,
+        .encoding = "FlateDecode",
+        .warnings = ws,
+    });
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"payload_b64\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"warnings\":[\"unsupported_filter:FlateDecode\"]") != null);
+}
+
+test "PR-19 metadata: emitImage omits payload_b64 field entirely" {
+    var buf: [2048]u8 = undefined;
+    var aw = std.io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitImage(1, .{
+        .bbox = .{ 0, 0, 100, 100 },
+        .width_px = 10,
+        .height_px = 10,
+        .encoding = "FlateDecode",
+    });
+    const written = aw.buffered();
+    // Metadata mode: no payload_b64 or warnings fields at all.
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"payload_b64\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"warnings\"") == null);
 }
 
 test "PR-21: emitStructTreeEmpty produces null root" {
