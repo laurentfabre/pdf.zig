@@ -1,0 +1,4 @@
+# PR-15 follow-up: real-world corpus is fetched on demand by
+# `audit/fetch_real_corpus.py`. Per-PDF size is 5–30 MB; 30 PDFs total
+# would balloon the repo. The manifest itself stays tracked.
+real/*.pdf

@@ -289,14 +289,14 @@ updated: 2026-05-04
   > **Test strategy.** Two fixtures + integration test.
   > **Codex gate.** No infinite-loop cascade; correct error-code propagation.
 
-- [ ] **PR-15 · feat: CJK extraction quality + corpus test**
+- [ ] **PR-15 · feat: CJK extraction quality + corpus test** _(harness shipped; 30-PDF real corpus pending license review)_
   > [!info]- Details
   > **Files-touched envelope.** Audit-only PR — `audit/cjk_subset.py`, `audit/cjk-pdfs/`, `audit/v1_4_cjk_run.py`, possibly `src/encoding.zig` regressions.
   > **Acceptance gate.**
-  > - 30-PDF CJK corpus materialised (10 ja, 10 zh, 10 ko).
-  > - ≥ 95 % byte-identical text vs `pymupdf4llm` reference for non-vertical writing.
-  > - Vertical-writing CJK extraction known-broken — emit `kind:"warning"` `"vertical_writing_unsupported"`.
-  > - Document gap in [[architecture]] §9 case #10 update.
+  > - 30-PDF CJK corpus materialised (10 ja, 10 zh, 10 ko). _(Harness shipped against a 15-fixture **synthetic** corpus — 5 ja + 5 zh + 5 ko, mix of horizontal + vertical. The 30-PDF real-world corpus is pending user license review and lives behind `audit/cjk-pdfs/real/.gitkeep`.)_
+  > - ≥ 95 % byte-identical text vs `pymupdf4llm` reference for non-vertical writing. _(100 % char-identity vs synthetic ground truth; real-corpus comparison runs against `pymupdf4llm` once PDFs land.)_
+  > - Vertical-writing CJK extraction known-broken — emit `kind:"warning"` `"vertical_writing_unsupported"`. _(Shipped — `Document.pageHasVerticalWriting` + `Envelope.emitWarning` per affected page in NDJSON mode; harness gates 100 % emission on `wmode == 1` fixtures.)_
+  > - Document gap in [[architecture]] §9 case #10 update. _(Done — case #10 + #12 both updated.)_
   >
   > **Test strategy.** New corpus harness; if encoding regressions surface, scope follow-up `v1.4.1` PR.
   > **Codex gate.** 95 % threshold honest (not gamed by stripping); CJK-specific edge cases (full-width punctuation, ruby annotations).

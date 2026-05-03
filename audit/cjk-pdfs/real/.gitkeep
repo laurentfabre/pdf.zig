@@ -1,0 +1,22 @@
+# Real-world CJK PDF corpus.
+#
+# 30-item manifest (10 ja + 10 zh + 10 ko) lives at
+# `audit/cjk-pdfs/real-corpus-manifest.json`. Every entry is sourced from
+# Internet Archive and tagged with a PD-Mark / CC0 / pre-1929 license.
+#
+# Fetch on demand (PDFs are gitignored — they would balloon the repo):
+#   python3 audit/fetch_real_corpus.py            # all 30, ~500 MB
+#   python3 audit/fetch_real_corpus.py --lang ja  # one language
+#   python3 audit/fetch_real_corpus.py --dry-run  # license-check only
+#   python3 audit/fetch_real_corpus.py --max-mb 15
+#
+# The fetcher cross-checks each item's live licenseurl against the manifest
+# before downloading; any mismatch aborts that item rather than silently
+# pulling potentially-restricted content.
+#
+# Filename convention `<lang>-<source>-<id>.pdf` is enforced by the manifest.
+# `audit/v1_4_cjk_run.py` automatically picks up everything matching `*.pdf`
+# in this directory and compares pdf.zig output against pymupdf4llm.
+#
+# Drop your own PDFs here directly if they're not on IA — keep the filename
+# pattern (lang prefix) so the harness groups them correctly.

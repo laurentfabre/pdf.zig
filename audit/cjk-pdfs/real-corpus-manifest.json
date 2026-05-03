@@ -1,0 +1,47 @@
+{
+  "_doc": "Real-world CJK corpus for PR-15 (10 ja + 10 zh + 10 ko = 30 PDFs).",
+  "_provenance": "Every entry is sourced from Internet Archive (archive.org) and carries an explicit Public Domain Mark 1.0 or CC0 license URL on its IA metadata page. The fetch script (audit/fetch_real_corpus.py) verifies the license at download time and refuses to fetch anything whose live licenseurl no longer matches the manifest. PDFs are NOT committed to the repo (audit/cjk-pdfs/.gitignore excludes *.pdf in real/) — fetch on demand.",
+  "_filename_convention": "<lang>-<source>-<id>.pdf, where <source> is `ia` (Internet Archive). v1_4_cjk_run.py groups by the leading `ja-`/`zh-`/`ko-` tag.",
+  "_test_target": "≥95% byte-identical text vs pymupdf4llm reference for non-vertical writing. These are scanned PDFs with OCR text overlays — both pdf.zig and pymupdf4llm consume the same overlay, so parity is the gate, not absolute correctness.",
+  "_caveat": "Internet Archive scans are 5–30 MB each; 30 PDFs ≈ 500 MB total. Fetch only the subset you intend to test against; pass `--lang ja` or `--lang zh,ko` to scope.",
+  "_writing_field": "The `writing` field is an a-priori expectation based on the work's traditional layout. It is NOT verified ground truth. The actual gate is whether pdf.zig emits a `vertical_writing_unsupported` warning record on PDFs the extractor judges to use vertical writing. Project Gutenberg-derived PDFs in particular are typically rendered horizontally from digital text regardless of the source work's tradition.",
+
+  "ja": [
+    {"id": "ja-ia-manyoshu-5-6", "ia_id": "manyoshu-volumes-5-6", "title": "Man'yōshū Volumes 5 & 6", "year": 759, "license": "PD-Mark", "writing": "vertical", "size_mb": 12},
+    {"id": "ja-ia-nanpobunshu", "ia_id": "Nanpobunshu", "title": "Nanpobunshu", "year": 1625, "license": "PD-Mark", "writing": "vertical", "size_mb": 8},
+    {"id": "ja-ia-reigi-25", "ia_id": "JAPAF.611.25", "title": "Reigi ruiten vol 25", "year": 1680, "license": "PD-Mark", "writing": "vertical", "size_mb": 15},
+    {"id": "ja-ia-reigi-146", "ia_id": "JAPAF.611.146", "title": "Reigi ruiten vol 146", "year": 1680, "license": "PD-Mark", "writing": "vertical", "size_mb": 15},
+    {"id": "ja-ia-reigi-148", "ia_id": "JAPAF.611.148", "title": "Reigi ruiten vol 148", "year": 1680, "license": "PD-Mark", "writing": "vertical", "size_mb": 15},
+    {"id": "ja-ia-reigi-220", "ia_id": "JAPAF.611.220", "title": "Reigi ruiten vol 220", "year": 1680, "license": "PD-Mark", "writing": "vertical", "size_mb": 15},
+    {"id": "ja-ia-dai-hannya", "ia_id": "BULAC.RES.MON.4.2896", "title": "Dai hannya rishubun", "year": 1685, "license": "PD-Mark", "writing": "vertical", "size_mb": 10},
+    {"id": "ja-ia-kecho-ruien", "ia_id": "KechoRuienRyakushu1696", "title": "Kecho Ruien Ryakushu", "year": 1696, "license": "PD-Mark", "writing": "vertical", "size_mb": 12},
+    {"id": "ja-ia-hamonshu-1", "ia_id": "hamonshuyv1mori", "title": "Hamonshu vol 1 (Mori Yūzan)", "year": 1903, "license": "PD-pre-1929", "writing": "vertical", "size_mb": 18},
+    {"id": "ja-ia-hamonshu-3", "ia_id": "hamonshuyv3mori", "title": "Hamonshu vol 3 (Mori Yūzan)", "year": 1903, "license": "PD-pre-1929", "writing": "vertical", "size_mb": 18}
+  ],
+
+  "zh": [
+    {"id": "zh-ia-dream-pool", "ia_id": "shen_kuo_dream_pool_essays_1095_chinese_trad", "title": "夢溪筆談 Dream Pool Essays (Shen Kuo)", "year": 1095, "license": "CC0", "writing": "vertical", "size_mb": 6},
+    {"id": "zh-ia-tripitaka-images", "ia_id": "scripturalwoodblocks", "title": "高麗藏再雕本经板 (Tripitaka Koreana woodblocks)", "year": 1237, "license": "CC0", "writing": "vertical", "size_mb": 25},
+    {"id": "zh-ia-washing-wrongs", "ia_id": "washingawaywrongs", "title": "洗冤集錄 Washing Away of Wrongs (Song Ci)", "year": 1247, "license": "PD-Mark", "writing": "vertical", "size_mb": 30},
+    {"id": "zh-ia-tripitaka-cd", "ia_id": "26_20240623_202406", "title": "高麗藏再雕本 CD-ROM 图像", "year": 1249, "license": "CC0", "writing": "vertical", "size_mb": 20},
+    {"id": "zh-ia-zhushu-jinian", "ia_id": "20201208_20201208_0233", "title": "竹書紀年(卷上、下) 善本掃描清晰版", "year": 1566, "license": "PD-Mark", "writing": "vertical", "size_mb": 14},
+    {"id": "zh-ia-li-ji", "ia_id": "pg24048-images-3", "title": "禮記 Li Ji (Project Gutenberg ebook 24048)", "year": 900, "license": "PD-Mark", "writing": "horizontal", "size_mb": 5},
+    {"id": "zh-ia-viet-am-thi", "ia_id": "viet-am-thi-tap", "title": "越音詩集 Việt âm thi tập (han characters)", "year": 1433, "license": "PD-Mark", "writing": "vertical", "size_mb": 12},
+    {"id": "zh-ia-hoang-viet", "ia_id": "hoang-viet-dia-du-chi", "title": "皇越地輿誌 Hoàng Việt địa dư chí", "year": 1435, "license": "PD-Mark", "writing": "vertical", "size_mb": 10},
+    {"id": "zh-ia-dai-viet-su", "ia_id": "dai-viet-su-ky-ban-ky-toan-thu-quyen-1", "title": "大越史記本紀全書 Đại Việt sử ký (q1)", "year": 1479, "license": "PD-Mark", "writing": "vertical", "size_mb": 15},
+    {"id": "zh-ia-o-chau-can-luc", "ia_id": "o-chau-can-luc-luc", "title": "烏州近錄 Ô Châu cận lục", "year": 1555, "license": "PD-Mark", "writing": "vertical", "size_mb": 8}
+  ],
+
+  "ko": [
+    {"id": "ko-ia-seokbosangjeol", "ia_id": "seok-bo-sang-jeol", "title": "Seokbosangjeol (Buddhist text)", "year": 1447, "license": "PD-Mark", "writing": "vertical", "size_mb": 17},
+    {"id": "ko-ia-hunmong-jahoe", "ia_id": "20230923_20230923_0401", "title": "訓蒙字會 Hunmong Jahoe", "year": 1527, "license": "PD-Mark", "writing": "vertical", "size_mb": 11},
+    {"id": "ko-ia-tyongni-29", "ia_id": "COR.I.21.29", "title": "Tyŏngni ŭigwe vol 29", "year": 1797, "license": "PD-Mark", "writing": "vertical", "size_mb": 14},
+    {"id": "ko-ia-tyongni-30", "ia_id": "COR.I.21.30", "title": "Tyŏngni ŭigwe vol 30", "year": 1797, "license": "PD-Mark", "writing": "vertical", "size_mb": 14},
+    {"id": "ko-ia-tyongni-33", "ia_id": "COR.I.21.33", "title": "Tyŏngni ŭigwe vol 33", "year": 1797, "license": "PD-Mark", "writing": "vertical", "size_mb": 14},
+    {"id": "ko-ia-tyongni-36", "ia_id": "COR.I.21.36", "title": "Tyŏngni ŭigwe vol 36", "year": 1797, "license": "PD-Mark", "writing": "vertical", "size_mb": 14},
+    {"id": "ko-ia-tyongni-40", "ia_id": "COR.I.21.40", "title": "Tyŏngni ŭigwe vol 40", "year": 1797, "license": "PD-Mark", "writing": "vertical", "size_mb": 14},
+    {"id": "ko-ia-kwanbo-3", "ia_id": "aseamunhwasa_kwanbo_v_3_1910", "title": "Kwanbo (Korean government gazette) vol 3", "year": 1910, "license": "PD-Mark", "writing": "vertical", "size_mb": 9},
+    {"id": "ko-ia-kwanbo-10", "ia_id": "aseamunhwasa_kwanbo_v_10_1910", "title": "Kwanbo vol 10", "year": 1910, "license": "PD-Mark", "writing": "vertical", "size_mb": 9},
+    {"id": "ko-ia-kwanbo-16", "ia_id": "aseamunhwasa_kwanbo_v_16_1910", "title": "Kwanbo vol 16", "year": 1910, "license": "PD-Mark", "writing": "vertical", "size_mb": 9}
+  ]
+}
