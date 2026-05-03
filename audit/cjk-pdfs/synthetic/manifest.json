@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "fixtures": [
+    {"id":"ja-h-01","lang":"ja","wmode":0,"path":"ja-h-01.pdf","expected_utf8":"あいうえお"},
+    {"id":"ja-h-02","lang":"ja","wmode":0,"path":"ja-h-02.pdf","expected_utf8":"カタカナ"},
+    {"id":"ja-h-03","lang":"ja","wmode":0,"path":"ja-h-03.pdf","expected_utf8":"日本語"},
+    {"id":"ja-h-04","lang":"ja","wmode":0,"path":"ja-h-04.pdf","expected_utf8":"テスト文書"},
+    {"id":"ja-v-01","lang":"ja","wmode":1,"path":"ja-v-01.pdf","expected_utf8":"縦書き"},
+    {"id":"zh-h-01","lang":"zh","wmode":0,"path":"zh-h-01.pdf","expected_utf8":"中文"},
+    {"id":"zh-h-02","lang":"zh","wmode":0,"path":"zh-h-02.pdf","expected_utf8":"你好世界"},
+    {"id":"zh-h-03","lang":"zh","wmode":0,"path":"zh-h-03.pdf","expected_utf8":"测试文档"},
+    {"id":"zh-h-04","lang":"zh","wmode":0,"path":"zh-h-04.pdf","expected_utf8":"一二三四五"},
+    {"id":"zh-v-01","lang":"zh","wmode":1,"path":"zh-v-01.pdf","expected_utf8":"竖排"},
+    {"id":"ko-h-01","lang":"ko","wmode":0,"path":"ko-h-01.pdf","expected_utf8":"한글"},
+    {"id":"ko-h-02","lang":"ko","wmode":0,"path":"ko-h-02.pdf","expected_utf8":"안녕하세요"},
+    {"id":"ko-h-03","lang":"ko","wmode":0,"path":"ko-h-03.pdf","expected_utf8":"테스트"},
+    {"id":"ko-h-04","lang":"ko","wmode":0,"path":"ko-h-04.pdf","expected_utf8":"문서"},
+    {"id":"ko-v-01","lang":"ko","wmode":1,"path":"ko-v-01.pdf","expected_utf8":"세로"}
+  ]
+}

@@ -46,6 +46,11 @@ pub const RecordKind = enum {
     /// record carrying the full /StructTreeRoot walk as a JSON tree.
     /// Off by default (records can be very large on long documents).
     struct_tree,
+    /// PR-15 [feat]: standalone warning record. Used for document- /
+    /// page-scope conditions that don't fit inside a `page` record's
+    /// embedded `warnings:[]` array — currently
+    /// `vertical_writing_unsupported` (§9 cases #10 + #12).
+    warning,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -63,6 +68,7 @@ pub const RecordKind = enum {
             .annotations => "annotations",
             .image => "image",
             .struct_tree => "struct_tree",
+            .warning => "warning",
         };
     }
 };
@@ -639,6 +645,25 @@ pub const Envelope = struct {
         try self.endRecord();
     }
 
+    /// PR-15 [feat]: emit a standalone `kind:"warning"` record. Used
+    /// for warnings that aren't tied to a single page's extraction
+    /// (e.g. `vertical_writing_unsupported` — the page is still
+    /// emitted, but the extracted text is known to be wrong-order).
+    /// `at_page` is 1-based; pass `null` for document-scope warnings.
+    pub fn emitWarning(
+        self: *Envelope,
+        code: []const u8,
+        message: []const u8,
+        at_page: ?u32,
+    ) !void {
+        try self.beginRecord(.warning);
+        try self.writer.writeAll(",\"code\":");
+        try writeJsonString(self.writer, code);
+        try self.writeStringField("message", message);
+        if (at_page) |p| try self.writer.print(",\"at_page\":{d}", .{p});
+        try self.endRecord();
+    }
+
     fn beginRecord(self: *Envelope, kind: RecordKind) !void {
         try self.writer.writeAll("{\"kind\":\"");
         try self.writer.writeAll(kind.asString());
@@ -1178,6 +1203,28 @@ test "interrupted record carries signal number" {
     const written = aw.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"interrupted\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"signal\":2") != null);
+}
+
+test "PR-15: emitWarning emits kind, code, message, optional at_page" {
+    var buf: [1024]u8 = undefined;
+    var aw = std.Io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitWarning("vertical_writing_unsupported", "page uses /Identity-V", 7);
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"warning\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"code\":\"vertical_writing_unsupported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"message\":\"page uses /Identity-V\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"at_page\":7") != null);
+}
+
+test "PR-15: emitWarning omits at_page when null" {
+    var buf: [1024]u8 = undefined;
+    var aw = std.Io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.emitWarning("doc_scope_warning", "applies to whole doc", null);
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"warning\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"at_page\":") == null);
 }
 
 test "emitSummary omits quality_flag when null (PR-11 default)" {

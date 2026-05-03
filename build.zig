@@ -97,6 +97,21 @@ pub fn build(b: *std.Build) void {
     const run_pdfzig_step = b.step("run-pdfzig", "Run the pdf.zig CLI");
     run_pdfzig_step.dependOn(&run_pdfzig.step);
 
+    // PR-15 [feat]: synthetic CJK corpus generator.  Materialises 15
+    // synthetic CJK PDFs (5 ja, 5 zh, 5 ko; horizontal + vertical) to
+    // `audit/cjk-pdfs/synthetic/` plus a `manifest.json` ground truth.
+    const gen_cjk = b.addExecutable(.{
+        .name = "gen-cjk-corpus",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gen_cjk_corpus.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_gen_cjk = b.addRunArtifact(gen_cjk);
+    const gen_cjk_step = b.step("gen-cjk-corpus", "Materialise the synthetic CJK corpus to audit/cjk-pdfs/synthetic/");
+    gen_cjk_step.dependOn(&run_gen_cjk.step);
+
     // Streaming-layer unit tests (uuid, tokenizer, stream, chunk, cli).
     // Each module's tests are also picked up via the main `test` step below.
     const stream_unit_tests = b.addTest(.{

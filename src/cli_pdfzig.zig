@@ -559,6 +559,24 @@ fn runExtract(allocator: std.mem.Allocator, io: std.Io, args: ExtractArgs) !Exit
         const cur_page: u32 = @intCast(page_idx + 1);
         last_page_seen = cur_page;
 
+        // PR-15 [feat]: vertical-writing CJK detection. The XY-Cut++
+        // reading-order pass assumes left-to-right horizontal flow;
+        // pages with /WMode 1 (Identity-V, UniJIS-UCS2-V, …) come out
+        // as garbled column-order text. We still emit the page record
+        // (the consumer may want best-effort text), but warn loudly.
+        // NDJSON-only emission — other modes are line-stream and don't
+        // model record kinds.
+        if (args.output_mode == .ndjson and doc.pageHasVerticalWriting(page_idx)) {
+            warnings_count += 1;
+            if (!args.no_warnings) {
+                env.emitWarning(
+                    "vertical_writing_unsupported",
+                    "page uses vertical writing mode (WMode 1); extraction may be incorrect",
+                    cur_page,
+                ) catch |e| return mapWriteErr(e);
+            }
+        }
+
         // .text mode streams plain text via the upstream extractor — no
         // markdown rendering, no per-page allocation. The other modes share
         // the extractMarkdown path below.

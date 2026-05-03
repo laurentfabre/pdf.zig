@@ -1023,6 +1023,33 @@ pub const Document = struct {
         };
     }
 
+    /// PR-15 [feat]: returns `true` if any font on this page has
+    /// `wmode == 1` (vertical writing — Identity-V, UniJIS-UCS2-V,
+    /// CMap `/WMode 1 def`, …).  Vertical-writing CJK extraction is
+    /// known-broken in the current XY-Cut++ pass — the CLI emits a
+    /// `kind:"warning"` `vertical_writing_unsupported` record on
+    /// pages where this returns `true`.  See `docs/architecture.md`
+    /// §9 cases #10 + #12.
+    pub fn pageHasVerticalWriting(self: *Document, page_num: usize) bool {
+        if (page_num >= self.pages.items.len) return false;
+        // Lazy-load fonts before scanning — without this, the cache
+        // can be empty for pages that haven't been extracted yet and
+        // we'd silently miss the warning.
+        self.ensurePageFonts(page_num);
+
+        const page_prefix_buf_len = 32;
+        var prefix_buf: [page_prefix_buf_len]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "{d}:", .{page_num}) catch return false;
+
+        var it = self.font_cache.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            if (entry.value_ptr.wmode == 1) return true;
+        }
+        return false;
+    }
+
     pub const PageInfo = struct {
         width: f64,
         height: f64,

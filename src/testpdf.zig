@@ -2413,3 +2413,242 @@ pub fn generateLatticeWithTextPdf(allocator: std.mem.Allocator) ![]u8 {
 
     return try pdf.toOwnedSlice();
 }
+
+// ============================================================================
+// PR-15 [feat]: CJK synthetic fixtures (Identity-H + Identity-V).
+//
+// These hand-rolled PDFs exercise the CJK extraction code path without
+// depending on any copyrighted CJK content. The string contents are
+// generic stand-ins:
+//   - Japanese hiragana/katakana plus a few common kanji
+//   - Chinese (Simplified) digits + 中 + 文
+//   - Korean hangul syllables + a CJK ideograph
+// All glyphs are drawn from the BMP, identity-encoded as CIDs, and
+// round-tripped through a ToUnicode CMap with bfchar entries that
+// echo the input.
+//
+// `wmode == 0` → /Identity-H (horizontal), expected text-extractable.
+// `wmode == 1` → /Identity-V (vertical), known-broken — extraction
+// emits a `vertical_writing_unsupported` warning.
+// ============================================================================
+
+/// Build a CJK CID-font fixture. `codepoints` is a UTF-32 sequence; each
+/// codepoint is BMP (≤ 0xFFFF — no surrogate pairs in the synthetic
+/// corpus). `wmode == 1` selects /Identity-V instead of /Identity-H.
+/// The expected extracted text (UTF-8) round-trips the input.
+pub fn generateCjkCidFontPdf(
+    allocator: std.mem.Allocator,
+    codepoints: []const u21,
+    wmode: u8,
+) ![]u8 {
+    var pdf = std.Io.Writer.Allocating.init(allocator);
+    errdefer pdf.deinit();
+
+    const writer = &pdf.writer;
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    // Object 1: Catalog
+    const obj1_offset = pdf.written().len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // Object 2: Pages
+    const obj2_offset = pdf.written().len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Object 3: Page
+    const obj3_offset = pdf.written().len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    // Object 4: Content stream — UTF-16BE hex-encoded text in a Tj.
+    var content_buf = std.Io.Writer.Allocating.init(allocator);
+    defer content_buf.deinit();
+    const cw = &content_buf.writer;
+    try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n<");
+    for (codepoints) |cp| {
+        // BMP-only — surrogate pairs are out of scope for the synthetic
+        // corpus. The caller is responsible for staying ≤ 0xFFFF.
+        std.debug.assert(cp <= 0xFFFF);
+        try cw.print("{X:0>4}", .{@as(u16, @intCast(cp))});
+    }
+    try cw.writeAll("> Tj\nET\n");
+
+    const obj4_offset = pdf.written().len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content_buf.written().len});
+    try writer.writeAll(content_buf.written());
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // Object 5: Type0 Font (Composite CID font).
+    const enc_name: []const u8 = if (wmode == 1) "/Identity-V" else "/Identity-H";
+    const obj5_offset = pdf.written().len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.writeAll("<< /Type /Font /Subtype /Type0 /BaseFont /CJKFixture\n");
+    try writer.print("   /Encoding {s}\n", .{enc_name});
+    try writer.writeAll("   /DescendantFonts [6 0 R]\n");
+    try writer.writeAll("   /ToUnicode 7 0 R >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Object 6: CIDFont — CIDFontType2, identity-mapped, 1000-unit
+    // default width. We don't embed a real font program; the extractor
+    // only cares about the encoding and ToUnicode CMap.
+    const obj6_offset = pdf.written().len;
+    try writer.writeAll("6 0 obj\n");
+    try writer.writeAll("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /CJKFixture\n");
+    try writer.writeAll("   /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\n");
+    try writer.writeAll("   /W [0 [500]] >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Object 7: ToUnicode CMap — one bfchar per unique codepoint
+    // mapping CID → same Unicode (identity round-trip).
+    var cmap = std.Io.Writer.Allocating.init(allocator);
+    defer cmap.deinit();
+    const mw = &cmap.writer;
+    try mw.writeAll("/CIDInit /ProcSet findresource begin\n");
+    try mw.writeAll("12 dict begin\nbegincmap\n");
+    try mw.writeAll("/CMapType 2 def\n/CMapName /CJKFixtureCMap def\n");
+    try mw.writeAll("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
+
+    // Deduplicate codepoints so the CMap is well-formed (bfchar
+    // forbids duplicate src codes).
+    var seen = std.AutoHashMap(u21, void).init(allocator);
+    defer seen.deinit();
+    var unique_list: std.ArrayList(u21) = .empty;
+    defer unique_list.deinit(allocator);
+    for (codepoints) |cp| {
+        if (seen.contains(cp)) continue;
+        try seen.put(cp, {});
+        try unique_list.append(allocator, cp);
+    }
+    try mw.print("{d} beginbfchar\n", .{unique_list.items.len});
+    for (unique_list.items) |cp| {
+        const w16: u16 = @intCast(cp);
+        try mw.print("<{X:0>4}> <{X:0>4}>\n", .{ w16, w16 });
+    }
+    try mw.writeAll("endbfchar\n");
+    try mw.writeAll("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+
+    const obj7_offset = pdf.written().len;
+    try writer.print("7 0 obj\n<< /Length {} >>\nstream\n", .{cmap.written().len});
+    try writer.writeAll(cmap.written());
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    // XRef table
+    const xref_offset = pdf.written().len;
+    try writer.writeAll("xref\n0 8\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+
+    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return try pdf.toOwnedSlice();
+}
+
+/// Convenience: encode a UTF-8 string as a `[]u21` slice and forward
+/// to `generateCjkCidFontPdf`.  Caller-owned slice is returned.
+pub fn generateCjkPdfFromUtf8(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    wmode: u8,
+) ![]u8 {
+    var cps: std.ArrayList(u21) = .empty;
+    defer cps.deinit(allocator);
+    var iter = (try std.unicode.Utf8View.init(utf8)).iterator();
+    while (iter.nextCodepoint()) |cp| {
+        if (cp > 0xFFFF) return error.NonBmpCodepointInSyntheticFixture;
+        try cps.append(allocator, cp);
+    }
+    return generateCjkCidFontPdf(allocator, cps.items, wmode);
+}
+
+// PR-15 [feat]: synthetic CJK corpus.  Each entry is an
+// {id, lang, wmode, utf8} tuple. The Python harness reads the
+// emitted PDFs from `audit/cjk-pdfs/synthetic/` and compares
+// extraction against the expected `utf8` text.
+pub const CjkFixture = struct {
+    id: []const u8,
+    lang: []const u8, // "ja" | "zh" | "ko"
+    wmode: u8, // 0 = horizontal, 1 = vertical
+    utf8: []const u8,
+};
+
+/// 15 fixtures: 5 ja + 5 zh + 5 ko. Each language has 4 horizontal
+/// + 1 vertical. Strings are deliberately short and use only the
+/// most common BMP CJK code points so the synthetic corpus has zero
+/// copyright concerns.
+pub const cjk_fixtures = [_]CjkFixture{
+    // -------------------------------------------------------------------
+    // Japanese (ja) — hiragana, katakana, common kanji
+    // -------------------------------------------------------------------
+    .{ .id = "ja-h-01", .lang = "ja", .wmode = 0, .utf8 = "あいうえお" },
+    .{ .id = "ja-h-02", .lang = "ja", .wmode = 0, .utf8 = "カタカナ" },
+    .{ .id = "ja-h-03", .lang = "ja", .wmode = 0, .utf8 = "日本語" },
+    .{ .id = "ja-h-04", .lang = "ja", .wmode = 0, .utf8 = "テスト文書" },
+    .{ .id = "ja-v-01", .lang = "ja", .wmode = 1, .utf8 = "縦書き" },
+
+    // -------------------------------------------------------------------
+    // Chinese (zh) — Simplified, common ideographs
+    // -------------------------------------------------------------------
+    .{ .id = "zh-h-01", .lang = "zh", .wmode = 0, .utf8 = "中文" },
+    .{ .id = "zh-h-02", .lang = "zh", .wmode = 0, .utf8 = "你好世界" },
+    .{ .id = "zh-h-03", .lang = "zh", .wmode = 0, .utf8 = "测试文档" },
+    .{ .id = "zh-h-04", .lang = "zh", .wmode = 0, .utf8 = "一二三四五" },
+    .{ .id = "zh-v-01", .lang = "zh", .wmode = 1, .utf8 = "竖排" },
+
+    // -------------------------------------------------------------------
+    // Korean (ko) — hangul syllables + an ideograph
+    // -------------------------------------------------------------------
+    .{ .id = "ko-h-01", .lang = "ko", .wmode = 0, .utf8 = "한글" },
+    .{ .id = "ko-h-02", .lang = "ko", .wmode = 0, .utf8 = "안녕하세요" },
+    .{ .id = "ko-h-03", .lang = "ko", .wmode = 0, .utf8 = "테스트" },
+    .{ .id = "ko-h-04", .lang = "ko", .wmode = 0, .utf8 = "문서" },
+    .{ .id = "ko-v-01", .lang = "ko", .wmode = 1, .utf8 = "세로" },
+};
+
+test "generate CJK Identity-H PDF (Japanese)" {
+    const pdf_data = try generateCjkPdfFromUtf8(std.testing.allocator, "日本語", 0);
+    defer std.testing.allocator.free(pdf_data);
+
+    try std.testing.expect(std.mem.startsWith(u8, pdf_data, "%PDF-1.4"));
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Identity-H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Subtype /Type0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "beginbfchar") != null);
+    // 日 = U+65E5, 本 = U+672C, 語 = U+8A9E
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "65E5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "672C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "8A9E") != null);
+}
+
+test "generate CJK Identity-V PDF (vertical writing flag)" {
+    const pdf_data = try generateCjkPdfFromUtf8(std.testing.allocator, "縦書き", 1);
+    defer std.testing.allocator.free(pdf_data);
+
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Identity-V") != null);
+    // 縦 = U+7E26, 書 = U+66F8, き = U+304D
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "7E26") != null);
+}
+
+test "CJK fixture corpus has 15 entries split 5/5/5" {
+    var ja: usize = 0;
+    var zh: usize = 0;
+    var ko: usize = 0;
+    var vertical: usize = 0;
+    for (cjk_fixtures) |f| {
+        if (std.mem.eql(u8, f.lang, "ja")) ja += 1;
+        if (std.mem.eql(u8, f.lang, "zh")) zh += 1;
+        if (std.mem.eql(u8, f.lang, "ko")) ko += 1;
+        if (f.wmode == 1) vertical += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), ja);
+    try std.testing.expectEqual(@as(usize, 5), zh);
+    try std.testing.expectEqual(@as(usize, 5), ko);
+    try std.testing.expectEqual(@as(usize, 3), vertical); // 1 per language
+    try std.testing.expectEqual(@as(usize, 15), cjk_fixtures.len);
+}

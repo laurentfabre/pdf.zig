@@ -1,0 +1,16 @@
+# Real-world CJK PDF corpus — placeholder.
+#
+# PR-15 ships the synthetic harness only. The 30-PDF (10 ja, 10 zh, 10 ko)
+# real-world corpus is the user's follow-up: PDFs land in this directory.
+#
+# Constraints:
+#   - License-cleared. Public-domain government docs, Creative-Commons
+#     research papers, the user's own PDFs.
+#   - ≥ 1 page each. Mix of horizontal + vertical writing, mixed scripts
+#     within a language (e.g. Japanese with hiragana + kanji).
+#   - Filename pattern: <lang>-<source>-<id>.pdf (e.g.
+#     ja-aozora-bungaku-0001.pdf, zh-gov-cn-2024-0001.pdf).
+#
+# `audit/v1_4_cjk_run.py` automatically picks up everything matching
+# `*.pdf` in `synthetic/` and `real/`, comparing pdf.zig output against
+# pymupdf4llm reference per file.

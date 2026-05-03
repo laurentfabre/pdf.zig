@@ -1947,3 +1947,55 @@ test "extractMarkdown survives BDC with non-name property dict (MCID extraction)
     const md = try doc.extractMarkdown(0, allocator);
     defer allocator.free(md);
 }
+
+// ============================================================================
+// PR-15 [feat]: CJK extraction quality tests.
+// ============================================================================
+
+test "PR-15: synthetic CJK Identity-H round-trips through extractText" {
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateCjkPdfFromUtf8(allocator, "中文", 0);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try doc.extractText(0, &output.writer);
+
+    // Round-trip: the bfchar identity mapping should yield the same UTF-8 bytes.
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "中") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "文") != null);
+
+    // Identity-H is wmode 0 → no vertical-writing flag.
+    try std.testing.expect(!doc.pageHasVerticalWriting(0));
+}
+
+test "PR-15: synthetic CJK Identity-V flags vertical writing" {
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateCjkPdfFromUtf8(allocator, "縦書き", 1);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    // The whole point: pageHasVerticalWriting must return true so the
+    // CLI can emit `vertical_writing_unsupported` for this page.
+    try std.testing.expect(doc.pageHasVerticalWriting(0));
+}
+
+test "PR-15: every fixture in the synthetic CJK corpus parses + opens" {
+    const allocator = std.testing.allocator;
+    for (testpdf.cjk_fixtures) |fixture| {
+        const pdf_data = try testpdf.generateCjkPdfFromUtf8(allocator, fixture.utf8, fixture.wmode);
+        defer allocator.free(pdf_data);
+
+        var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+        defer doc.close();
+
+        try std.testing.expectEqual(@as(usize, 1), doc.pageCount());
+        const expected_vertical = fixture.wmode == 1;
+        try std.testing.expectEqual(expected_vertical, doc.pageHasVerticalWriting(0));
+    }
+}
