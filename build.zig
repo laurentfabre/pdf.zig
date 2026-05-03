@@ -169,6 +169,20 @@ pub fn build(b: *std.Build) void {
 
     const run_encoding_unit_tests = b.addRunArtifact(encoding_unit_tests);
 
+    // PR-16 [feat]: UAX #9 Level-1 bidi resolution + reorder. Pure
+    // module — no dependency on the rest of the parse stack — so it
+    // gets its own test target rather than being pulled in via
+    // root.zig (which would slow incremental rebuilds).
+    const bidi_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bidi.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_bidi_unit_tests = b.addRunArtifact(bidi_unit_tests);
+
     const interpreter_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/interpreter.zig"),
@@ -238,6 +252,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parser_unit_tests.step);
     test_step.dependOn(&run_xref_unit_tests.step);
     test_step.dependOn(&run_encoding_unit_tests.step);
+    test_step.dependOn(&run_bidi_unit_tests.step);
     test_step.dependOn(&run_interpreter_unit_tests.step);
     test_step.dependOn(&run_testpdf_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);

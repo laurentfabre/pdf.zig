@@ -13,6 +13,7 @@
 const std = @import("std");
 const layout = @import("layout.zig");
 const structtree = @import("structtree.zig");
+const bidi = @import("bidi.zig");
 
 pub const TextSpan = layout.TextSpan;
 pub const LayoutResult = layout.LayoutResult;
@@ -39,7 +40,40 @@ pub const MarkdownOptions = struct {
     page_breaks_as_hr: bool = true,
     /// Wrap lines at this column (0 = no wrap)
     wrap_column: usize = 0,
+    /// PR-16 [feat]: apply UAX #9 Level-1 bidi resolution + reorder
+    /// to each rendered line that contains any strong-RTL character.
+    /// Default `true` — Arabic/Hebrew PDFs extract in visual order
+    /// out of the box. Pure-LTR text takes a single `containsRtl`
+    /// scan and a `dupe` per line; the cost is small and consistent
+    /// with the user's expectation that round-tripped text matches
+    /// the original logical order.
+    ///
+    /// Caveat (Codex P2, deferred): the markdown renderer assembles
+    /// each line by sorting spans by `x0` ascending within a row
+    /// (see `spansToElements` below). For real-world RTL PDFs whose
+    /// producer emits one Tj per glyph cluster in visual order, this
+    /// pre-sort already places spans in visual order — running bidi
+    /// over that input double-reorders. The CLI's `extractText` path
+    /// is unaffected because it bidi-processes the content stream
+    /// output line-by-line, not after geometric x-sorting.
+    /// A proper fix needs logical-order span recovery (e.g. honour
+    /// the producer's Tj sequence), which is a Stage-2 task —
+    /// tracked alongside the BidiTest.txt conformance work.
+    apply_bidi: bool = true,
 };
+
+/// Run a single line through the UAX #9 Level-1 reorder if it contains
+/// any RTL character. Returns the input unchanged (allocator-owned
+/// copy) when no RTL is present, so the caller can free uniformly.
+///
+/// Pure function — does not consult layout state. Intended for use at
+/// the markdown render boundary (per-line pass over emitted text).
+pub fn applyBidiToLine(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    if (!bidi.containsRtl(line)) {
+        return allocator.dupe(u8, line);
+    }
+    return bidi.process(allocator, line, null);
+}
 
 /// A processed text element with semantic information
 pub const TextElement = struct {
@@ -365,6 +399,18 @@ pub const MarkdownRenderer = struct {
         return elements.toOwnedSlice(self.allocator);
     }
 
+    /// Run a single element's text through `applyBidiToLine` if the
+    /// renderer's `apply_bidi` option is on. Returns an allocator-owned
+    /// slice; for elements with empty text (e.g., line breaks,
+    /// horizontal rules) returns an empty slice to keep the caller's
+    /// free path uniform.
+    fn maybeBidi(self: *MarkdownRenderer, text: []const u8) ![]u8 {
+        if (!self.options.apply_bidi or text.len == 0) {
+            return self.allocator.dupe(u8, text);
+        }
+        return applyBidiToLine(self.allocator, text);
+    }
+
     /// Render elements to Markdown text
     fn renderElements(self: *MarkdownRenderer, elements: []const TextElement) ![]u8 {
         var output: std.ArrayList(u8) = .empty;
@@ -373,6 +419,14 @@ pub const MarkdownRenderer = struct {
         var prev_kind: ?TextElement.Kind = null;
 
         for (elements) |elem| {
+            // PR-16 [feat]: per-element bidi reorder. Each `elem.text`
+            // already represents one logical line (paragraph fragment,
+            // list item, heading, etc.) — applying the algorithm at
+            // this granularity keeps RTL runs aligned to a single
+            // semantic unit, which is exactly the boundary UAX #9
+            // expects.
+            const display_text = try self.maybeBidi(elem.text);
+            defer self.allocator.free(display_text);
             // Add spacing between different element types
             if (prev_kind) |pk| {
                 const needs_blank = switch (elem.kind) {
@@ -391,36 +445,36 @@ pub const MarkdownRenderer = struct {
             switch (elem.kind) {
                 .heading1 => {
                     try output.appendSlice(self.allocator,"# ");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'\n');
                 },
                 .heading2 => {
                     try output.appendSlice(self.allocator,"## ");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'\n');
                 },
                 .heading3 => {
                     try output.appendSlice(self.allocator,"### ");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'\n');
                 },
                 .heading4 => {
                     try output.appendSlice(self.allocator,"#### ");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'\n');
                 },
                 .heading5 => {
                     try output.appendSlice(self.allocator,"##### ");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'\n');
                 },
                 .heading6 => {
                     try output.appendSlice(self.allocator,"###### ");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'\n');
                 },
                 .paragraph => {
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'\n');
                 },
                 .list_item_bullet => {
@@ -431,7 +485,7 @@ pub const MarkdownRenderer = struct {
                     }
                     try output.appendSlice(self.allocator,"- ");
                     // Strip bullet character from text
-                    const text = self.stripBullet(elem.text);
+                    const text = self.stripBullet(display_text);
                     try output.appendSlice(self.allocator,text);
                     try output.append(self.allocator,'\n');
                 },
@@ -441,29 +495,29 @@ pub const MarkdownRenderer = struct {
                         try output.appendSlice(self.allocator,"  ");
                     }
                     // Keep original numbering or normalize
-                    const text = self.stripNumberPrefix(elem.text);
+                    const text = self.stripNumberPrefix(display_text);
                     try output.appendSlice(self.allocator,"1. ");
                     try output.appendSlice(self.allocator,text);
                     try output.append(self.allocator,'\n');
                 },
                 .table_row => {
                     try output.appendSlice(self.allocator,"| ");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.appendSlice(self.allocator," |\n");
                 },
                 .code_block => {
                     try output.appendSlice(self.allocator,"```\n");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.appendSlice(self.allocator,"\n```\n");
                 },
                 .code_inline => {
                     try output.append(self.allocator,'`');
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'`');
                 },
                 .blockquote => {
                     try output.appendSlice(self.allocator,"> ");
-                    try output.appendSlice(self.allocator,elem.text);
+                    try output.appendSlice(self.allocator,display_text);
                     try output.append(self.allocator,'\n');
                 },
                 .horizontal_rule => {
@@ -730,4 +784,25 @@ test "bullet patterns" {
     try std.testing.expect(renderer.isBulletText("- Item"));
     try std.testing.expect(renderer.isBulletText("* Item"));
     try std.testing.expect(!renderer.isBulletText("1. Item"));
+}
+
+test "applyBidiToLine: no RTL is byte-identical copy" {
+    const allocator = std.testing.allocator;
+    const out = try applyBidiToLine(allocator, "Hello, world!");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("Hello, world!", out);
+}
+
+test "applyBidiToLine: Hebrew word reordered" {
+    const allocator = std.testing.allocator;
+    const out = try applyBidiToLine(allocator, "\u{05E9}\u{05DC}\u{05D5}\u{05DD}");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("\u{05DD}\u{05D5}\u{05DC}\u{05E9}", out);
+}
+
+test "applyBidiToLine: empty input" {
+    const allocator = std.testing.allocator;
+    const out = try applyBidiToLine(allocator, "");
+    defer allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
 }

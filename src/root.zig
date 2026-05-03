@@ -30,6 +30,7 @@ pub const pdf_document = @import("pdf_document.zig");
 pub const markdown_to_pdf = @import("markdown_to_pdf.zig");
 pub const structtree = @import("structtree.zig");
 pub const markdown = @import("markdown.zig");
+pub const bidi = @import("bidi.zig");
 pub const outline = @import("outline.zig");
 pub const tables = @import("tables.zig");
 pub const lattice = @import("lattice.zig");
@@ -557,7 +558,23 @@ pub const Document = struct {
             .page_num = page_num,
             .depth = 0,
         };
-        try extractTextFromContentFull(content, page.resources, &ctx, writer);
+        // PR-16 [feat]: extract into a per-page in-memory buffer first,
+        // then run UAX #9 Level-1 reorder on each line, then flush to
+        // the caller's writer. The bidi pass is a no-op (cheap
+        // `containsRtl` pre-pass + dupe) on pure-LTR content, so
+        // Latin/CJK pages pay only one extra allocation worth of
+        // overhead. RTL content (Arabic/Hebrew) reaches the caller in
+        // visual order — see PR body and the spec test cases in
+        // `bidi.zig`.
+        //
+        // Both the buffer and the reordered output are allocated from
+        // the scratch arena, so cleanup is handled by `scratch_arena`'s
+        // `defer deinit()` above.
+        var page_buf = std.Io.Writer.Allocating.init(scratch_allocator);
+        try extractTextFromContentFull(content, page.resources, &ctx, &page_buf.writer);
+
+        const reordered = try bidi.processLines(scratch_allocator, page_buf.written());
+        try writer.writeAll(reordered);
     }
 
     /// Extract text from all pages
