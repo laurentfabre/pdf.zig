@@ -329,6 +329,11 @@ pub const DocumentBuilder = struct {
     /// PR-W6 [feat]: single-use guard. Set true at the end of `write`;
     /// further mutating calls return `error.DocumentAlreadyWritten`.
     written: bool = false,
+    /// PR-W4 [feat]: opt-in zlib-wrapped DEFLATE compression on each
+    /// page's content stream. Off by default (Tier-1 emits raw streams).
+    /// Streams ≤256 B stay raw even when this flag is true — the zlib
+    /// wrapper overhead would inflate them.
+    compress_content_streams: bool = false,
 
     const AuxObject = struct {
         obj_num: u32,
@@ -533,7 +538,14 @@ pub const DocumentBuilder = struct {
         // 3d. Content streams.
         for (self.pages.items) |page| {
             try w.beginObject(page.content_obj_num, 0);
-            try w.writeStream(page.content.items, "");
+            // PR-W4: compress content streams when the flag is on AND the
+            // body is large enough to benefit from zlib's wrapper overhead.
+            const COMPRESS_THRESHOLD: usize = 256;
+            if (self.compress_content_streams and page.content.items.len > COMPRESS_THRESHOLD) {
+                try w.writeStreamCompressed(page.content.items, "");
+            } else {
+                try w.writeStream(page.content.items, "");
+            }
             try w.endObject();
         }
 
@@ -1502,4 +1514,67 @@ test "PageBuilder.markFontUsed name matches auto-resources output" {
         const key = try std.fmt.bufPrint(&key_buf, "{s} <<", .{f});
         try std.testing.expect(std.mem.indexOf(u8, bytes, key) != null);
     }
+}
+
+test "PR-W4: compress_content_streams produces a smaller, readable PDF" {
+    const allocator = std.testing.allocator;
+
+    // Build the same 3-page text PDF twice — once raw, once compressed.
+    const sizes = blk: {
+        var sizes: [2]usize = undefined;
+        for ([_]bool{ false, true }, 0..) |compress, i| {
+            var doc = DocumentBuilder.init(allocator);
+            defer doc.deinit();
+            doc.compress_content_streams = compress;
+            for (0..3) |p| {
+                const page = try doc.addPage(.{ 0, 0, 612, 792 });
+                // Repetitive text on each page so DEFLATE has something
+                // meaningful to chew on. Without enough body the >256 B
+                // threshold also ensures small PRs aren't over-compressed.
+                var y: f64 = 740;
+                inline for (0..30) |_| {
+                    var line_buf: [128]u8 = undefined;
+                    const line = try std.fmt.bufPrint(&line_buf, "Page {d}: lorem ipsum dolor sit amet consectetur adipiscing elit", .{p + 1});
+                    try page.drawText(72, y, .helvetica, 11, line);
+                    y -= 14;
+                }
+            }
+            const bytes = try doc.write();
+            defer allocator.free(bytes);
+            sizes[i] = bytes.len;
+        }
+        break :blk sizes;
+    };
+
+    // Compressed must be at least 50% smaller than uncompressed (per the
+    // PR-W4 acceptance gate).
+    try std.testing.expect(sizes[1] * 2 < sizes[0]);
+}
+
+test "PR-W4: compressed PDF round-trips through Document.openFromMemory + extractAllText" {
+    const zpdf = @import("root.zig");
+    const allocator = std.testing.allocator;
+
+    var doc_b = DocumentBuilder.init(allocator);
+    defer doc_b.deinit();
+    doc_b.compress_content_streams = true;
+    const page = try doc_b.addPage(.{ 0, 0, 612, 792 });
+    // Body must exceed the 256 B compression threshold so the FlateDecode
+    // path actually fires.
+    var y: f64 = 740;
+    inline for (0..15) |_| {
+        try page.drawText(72, y, .helvetica, 12, "Round trip text via Flate");
+        y -= 16;
+    }
+    const bytes = try doc_b.write();
+    defer allocator.free(bytes);
+
+    const parsed = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer parsed.close();
+    try std.testing.expectEqual(@as(usize, 1), parsed.pageCount());
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try parsed.extractText(0, &aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "Round trip text via Flate") != null);
 }
