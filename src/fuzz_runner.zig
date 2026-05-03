@@ -762,10 +762,10 @@ pub fn main(init: std.process.Init) !void {
     const aggressive_enabled = if (env_aggressive) |s| !std.mem.eql(u8, s, "0") else false;
 
     const env_seed = init.environ_map.get("PDFZIG_FUZZ_SEED");
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.REALTIME, &ts);
-    const wall_seed: u64 = @intCast(@as(i64, @intCast(ts.sec)) * 1000 +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms));
+    const wall_seed: u64 = blk: {
+        const now = std.Io.Timestamp.now(init.io, .real);
+        break :blk @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
+    };
     const base_seed: u64 = if (env_seed) |s|
         std.fmt.parseInt(u64, s, 0) catch wall_seed
     else

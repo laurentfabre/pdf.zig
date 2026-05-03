@@ -17,10 +17,10 @@ pub const Bytes = [16]u8;
 pub const String = [36]u8;
 
 pub fn v7Bytes(io: std.Io) Bytes {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.REALTIME, &ts);
-    const ts_ms: u64 = @intCast(@as(i64, @intCast(ts.sec)) * 1000 +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms));
+    // 0.16 removed `std.time.milliTimestamp`; the cross-platform replacement
+    // requires an `Io`. We have one (caller provides), so use it directly.
+    const now = std.Io.Timestamp.now(io, .real);
+    const ts_ms: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
     var bytes: Bytes = undefined;
 
     std.mem.writeInt(u64, bytes[0..8], ts_ms << 16, .big);

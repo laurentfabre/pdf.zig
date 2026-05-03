@@ -164,7 +164,7 @@ pub const Document = struct {
             // Windows: read file into allocated memory (no mmap support)
             const data = try allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), size);
             errdefer allocator.free(data);
-            const bytes_read = try file.readAll(io, data);
+            const bytes_read = try file.readPositionalAll(io, data, 0);
             if (bytes_read != size) {
                 return error.UnexpectedEof;
             }
