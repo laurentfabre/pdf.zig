@@ -13,6 +13,7 @@
 const std = @import("std");
 const layout = @import("layout.zig");
 const structtree = @import("structtree.zig");
+const bidi = @import("bidi.zig");
 
 pub const TextSpan = layout.TextSpan;
 pub const LayoutResult = layout.LayoutResult;
@@ -39,7 +40,25 @@ pub const MarkdownOptions = struct {
     page_breaks_as_hr: bool = true,
     /// Wrap lines at this column (0 = no wrap)
     wrap_column: usize = 0,
+    /// PR-16 [feat] (Stage 1, opt-in): apply UAX #9 Level-1 bidi
+    /// resolution + reorder to each rendered line that contains any
+    /// strong-RTL character. Off by default while the wire-in shape
+    /// is reviewed (see PR-16 # QUESTIONS section).
+    apply_bidi: bool = false,
 };
+
+/// Run a single line through the UAX #9 Level-1 reorder if it contains
+/// any RTL character. Returns the input unchanged (allocator-owned
+/// copy) when no RTL is present, so the caller can free uniformly.
+///
+/// Pure function — does not consult layout state. Intended for use at
+/// the markdown render boundary (per-line pass over emitted text).
+pub fn applyBidiToLine(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    if (!bidi.containsRtl(line)) {
+        return allocator.dupe(u8, line);
+    }
+    return bidi.process(allocator, line, null);
+}
 
 /// A processed text element with semantic information
 pub const TextElement = struct {
@@ -730,4 +749,25 @@ test "bullet patterns" {
     try std.testing.expect(renderer.isBulletText("- Item"));
     try std.testing.expect(renderer.isBulletText("* Item"));
     try std.testing.expect(!renderer.isBulletText("1. Item"));
+}
+
+test "applyBidiToLine: no RTL is byte-identical copy" {
+    const allocator = std.testing.allocator;
+    const out = try applyBidiToLine(allocator, "Hello, world!");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("Hello, world!", out);
+}
+
+test "applyBidiToLine: Hebrew word reordered" {
+    const allocator = std.testing.allocator;
+    const out = try applyBidiToLine(allocator, "\u{05E9}\u{05DC}\u{05D5}\u{05DD}");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("\u{05DD}\u{05D5}\u{05DC}\u{05E9}", out);
+}
+
+test "applyBidiToLine: empty input" {
+    const allocator = std.testing.allocator;
+    const out = try applyBidiToLine(allocator, "");
+    defer allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
 }
