@@ -2414,6 +2414,208 @@ pub fn generateLatticeWithTextPdf(allocator: std.mem.Allocator) ![]u8 {
     return try pdf.toOwnedSlice();
 }
 
+
+/// PR-16 [feat]: synthesize a single-page PDF whose content stream
+/// emits one Tj op containing the given UTF-8 string in *logical*
+/// order, encoded under an Identity-H CMap with a ToUnicode mapping
+/// from CID -> original code point.
+///
+/// The CID for each input scalar is just its code-point value
+/// (truncated to u16). That is illegal for general PDF (CIDs <= U+FFFF)
+/// but fine for the BMP characters our bidi fixtures use (Hebrew
+/// 05xx, Arabic 06xx, ASCII).
+///
+/// Used by the bidi integration tests (Hebrew, Arabic, mixed) - the
+/// extraction pipeline should round-trip these strings into UTF-8 in
+/// visual order via the bidi pass wired into extractText.
+///
+/// `text` is UTF-8; surrogates and non-BMP code points are not
+/// supported (the synthesizer asserts).
+pub fn generateBidiPdf(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var cids: std.ArrayList(u16) = .empty;
+    defer cids.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        const seq_len = try std.unicode.utf8ByteSequenceLength(text[i]);
+        if (i + seq_len > text.len) return error.InvalidUtf8;
+        const cp = try std.unicode.utf8Decode(text[i .. i + seq_len]);
+        if (cp > 0xFFFF) return error.NonBmpCodePoint;
+        try cids.append(allocator, @intCast(cp));
+        i += seq_len;
+    }
+
+    var pdf = std.Io.Writer.Allocating.init(allocator);
+    errdefer pdf.deinit();
+    const writer = &pdf.writer;
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.written().len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.written().len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.written().len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    var content_buf: std.Io.Writer.Allocating = std.Io.Writer.Allocating.init(allocator);
+    defer content_buf.deinit();
+    const cw = &content_buf.writer;
+    try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n<");
+    for (cids.items) |cid| {
+        try cw.print("{X:0>4}", .{cid});
+    }
+    try cw.writeAll("> Tj\nET\n");
+
+    const obj4_offset = pdf.written().len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content_buf.written().len});
+    try writer.writeAll(content_buf.written());
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.written().len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.writeAll("<< /Type /Font /Subtype /Type0 /BaseFont /BidiCID\n");
+    try writer.writeAll("   /Encoding /Identity-H\n");
+    try writer.writeAll("   /DescendantFonts [6 0 R]\n");
+    try writer.writeAll("   /ToUnicode 7 0 R >>\nendobj\n");
+
+    const obj6_offset = pdf.written().len;
+    try writer.writeAll("6 0 obj\n");
+    try writer.writeAll("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /BidiCID\n");
+    try writer.writeAll("   /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\n");
+    try writer.writeAll("   /W [0 [500]] >>\nendobj\n");
+
+    var cmap_buf: std.Io.Writer.Allocating = std.Io.Writer.Allocating.init(allocator);
+    defer cmap_buf.deinit();
+    const mw = &cmap_buf.writer;
+    try mw.writeAll(
+        \\/CIDInit /ProcSet findresource begin
+        \\12 dict begin
+        \\begincmap
+        \\/CMapType 2 def
+        \\/CMapName /BidiCMap def
+        \\1 begincodespacerange
+        \\<0000> <FFFF>
+        \\endcodespacerange
+        \\
+    );
+    var idx: usize = 0;
+    while (idx < cids.items.len) {
+        const chunk_end = @min(cids.items.len, idx + 100);
+        const chunk = cids.items[idx..chunk_end];
+        try mw.print("{d} beginbfchar\n", .{chunk.len});
+        for (chunk) |cid| {
+            try mw.print("<{X:0>4}> <{X:0>4}>\n", .{ cid, cid });
+        }
+        try mw.writeAll("endbfchar\n");
+        idx = chunk_end;
+    }
+    try mw.writeAll(
+        \\endcmap
+        \\CMapName currentdict /CMap defineresource pop
+        \\end
+        \\end
+    );
+
+    const obj7_offset = pdf.written().len;
+    try writer.print("7 0 obj\n<< /Length {} >>\nstream\n", .{cmap_buf.written().len});
+    try writer.writeAll(cmap_buf.written());
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const xref_offset = pdf.written().len;
+    try writer.writeAll("xref\n0 8\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice();
+}
+
+// PR-16 fixture provenance: the expected_visual strings below are
+// computed from UAX #9 §L2 by hand, not captured from a pymupdf4llm
+// reference. The PR description says the acceptance gate is
+// "character-for-character with pymupdf4llm" — this is enforced
+// out-of-band by the project bake-off (`docs/alfred-bakeoff-report.md`)
+// rather than in CI, because vendoring a pinned pymupdf4llm reference
+// would mean adding a Python dependency to the Zig test runner.
+// Codex P1 noted this gap. Tracking issue: see PR #49 comments.
+test "generateBidiPdf: Hebrew round-trips through extractText in visual order" {
+    const allocator = std.testing.allocator;
+    const root = @import("root.zig");
+
+    const logical = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}";
+    const expected_visual = "\u{05DD}\u{05D5}\u{05DC}\u{05E9}";
+
+    const pdf_bytes = try generateBidiPdf(allocator, logical);
+    defer allocator.free(pdf_bytes);
+
+    const extracted = try root.extractTextFromMemory(allocator, pdf_bytes);
+    defer allocator.free(extracted);
+
+    const trimmed = std.mem.trim(u8, extracted, " \t\r\n");
+    try std.testing.expectEqualStrings(expected_visual, trimmed);
+}
+
+test "generateBidiPdf: Arabic round-trips through extractText in visual order" {
+    const allocator = std.testing.allocator;
+    const root = @import("root.zig");
+
+    const logical = "\u{0633}\u{0644}\u{0627}\u{0645}";
+    const expected_visual = "\u{0645}\u{0627}\u{0644}\u{0633}";
+
+    const pdf_bytes = try generateBidiPdf(allocator, logical);
+    defer allocator.free(pdf_bytes);
+
+    const extracted = try root.extractTextFromMemory(allocator, pdf_bytes);
+    defer allocator.free(extracted);
+
+    const trimmed = std.mem.trim(u8, extracted, " \t\r\n");
+    try std.testing.expectEqualStrings(expected_visual, trimmed);
+}
+
+test "generateBidiPdf: pure-LTR ASCII is unchanged by the bidi pass" {
+    const allocator = std.testing.allocator;
+    const root = @import("root.zig");
+
+    const logical = "Hello";
+    const pdf_bytes = try generateBidiPdf(allocator, logical);
+    defer allocator.free(pdf_bytes);
+
+    const extracted = try root.extractTextFromMemory(allocator, pdf_bytes);
+    defer allocator.free(extracted);
+
+    const trimmed = std.mem.trim(u8, extracted, " \t\r\n");
+    try std.testing.expectEqualStrings(logical, trimmed);
+}
+
+test "generateBidiPdf: Hebrew round-trips through extractMarkdown in visual order" {
+    const allocator = std.testing.allocator;
+    const root = @import("root.zig");
+
+    const logical = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}";
+    const expected_visual = "\u{05DD}\u{05D5}\u{05DC}\u{05E9}";
+
+    const pdf_bytes = try generateBidiPdf(allocator, logical);
+    defer allocator.free(pdf_bytes);
+
+    var doc = try root.Document.openFromMemory(allocator, pdf_bytes, root.ErrorConfig.default());
+    defer doc.close();
+
+    const md = try doc.extractMarkdown(0, allocator);
+    defer allocator.free(md);
+
+    try std.testing.expect(std.mem.indexOf(u8, md, expected_visual) != null);
+}
 // ============================================================================
 // PR-15 [feat]: CJK synthetic fixtures (Identity-H + Identity-V).
 //
