@@ -249,6 +249,46 @@ pub const Writer = struct {
         try self.buf.writer.writeAll("\nendstream");
     }
 
+    /// PR-W4 [feat]: emit a zlib-wrapped DEFLATE-compressed stream object.
+    /// `body` is run through `std.compress.flate.Compress` (level_6) with
+    /// `container: .zlib` (the exact wire format PDF /FlateDecode expects);
+    /// `" /Filter /FlateDecode"` is prepended to `extra_dict` automatically.
+    /// Reader-side decompression is already supported by `decompress.zig`.
+    /// Caller is responsible for the >256 B threshold check — small streams
+    /// pay the zlib wrapper overhead and end up larger than uncompressed.
+    pub fn writeStreamCompressed(
+        self: *Writer,
+        body: []const u8,
+        extra_dict: []const u8,
+    ) Error!void {
+        if (!self.in_object) return error.UnbalancedObject;
+
+        // Allocate a 64 KiB sliding-window buffer + an output collector. The
+        // stdlib encoder asserts buffer.len >= flate.max_window_len.
+        const work_buf = try self.allocator.alloc(u8, std.compress.flate.max_window_len);
+        defer self.allocator.free(work_buf);
+
+        var compressed = try std.Io.Writer.Allocating.initCapacity(self.allocator, body.len);
+        defer compressed.deinit();
+
+        var compressor = try std.compress.flate.Compress.init(
+            &compressed.writer,
+            work_buf,
+            .zlib,
+            .level_6,
+        );
+        try compressor.writer.writeAll(body);
+        try compressor.finish();
+
+        // Compose the per-stream extra-dict: leading filter + caller's bytes.
+        var combined: std.ArrayList(u8) = .empty;
+        defer combined.deinit(self.allocator);
+        try combined.appendSlice(self.allocator, " /Filter /FlateDecode");
+        try combined.appendSlice(self.allocator, extra_dict);
+
+        try self.writeStream(compressed.written(), combined.items);
+    }
+
     /// Emit the xref table. Returns the byte offset of the `xref` keyword
     /// (caller passes this to `writeTrailer`'s `startxref`).
     pub fn writeXref(self: *Writer) Error!u64 {
@@ -594,6 +634,69 @@ test "FailingAllocator stress on round-trip flow (no leaks)" {
             try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
         }
     }
+}
+
+test "PR-W4: writeStreamCompressed round-trips through std flate Decompress" {
+    const allocator = std.testing.allocator;
+    var w = Writer.init(allocator);
+    defer w.deinit();
+
+    try w.writeHeader();
+    const obj = try w.allocObjectNum();
+    try w.beginObject(obj, 0);
+    // Use a body that has good redundancy so DEFLATE has something to chew.
+    const body = "BT /F1 12 Tf 100 700 Td (lorem ipsum lorem ipsum lorem ipsum lorem ipsum lorem ipsum) Tj ET\n" ** 8;
+    try w.writeStreamCompressed(body, "");
+    try w.endObject();
+
+    const bytes = try w.finalize();
+    defer allocator.free(bytes);
+
+    // The PDF must contain the /Filter we promised.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Filter /FlateDecode") != null);
+
+    // Find the stream body and round-trip it through stdlib's Decompress.
+    const stream_marker = "stream\n";
+    const start = std.mem.indexOf(u8, bytes, stream_marker).? + stream_marker.len;
+    const end = std.mem.indexOf(u8, bytes, "\nendstream").?;
+    const compressed_body = bytes[start..end];
+
+    var fb = std.Io.Reader.fixed(compressed_body);
+    var dec_buf: [65536]u8 = undefined;
+    var dec = std.compress.flate.Decompress.init(&fb, .zlib, &dec_buf);
+
+    var dec_out = std.Io.Writer.Allocating.init(allocator);
+    defer dec_out.deinit();
+    var read_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try dec.reader.readSliceShort(&read_buf);
+        if (n == 0) break;
+        try dec_out.writer.writeAll(read_buf[0..n]);
+    }
+    try std.testing.expectEqualStrings(body, dec_out.written());
+}
+
+test "PR-W4: writeStreamCompressed shrinks repetitive bodies" {
+    const allocator = std.testing.allocator;
+    var w = Writer.init(allocator);
+    defer w.deinit();
+
+    try w.writeHeader();
+    const obj = try w.allocObjectNum();
+    try w.beginObject(obj, 0);
+    // 800 bytes of highly redundant text — DEFLATE should easily get >50% off.
+    const body = "lorem ipsum dolor sit amet " ** 30;
+    try w.writeStreamCompressed(body, "");
+    try w.endObject();
+
+    const bytes = try w.finalize();
+    defer allocator.free(bytes);
+
+    const stream_marker = "stream\n";
+    const start = std.mem.indexOf(u8, bytes, stream_marker).? + stream_marker.len;
+    const end = std.mem.indexOf(u8, bytes, "\nendstream").?;
+    const compressed_len = end - start;
+    try std.testing.expect(compressed_len * 2 < body.len);
 }
 
 fn roundTripSmoke(w: *Writer) Writer.Error!void {
