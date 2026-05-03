@@ -422,7 +422,7 @@ updated: 2026-04-27
   > **Test strategy.** 14 unit tests (one per BuiltinFont) + round-trip integration test.
   > **Codex gate.** WinAnsi encoding completeness vs the standard; backslash-escape edge cases; empty-text drawText is a no-op (not malformed BT/ET).
 
-- [ ] **PR-W4 · feat: FlateDecode content-stream compression**
+- [x] **PR-W4 · feat: FlateDecode content-stream compression** _(shipped via #47)_
   > [!info] Unblocked by the 0.16 toolchain bump
   > 0.15.2's `std.compress.flate.Compress` was non-functional (`Compress.drain` panicked, `Simple.finish` had a compile error in `hasher.container()`). 0.16.0 ships a working deflate encoder with `container: .zlib` — exactly what PDF `/FlateDecode` expects. This PR wires it into `pdf_writer.Writer.writeStreamCompressed` and adds a `compress_content_streams: bool` flag on `DocumentBuilder`.
   > **Files-touched envelope.** `src/pdf_writer.zig`, `src/pdf_document.zig`, `src/integration_test.zig`.
