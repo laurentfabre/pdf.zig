@@ -1,16 +1,22 @@
-# Real-world CJK PDF corpus — placeholder.
+# Real-world CJK PDF corpus.
 #
-# PR-15 ships the synthetic harness only. The 30-PDF (10 ja, 10 zh, 10 ko)
-# real-world corpus is the user's follow-up: PDFs land in this directory.
+# 30-item manifest (10 ja + 10 zh + 10 ko) lives at
+# `audit/cjk-pdfs/real-corpus-manifest.json`. Every entry is sourced from
+# Internet Archive and tagged with a PD-Mark / CC0 / pre-1929 license.
 #
-# Constraints:
-#   - License-cleared. Public-domain government docs, Creative-Commons
-#     research papers, the user's own PDFs.
-#   - ≥ 1 page each. Mix of horizontal + vertical writing, mixed scripts
-#     within a language (e.g. Japanese with hiragana + kanji).
-#   - Filename pattern: <lang>-<source>-<id>.pdf (e.g.
-#     ja-aozora-bungaku-0001.pdf, zh-gov-cn-2024-0001.pdf).
+# Fetch on demand (PDFs are gitignored — they would balloon the repo):
+#   python3 audit/fetch_real_corpus.py            # all 30, ~500 MB
+#   python3 audit/fetch_real_corpus.py --lang ja  # one language
+#   python3 audit/fetch_real_corpus.py --dry-run  # license-check only
+#   python3 audit/fetch_real_corpus.py --max-mb 15
 #
-# `audit/v1_4_cjk_run.py` automatically picks up everything matching
-# `*.pdf` in `synthetic/` and `real/`, comparing pdf.zig output against
-# pymupdf4llm reference per file.
+# The fetcher cross-checks each item's live licenseurl against the manifest
+# before downloading; any mismatch aborts that item rather than silently
+# pulling potentially-restricted content.
+#
+# Filename convention `<lang>-<source>-<id>.pdf` is enforced by the manifest.
+# `audit/v1_4_cjk_run.py` automatically picks up everything matching `*.pdf`
+# in this directory and compares pdf.zig output against pymupdf4llm.
+#
+# Drop your own PDFs here directly if they're not on IA — keep the filename
+# pattern (lang prefix) so the harness groups them correctly.
