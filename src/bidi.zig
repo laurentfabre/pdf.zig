@@ -191,13 +191,24 @@ pub fn containsRtl(text: []const u8) bool {
 /// Per-character bidi state — one entry per Unicode scalar of the input
 /// paragraph. `level` is the resolved embedding level; `class` is the
 /// (mutable) bidi class as it is rewritten by W/N/I rules.
+///
+/// `original_class` preserves the BD1 assignment before any rule
+/// rewrites it. UAX #9 L1 is defined in terms of the original bidi
+/// types (segment separators, paragraph separators, whitespace,
+/// boundary neutrals); the W/N rules can flip a tab from `S` into `L`
+/// (Codex P1, fixed in this PR) so checking the mutated class would
+/// silently fail to reset levels for those characters.
 const CharState = struct {
     cp: u21,
     /// Original UTF-8 byte offset in the source slice (start of the
-    /// scalar). Used to copy bytes back during reorder.
-    byte_off: u32,
+    /// scalar). Used to copy bytes back during reorder. `usize` so
+    /// pages larger than 4 GiB still extract correctly.
+    byte_off: usize,
     byte_len: u8,
     class: BidiClass,
+    /// BD1 class as assigned by `classify`, preserved across W/N/I
+    /// rewrites for L1's use.
+    original_class: BidiClass,
     level: u8,
 };
 
@@ -207,7 +218,13 @@ const CharState = struct {
 /// `forced` short-circuits this — useful when the caller already knows
 /// the paragraph direction (e.g., from an RTL marker).
 fn resolveParagraphLevel(states: []const CharState, forced: ?u8) u8 {
-    if (forced) |f| return f;
+    if (forced) |f| {
+        // Level-1 implementation: only paragraph levels 0 (LTR) and 1
+        // (RTL) are meaningful. Defensive guard against an out-of-range
+        // override leaking into I1/I2 arithmetic.
+        std.debug.assert(f == 0 or f == 1);
+        return f;
+    }
     for (states) |s| {
         switch (s.class) {
             .L => return 0,
@@ -413,12 +430,18 @@ fn applyI1I2(states: []CharState) void {
 
 /// L1: Trailing whitespace and segment/paragraph separators reset to
 /// the paragraph level.
+///
+/// Uses `original_class` (the BD1 assignment) rather than the W/N/I
+/// mutated class. UAX #9 L1 is defined in terms of original types —
+/// otherwise an `S` (tab) flanked by L/R can be rewritten into `L` by
+/// N1, which would skip the L1 reset and leave the tab at a non-base
+/// level.
 fn applyL1(states: []CharState, paragraph_level: u8) void {
     // Reset trailing whitespace at end of paragraph.
     var i: usize = states.len;
     while (i > 0) {
         i -= 1;
-        switch (states[i].class) {
+        switch (states[i].original_class) {
             .B, .S => {
                 states[i].level = paragraph_level;
             },
@@ -429,13 +452,13 @@ fn applyL1(states: []CharState, paragraph_level: u8) void {
     // Also reset whitespace immediately preceding a B/S.
     i = 0;
     while (i < states.len) : (i += 1) {
-        const c = states[i].class;
-        if (c == .B or c == .S) {
+        const oc = states[i].original_class;
+        if (oc == .B or oc == .S) {
             states[i].level = paragraph_level;
             var j: usize = i;
             while (j > 0) {
                 j -= 1;
-                if (states[j].class != .WS) break;
+                if (states[j].original_class != .WS) break;
                 states[j].level = paragraph_level;
             }
         }
@@ -556,9 +579,10 @@ pub fn process(
             // Invalid UTF-8 leading byte — emit as opaque ON
             try states.append(allocator, .{
                 .cp = text[i],
-                .byte_off = @intCast(i),
+                .byte_off = i,
                 .byte_len = 1,
                 .class = .ON,
+                .original_class = .ON,
                 .level = 0,
             });
             i += 1;
@@ -568,19 +592,22 @@ pub fn process(
         const cp = std.unicode.utf8Decode(text[i .. i + seq_len]) catch {
             try states.append(allocator, .{
                 .cp = text[i],
-                .byte_off = @intCast(i),
+                .byte_off = i,
                 .byte_len = 1,
                 .class = .ON,
+                .original_class = .ON,
                 .level = 0,
             });
             i += 1;
             continue;
         };
+        const cls = classify(cp);
         try states.append(allocator, .{
             .cp = cp,
-            .byte_off = @intCast(i),
+            .byte_off = i,
             .byte_len = @intCast(seq_len),
-            .class = classify(cp),
+            .class = cls,
+            .original_class = cls,
             .level = 0,
         });
         i += seq_len;
@@ -767,23 +794,23 @@ test "process: Arabic with European digits stays LTR within RTL run" {
 
 test "resolveParagraphLevel: first strong wins" {
     const states_ltr = [_]CharState{
-        .{ .cp = ' ', .byte_off = 0, .byte_len = 1, .class = .WS, .level = 0 },
-        .{ .cp = 'A', .byte_off = 1, .byte_len = 1, .class = .L, .level = 0 },
-        .{ .cp = 0x05D0, .byte_off = 2, .byte_len = 2, .class = .R, .level = 0 },
+        .{ .cp = ' ', .byte_off = 0, .byte_len = 1, .class = .WS, .original_class = .WS, .level = 0 },
+        .{ .cp = 'A', .byte_off = 1, .byte_len = 1, .class = .L, .original_class = .L, .level = 0 },
+        .{ .cp = 0x05D0, .byte_off = 2, .byte_len = 2, .class = .R, .original_class = .R, .level = 0 },
     };
     try std.testing.expectEqual(@as(u8, 0), resolveParagraphLevel(&states_ltr, null));
 
     const states_rtl = [_]CharState{
-        .{ .cp = ' ', .byte_off = 0, .byte_len = 1, .class = .WS, .level = 0 },
-        .{ .cp = 0x05D0, .byte_off = 1, .byte_len = 2, .class = .R, .level = 0 },
-        .{ .cp = 'A', .byte_off = 3, .byte_len = 1, .class = .L, .level = 0 },
+        .{ .cp = ' ', .byte_off = 0, .byte_len = 1, .class = .WS, .original_class = .WS, .level = 0 },
+        .{ .cp = 0x05D0, .byte_off = 1, .byte_len = 2, .class = .R, .original_class = .R, .level = 0 },
+        .{ .cp = 'A', .byte_off = 3, .byte_len = 1, .class = .L, .original_class = .L, .level = 0 },
     };
     try std.testing.expectEqual(@as(u8, 1), resolveParagraphLevel(&states_rtl, null));
 
     // No strong → default 0
     const states_none = [_]CharState{
-        .{ .cp = ' ', .byte_off = 0, .byte_len = 1, .class = .WS, .level = 0 },
-        .{ .cp = '5', .byte_off = 1, .byte_len = 1, .class = .EN, .level = 0 },
+        .{ .cp = ' ', .byte_off = 0, .byte_len = 1, .class = .WS, .original_class = .WS, .level = 0 },
+        .{ .cp = '5', .byte_off = 1, .byte_len = 1, .class = .EN, .original_class = .EN, .level = 0 },
     };
     try std.testing.expectEqual(@as(u8, 0), resolveParagraphLevel(&states_none, null));
 
@@ -851,8 +878,8 @@ test "spec W2: EN preceded by AL → AN" {
     // would also implicitly verify W2, but locking the class transition
     // here keeps regressions on the rule itself loud.
     var states = [_]CharState{
-        .{ .cp = 0x0623, .byte_off = 0, .byte_len = 2, .class = .AL, .level = 0 },
-        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .level = 0 },
+        .{ .cp = 0x0623, .byte_off = 0, .byte_len = 2, .class = .AL, .original_class = .AL, .level = 0 },
+        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .original_class = .EN, .level = 0 },
     };
     applyW2(&states, 1);
     try std.testing.expectEqual(BidiClass.AN, states[1].class);
@@ -860,7 +887,7 @@ test "spec W2: EN preceded by AL → AN" {
 
 test "spec W3: AL → R after weak resolution" {
     var states = [_]CharState{
-        .{ .cp = 0x0627, .byte_off = 0, .byte_len = 2, .class = .AL, .level = 1 },
+        .{ .cp = 0x0627, .byte_off = 0, .byte_len = 2, .class = .AL, .original_class = .AL, .level = 1 },
     };
     applyW3(&states);
     try std.testing.expectEqual(BidiClass.R, states[0].class);
@@ -869,9 +896,9 @@ test "spec W3: AL → R after weak resolution" {
 test "spec W4: single CS between two ENs → EN" {
     // "1,2" → CS becomes EN.
     var states = [_]CharState{
-        .{ .cp = '1', .byte_off = 0, .byte_len = 1, .class = .EN, .level = 0 },
-        .{ .cp = ',', .byte_off = 1, .byte_len = 1, .class = .CS, .level = 0 },
-        .{ .cp = '2', .byte_off = 2, .byte_len = 1, .class = .EN, .level = 0 },
+        .{ .cp = '1', .byte_off = 0, .byte_len = 1, .class = .EN, .original_class = .EN, .level = 0 },
+        .{ .cp = ',', .byte_off = 1, .byte_len = 1, .class = .CS, .original_class = .CS, .level = 0 },
+        .{ .cp = '2', .byte_off = 2, .byte_len = 1, .class = .EN, .original_class = .EN, .level = 0 },
     };
     applyW4(&states);
     try std.testing.expectEqual(BidiClass.EN, states[1].class);
@@ -880,8 +907,8 @@ test "spec W4: single CS between two ENs → EN" {
 test "spec W5: ETs adjacent to EN absorbed" {
     // "$ 9" — ET ($) preceding EN should become EN; whitespace stays.
     var states = [_]CharState{
-        .{ .cp = '$', .byte_off = 0, .byte_len = 1, .class = .ET, .level = 0 },
-        .{ .cp = '9', .byte_off = 1, .byte_len = 1, .class = .EN, .level = 0 },
+        .{ .cp = '$', .byte_off = 0, .byte_len = 1, .class = .ET, .original_class = .ET, .level = 0 },
+        .{ .cp = '9', .byte_off = 1, .byte_len = 1, .class = .EN, .original_class = .EN, .level = 0 },
     };
     applyW5(&states);
     try std.testing.expectEqual(BidiClass.EN, states[0].class);
@@ -890,8 +917,8 @@ test "spec W5: ETs adjacent to EN absorbed" {
 test "spec W6: leftover ES/ET/CS → ON" {
     // ET not adjacent to EN should fall through to ON via W6.
     var states = [_]CharState{
-        .{ .cp = '$', .byte_off = 0, .byte_len = 1, .class = .ET, .level = 0 },
-        .{ .cp = 'A', .byte_off = 1, .byte_len = 1, .class = .L, .level = 0 },
+        .{ .cp = '$', .byte_off = 0, .byte_len = 1, .class = .ET, .original_class = .ET, .level = 0 },
+        .{ .cp = 'A', .byte_off = 1, .byte_len = 1, .class = .L, .original_class = .L, .level = 0 },
     };
     applyW5(&states);
     applyW6(&states);
@@ -901,9 +928,9 @@ test "spec W6: leftover ES/ET/CS → ON" {
 test "spec W7: EN preceded by L → L" {
     // "A 5" — EN preceded by L (with WS in between) becomes L.
     var states = [_]CharState{
-        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .level = 0 },
-        .{ .cp = ' ', .byte_off = 1, .byte_len = 1, .class = .WS, .level = 0 },
-        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .level = 0 },
+        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .original_class = .L, .level = 0 },
+        .{ .cp = ' ', .byte_off = 1, .byte_len = 1, .class = .WS, .original_class = .WS, .level = 0 },
+        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .original_class = .EN, .level = 0 },
     };
     applyW7(&states, 0);
     try std.testing.expectEqual(BidiClass.L, states[2].class);
@@ -912,9 +939,9 @@ test "spec W7: EN preceded by L → L" {
 test "spec N1: neutrals between two Rs adopt R" {
     // <05D0> ' ' <05D1> — WS between two Hebrew letters takes R per N1.
     var states = [_]CharState{
-        .{ .cp = 0x05D0, .byte_off = 0, .byte_len = 2, .class = .R, .level = 1 },
-        .{ .cp = ' ', .byte_off = 2, .byte_len = 1, .class = .WS, .level = 1 },
-        .{ .cp = 0x05D1, .byte_off = 3, .byte_len = 2, .class = .R, .level = 1 },
+        .{ .cp = 0x05D0, .byte_off = 0, .byte_len = 2, .class = .R, .original_class = .R, .level = 1 },
+        .{ .cp = ' ', .byte_off = 2, .byte_len = 1, .class = .WS, .original_class = .WS, .level = 1 },
+        .{ .cp = 0x05D1, .byte_off = 3, .byte_len = 2, .class = .R, .original_class = .R, .level = 1 },
     };
     applyN1N2(&states, 1);
     try std.testing.expectEqual(BidiClass.R, states[1].class);
@@ -924,9 +951,9 @@ test "spec N2: bracketing-mismatch neutrals take embedding direction" {
     // L ' ' R — strong types differ, paragraph_level=0 (LTR), so the
     // WS resolves to L per N2.
     var states = [_]CharState{
-        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .level = 0 },
-        .{ .cp = ' ', .byte_off = 1, .byte_len = 1, .class = .WS, .level = 0 },
-        .{ .cp = 0x05D0, .byte_off = 2, .byte_len = 2, .class = .R, .level = 0 },
+        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .original_class = .L, .level = 0 },
+        .{ .cp = ' ', .byte_off = 1, .byte_len = 1, .class = .WS, .original_class = .WS, .level = 0 },
+        .{ .cp = 0x05D0, .byte_off = 2, .byte_len = 2, .class = .R, .original_class = .R, .level = 0 },
     };
     applyN1N2(&states, 0);
     try std.testing.expectEqual(BidiClass.L, states[1].class);
@@ -934,9 +961,9 @@ test "spec N2: bracketing-mismatch neutrals take embedding direction" {
 
 test "spec I1: at even level, R += 1, AN/EN += 2" {
     var states = [_]CharState{
-        .{ .cp = 0x05D0, .byte_off = 0, .byte_len = 2, .class = .R, .level = 0 },
-        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .level = 0 },
-        .{ .cp = '5', .byte_off = 3, .byte_len = 1, .class = .AN, .level = 0 },
+        .{ .cp = 0x05D0, .byte_off = 0, .byte_len = 2, .class = .R, .original_class = .R, .level = 0 },
+        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .original_class = .EN, .level = 0 },
+        .{ .cp = '5', .byte_off = 3, .byte_len = 1, .class = .AN, .original_class = .AN, .level = 0 },
     };
     applyI1I2(&states);
     try std.testing.expectEqual(@as(u8, 1), states[0].level);
@@ -946,9 +973,9 @@ test "spec I1: at even level, R += 1, AN/EN += 2" {
 
 test "spec I2: at odd level, L/EN/AN += 1" {
     var states = [_]CharState{
-        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .level = 1 },
-        .{ .cp = '5', .byte_off = 1, .byte_len = 1, .class = .EN, .level = 1 },
-        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .AN, .level = 1 },
+        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .original_class = .L, .level = 1 },
+        .{ .cp = '5', .byte_off = 1, .byte_len = 1, .class = .EN, .original_class = .EN, .level = 1 },
+        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .AN, .original_class = .AN, .level = 1 },
     };
     applyI1I2(&states);
     try std.testing.expectEqual(@as(u8, 2), states[0].level);
@@ -980,6 +1007,31 @@ test "spec L2: nested-level reversal of mixed RTL+LTR run" {
     const out = try process(allocator, logical, null);
     defer allocator.free(out);
     try std.testing.expectEqualStrings(expected, out);
+}
+
+test "spec L1: segment separator (tab) reset uses original class (Codex P1)" {
+    // RTL paragraph (first strong = Hebrew) with a tab flanked by L
+    // characters on both sides. Without the original-class fix, N1 sees
+    // the tab between two L runs and rewrites it from `S` to `L`; I2
+    // raises it to level 2; L1 looking at the mutated class would skip
+    // the reset, leaving the tab at level 2. With the fix, L1 sees the
+    // unchanged BD1 type `S` and resets it to paragraph level (1).
+    //
+    // This locks in the spec-faithful behaviour even though the visible
+    // glyph order on this particular fixture happens to coincide with
+    // the buggy variant in some renderers — the level on the tab is
+    // what matters for downstream L2 ordering of multi-paragraph text.
+    const allocator = std.testing.allocator;
+    const logical = "\u{05D0}A\tB\u{05D1}";
+    const out = try process(allocator, logical, null);
+    defer allocator.free(out);
+    // Visual: paragraph base is RTL (level 1). The L runs `A` and `B`
+    // get level 2; the tab (S) is reset to level 1 by L1 (paragraph
+    // level). L2 reverses level-≥1 runs: outer level-1 reverses
+    // everything; inner level-2 runs (each single L char) are reversed
+    // pairwise but are length-1 so no internal change. End result:
+    // <05D1> B \t A <05D0>.
+    try std.testing.expectEqualStrings("\u{05D1}B\tA\u{05D0}", out);
 }
 
 test "spec L1: paragraph separator resets" {
