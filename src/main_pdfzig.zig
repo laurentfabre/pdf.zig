@@ -6,20 +6,24 @@
 const std = @import("std");
 const cli = @import("cli_pdfzig.zig");
 
-pub fn main() !u8 {
-    // Production allocator: smp_allocator is fast, low-overhead, and does not
-    // do leak detection. Process exit reclaims everything; chasing upstream
-    // leaks is a separate workstream from the streaming layer's correctness.
-    const allocator = std.heap.smp_allocator;
+pub fn main(init: std.process.Init) !u8 {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+    // argv (skipping argv[0]) — `toSlice` allocates into the auto-cleaning
+    // process arena, so no manual cleanup is needed.
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    const args = if (argv.len > 1) argv[1..] else &[_][:0]const u8{};
 
-    const args = if (argv.len > 1) argv[1..] else &[_][]const u8{};
+    // cli.run expects []const []const u8; convert from [:0]const u8.
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    try args_list.ensureTotalCapacity(allocator, args.len);
+    for (args) |a| args_list.appendAssumeCapacity(a);
 
-    const code = cli.run(allocator, args) catch |err| {
+    const code = cli.run(allocator, io, args_list.items) catch |err| {
         var buf: [256]u8 = undefined;
-        var bw = std.fs.File.stderr().writer(&buf);
+        var bw = std.Io.File.stderr().writer(io, &buf);
         const w = &bw.interface;
         defer w.flush() catch {};
         w.print("pdf.zig: fatal: {s}\n", .{@errorName(err)}) catch {};

@@ -16,12 +16,15 @@ const std = @import("std");
 pub const Bytes = [16]u8;
 pub const String = [36]u8;
 
-pub fn v7Bytes() Bytes {
-    const ts_ms: u64 = @intCast(@max(0, std.time.milliTimestamp()));
+pub fn v7Bytes(io: std.Io) Bytes {
+    // 0.16 removed `std.time.milliTimestamp`; the cross-platform replacement
+    // requires an `Io`. We have one (caller provides), so use it directly.
+    const now = std.Io.Timestamp.now(io, .real);
+    const ts_ms: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
     var bytes: Bytes = undefined;
 
     std.mem.writeInt(u64, bytes[0..8], ts_ms << 16, .big);
-    std.crypto.random.bytes(bytes[6..16]);
+    io.random(bytes[6..16]);
 
     bytes[6] = (bytes[6] & 0x0F) | 0x70;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
@@ -29,8 +32,8 @@ pub fn v7Bytes() Bytes {
     return bytes;
 }
 
-pub fn v7() String {
-    return format(v7Bytes());
+pub fn v7(io: std.Io) String {
+    return format(v7Bytes(io));
 }
 
 pub fn format(bytes: Bytes) String {
@@ -59,8 +62,17 @@ pub fn format(bytes: Bytes) String {
 
 // ---- tests ----
 
+fn testIo() !struct { threaded: std.Io.Threaded, io: std.Io } {
+    var t: std.Io.Threaded = .init(std.testing.allocator, .{});
+    return .{ .threaded = t, .io = t.io() };
+}
+
 test "v7 string format" {
-    const s = v7();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const s = v7(io);
     try std.testing.expectEqual(@as(usize, 36), s.len);
     try std.testing.expectEqual(@as(u8, '-'), s[8]);
     try std.testing.expectEqual(@as(u8, '-'), s[13]);
@@ -77,15 +89,23 @@ test "v7 string format" {
 }
 
 test "v7 bytes version + variant bits" {
-    const b = v7Bytes();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const b = v7Bytes(io);
     try std.testing.expectEqual(@as(u8, 0x70), b[6] & 0xF0);
     try std.testing.expectEqual(@as(u8, 0x80), b[8] & 0xC0);
 }
 
 test "v7 is time-ordered across milliseconds" {
-    const a = v7Bytes();
-    std.Thread.sleep(2 * std.time.ns_per_ms);
-    const c = v7Bytes();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const a = v7Bytes(io);
+    try io.sleep(.{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake);
+    const c = v7Bytes(io);
     // Compare the 48-bit timestamp prefix only.
     const ts_a = std.mem.readInt(u64, a[0..8], .big) >> 16;
     const ts_c = std.mem.readInt(u64, c[0..8], .big) >> 16;
@@ -93,7 +113,11 @@ test "v7 is time-ordered across milliseconds" {
 }
 
 test "v7 strings are unique across calls" {
-    const a = v7();
-    const b = v7();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const a = v7(io);
+    const b = v7(io);
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }

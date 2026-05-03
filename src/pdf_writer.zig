@@ -47,7 +47,7 @@ const std = @import("std");
 
 pub const Writer = struct {
     allocator: std.mem.Allocator,
-    buf: std.ArrayList(u8),
+    buf: std.Io.Writer.Allocating,
     /// One entry per allocated object number. Index N is object N. Index 0
     /// is the always-free entry the xref table requires (per §7.5.4).
     objects: std.ArrayList(ObjectInfo),
@@ -78,19 +78,22 @@ pub const Writer = struct {
         /// PR-W1 codex r1 P3: tier-1 writer is generation-0 only.
         /// Multi-generation support is a Tier-2 follow-up.
         UnsupportedGeneration,
+        /// 0.16 Allocating-writer surfaces this when the underlying
+        /// allocator fails. Treated as OOM at the boundary.
+        WriteFailed,
     };
 
     pub fn init(allocator: std.mem.Allocator) Writer {
         return .{
             .allocator = allocator,
-            .buf = .empty,
+            .buf = std.Io.Writer.Allocating.init(allocator),
             .objects = .empty,
             .in_object = false,
         };
     }
 
     pub fn deinit(self: *Writer) void {
-        self.buf.deinit(self.allocator);
+        self.buf.deinit();
         self.objects.deinit(self.allocator);
     }
 
@@ -121,10 +124,10 @@ pub const Writer = struct {
     /// Emit `%PDF-1.4` + binary marker. Must be called exactly once at
     /// the start; the xref offsets won't be correct otherwise.
     pub fn writeHeader(self: *Writer) Error!void {
-        try self.buf.appendSlice(self.allocator, "%PDF-1.4\n");
+        try self.buf.writer.writeAll("%PDF-1.4\n");
         // Binary marker: 4 high-byte chars per §7.5.2 so file utilities
         // detect this as binary, not text.
-        try self.buf.appendSlice(self.allocator, "%\xE2\xE3\xCF\xD3\n");
+        try self.buf.writer.writeAll("%\xE2\xE3\xCF\xD3\n");
     }
 
     pub fn beginObject(self: *Writer, num: u32, generation: u16) Error!void {
@@ -134,20 +137,20 @@ pub const Writer = struct {
         if (self.in_object) return error.UnbalancedObject;
         if (num == 0 or num >= self.objects.items.len) return error.ObjectNotEmitted;
         if (self.objects.items[num].in_use) return error.ObjectAlreadyEmitted;
-        const offset = self.buf.items.len;
+        const offset = self.buf.written().len;
         self.objects.items[num] = .{
             .offset = offset,
             .generation = generation,
             .in_use = true,
             .allocated = true,
         };
-        try self.buf.writer(self.allocator).print("{d} {d} obj\n", .{ num, generation });
+        try self.buf.writer.print("{d} {d} obj\n", .{ num, generation });
         self.in_object = true;
     }
 
     pub fn endObject(self: *Writer) Error!void {
         if (!self.in_object) return error.UnbalancedObject;
-        try self.buf.appendSlice(self.allocator, "\nendobj\n");
+        try self.buf.writer.writeAll("\nendobj\n");
         self.in_object = false;
     }
 
@@ -155,18 +158,18 @@ pub const Writer = struct {
     //     callers are expected to compose dicts/arrays via writeRaw) ---
 
     pub fn writeRaw(self: *Writer, bytes: []const u8) Error!void {
-        try self.buf.appendSlice(self.allocator, bytes);
+        try self.buf.writer.writeAll(bytes);
     }
 
     /// Emit `/name`, escaping special chars per §7.3.5 (`#XX` hex escape
     /// for any byte outside `[0x21, 0x7e]` or in the delimiter set).
     pub fn writeName(self: *Writer, name: []const u8) Error!void {
-        try self.buf.append(self.allocator, '/');
+        try self.buf.writer.writeByte('/');
         for (name) |b| {
             if (b < 0x21 or b > 0x7e or isDelimiter(b) or b == '#') {
-                try self.buf.writer(self.allocator).print("#{x:0>2}", .{b});
+                try self.buf.writer.print("#{x:0>2}", .{b});
             } else {
-                try self.buf.append(self.allocator, b);
+                try self.buf.writer.writeByte(b);
             }
         }
     }
@@ -174,40 +177,40 @@ pub const Writer = struct {
     /// Emit `(literal-string)`, escaping `(`, `)`, `\`, and non-printable
     /// bytes via `\nnn` octal (§7.3.4.2).
     pub fn writeStringLiteral(self: *Writer, s: []const u8) Error!void {
-        try self.buf.append(self.allocator, '(');
+        try self.buf.writer.writeByte('(');
         for (s) |b| {
             switch (b) {
-                '(' => try self.buf.appendSlice(self.allocator, "\\("),
-                ')' => try self.buf.appendSlice(self.allocator, "\\)"),
-                '\\' => try self.buf.appendSlice(self.allocator, "\\\\"),
-                '\n' => try self.buf.appendSlice(self.allocator, "\\n"),
-                '\r' => try self.buf.appendSlice(self.allocator, "\\r"),
-                '\t' => try self.buf.appendSlice(self.allocator, "\\t"),
-                0x08 => try self.buf.appendSlice(self.allocator, "\\b"),
-                0x0c => try self.buf.appendSlice(self.allocator, "\\f"),
+                '(' => try self.buf.writer.writeAll("\\("),
+                ')' => try self.buf.writer.writeAll("\\)"),
+                '\\' => try self.buf.writer.writeAll("\\\\"),
+                '\n' => try self.buf.writer.writeAll("\\n"),
+                '\r' => try self.buf.writer.writeAll("\\r"),
+                '\t' => try self.buf.writer.writeAll("\\t"),
+                0x08 => try self.buf.writer.writeAll("\\b"),
+                0x0c => try self.buf.writer.writeAll("\\f"),
                 else => {
                     if (b < 0x20 or b == 0x7f) {
-                        try self.buf.writer(self.allocator).print("\\{o:0>3}", .{b});
+                        try self.buf.writer.print("\\{o:0>3}", .{b});
                     } else {
-                        try self.buf.append(self.allocator, b);
+                        try self.buf.writer.writeByte(b);
                     }
                 },
             }
         }
-        try self.buf.append(self.allocator, ')');
+        try self.buf.writer.writeByte(')');
     }
 
     /// Emit `<deadbeef>` lowercase hex string (§7.3.4.3).
     pub fn writeStringHex(self: *Writer, bytes: []const u8) Error!void {
-        try self.buf.append(self.allocator, '<');
+        try self.buf.writer.writeByte('<');
         for (bytes) |b| {
-            try self.buf.writer(self.allocator).print("{x:0>2}", .{b});
+            try self.buf.writer.print("{x:0>2}", .{b});
         }
-        try self.buf.append(self.allocator, '>');
+        try self.buf.writer.writeByte('>');
     }
 
     pub fn writeInt(self: *Writer, n: i64) Error!void {
-        try self.buf.writer(self.allocator).print("{d}", .{n});
+        try self.buf.writer.print("{d}", .{n});
     }
 
     /// Emit a real number per §7.3.3 (no exponent form). Rejects NaN/inf
@@ -221,12 +224,12 @@ pub const Writer = struct {
         var buf: [64]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{d:.6}", .{n}) catch return error.InvalidReal;
         const trimmed = stripTrailingZeros(s);
-        try self.buf.appendSlice(self.allocator, trimmed);
+        try self.buf.writer.writeAll(trimmed);
     }
 
     /// Emit `N G R` (indirect reference, §7.3.10).
     pub fn writeRef(self: *Writer, num: u32, generation: u16) Error!void {
-        try self.buf.writer(self.allocator).print("{d} {d} R", .{ num, generation });
+        try self.buf.writer.print("{d} {d} R", .{ num, generation });
     }
 
     /// Emit a stream object: `<< /Length N >>\nstream\n<body>\nendstream\n`.
@@ -238,12 +241,12 @@ pub const Writer = struct {
         extra_dict: []const u8,
     ) Error!void {
         if (!self.in_object) return error.UnbalancedObject;
-        try self.buf.writer(self.allocator).print(
+        try self.buf.writer.print(
             "<< /Length {d}{s} >>\nstream\n",
             .{ body.len, extra_dict },
         );
-        try self.buf.appendSlice(self.allocator, body);
-        try self.buf.appendSlice(self.allocator, "\nendstream");
+        try self.buf.writer.writeAll(body);
+        try self.buf.writer.writeAll("\nendstream");
     }
 
     /// Emit the xref table. Returns the byte offset of the `xref` keyword
@@ -265,8 +268,8 @@ pub const Writer = struct {
             if (idx == 0) continue;
             if (obj.allocated and !obj.in_use) return error.DanglingObjectAllocation;
         }
-        const xref_offset = self.buf.items.len;
-        try self.buf.writer(self.allocator).print(
+        const xref_offset = self.buf.written().len;
+        try self.buf.writer.print(
             "xref\n0 {d}\n",
             .{self.objects.items.len},
         );
@@ -274,7 +277,7 @@ pub const Writer = struct {
             // §7.5.4: each entry is exactly 20 bytes including the trailing
             // 2-byte newline. `f` = free, `n` = in-use.
             const marker: u8 = if (obj.in_use) 'n' else 'f';
-            try self.buf.writer(self.allocator).print(
+            try self.buf.writer.print(
                 "{d:0>10} {d:0>5} {c} \n",
                 .{ obj.offset, obj.generation, marker },
             );
@@ -294,14 +297,14 @@ pub const Writer = struct {
         // writer is generation-0 only so we hardcode `0 R`.
         try self.assertEmittedRef(root_obj);
         if (info_obj) |inum| try self.assertEmittedRef(inum);
-        try self.buf.writer(self.allocator).print(
+        try self.buf.writer.print(
             "trailer\n<< /Size {d} /Root {d} 0 R",
             .{ self.objects.items.len, root_obj },
         );
         if (info_obj) |inum| {
-            try self.buf.writer(self.allocator).print(" /Info {d} 0 R", .{inum});
+            try self.buf.writer.print(" /Info {d} 0 R", .{inum});
         }
-        try self.buf.writer(self.allocator).print(
+        try self.buf.writer.print(
             " >>\nstartxref\n{d}\n%%EOF\n",
             .{xref_offset},
         );
@@ -316,7 +319,7 @@ pub const Writer = struct {
     /// The `Writer` is reset to its empty state; further calls are valid
     /// but uncommon. Caller frees with `allocator.free(returned_bytes)`.
     pub fn finalize(self: *Writer) Error![]u8 {
-        const out = try self.buf.toOwnedSlice(self.allocator);
+        const out = try self.buf.toOwnedSlice();
         // Reset metadata so re-use is well-defined; the caller can keep
         // calling allocObjectNum etc. on the same Writer if they want a
         // second document.
@@ -347,7 +350,7 @@ test "writeHeader emits %PDF-1.4 with binary marker" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try w.writeHeader();
-    const got = w.buf.items;
+    const got = w.buf.written();
     try std.testing.expect(std.mem.startsWith(u8, got, "%PDF-1.4\n"));
     try std.testing.expect(std.mem.indexOfScalar(u8, got, 0xE2) != null);
 }
@@ -356,7 +359,7 @@ test "writeName basic name" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try w.writeName("Type");
-    try std.testing.expectEqualStrings("/Type", w.buf.items);
+    try std.testing.expectEqualStrings("/Type", w.buf.written());
 }
 
 test "writeName escapes special chars" {
@@ -364,21 +367,21 @@ test "writeName escapes special chars" {
     defer w.deinit();
     try w.writeName("With Space");
     // ' ' (0x20) is below 0x21 → escape #20.
-    try std.testing.expectEqualStrings("/With#20Space", w.buf.items);
+    try std.testing.expectEqualStrings("/With#20Space", w.buf.written());
 }
 
 test "writeName escapes # itself" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try w.writeName("a#b");
-    try std.testing.expectEqualStrings("/a#23b", w.buf.items);
+    try std.testing.expectEqualStrings("/a#23b", w.buf.written());
 }
 
 test "writeStringLiteral escapes parens, backslash, control" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try w.writeStringLiteral("a(b)\\c\nd\te");
-    try std.testing.expectEqualStrings("(a\\(b\\)\\\\c\\nd\\te)", w.buf.items);
+    try std.testing.expectEqualStrings("(a\\(b\\)\\\\c\\nd\\te)", w.buf.written());
 }
 
 test "writeStringLiteral emits high-byte non-printables as octal" {
@@ -386,28 +389,28 @@ test "writeStringLiteral emits high-byte non-printables as octal" {
     defer w.deinit();
     const s = [_]u8{0x01};
     try w.writeStringLiteral(&s);
-    try std.testing.expectEqualStrings("(\\001)", w.buf.items);
+    try std.testing.expectEqualStrings("(\\001)", w.buf.written());
 }
 
 test "writeStringHex emits lowercase pairs" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try w.writeStringHex(&[_]u8{ 0xde, 0xad, 0xbe, 0xef });
-    try std.testing.expectEqualStrings("<deadbeef>", w.buf.items);
+    try std.testing.expectEqualStrings("<deadbeef>", w.buf.written());
 }
 
 test "writeReal strips trailing zeros" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try w.writeReal(1.5);
-    try std.testing.expectEqualStrings("1.5", w.buf.items);
+    try std.testing.expectEqualStrings("1.5", w.buf.written());
 }
 
 test "writeReal of integer drops decimal point" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try w.writeReal(42.0);
-    try std.testing.expectEqualStrings("42", w.buf.items);
+    try std.testing.expectEqualStrings("42", w.buf.written());
 }
 
 test "writeReal rejects NaN and inf" {
@@ -421,7 +424,7 @@ test "writeRef emits N G R" {
     var w = Writer.init(std.testing.allocator);
     defer w.deinit();
     try w.writeRef(7, 3);
-    try std.testing.expectEqualStrings("7 3 R", w.buf.items);
+    try std.testing.expectEqualStrings("7 3 R", w.buf.written());
 }
 
 test "allocObjectNum starts at 1 and is monotonic" {
@@ -585,7 +588,10 @@ test "FailingAllocator stress on round-trip flow (no leaks)" {
 
         const result = roundTripSmoke(&w);
         if (result) {} else |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
+            // 0.16's Writer.Allocating surfaces alloc failures as
+            // error.WriteFailed; the rest of the path returns
+            // error.OutOfMemory directly. Both indicate alloc death.
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
         }
     }
 }

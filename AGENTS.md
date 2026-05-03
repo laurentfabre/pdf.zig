@@ -6,7 +6,7 @@ This document explains how to read and write PDFs via **pdf.zig** — a single-b
 
 The audience is an LLM agent loaded into a project directory and asked to extract content from a PDF or write a fresh one. **Every section is dense on purpose.** These are the rules that separate a 30-ms first-page flush into Claude's context from a 5-second `pymupdf4llm` boot that loads the entire document into RAM.
 
-> **Scope.** pdf.zig is the **default** for PDF → text / Markdown / NDJSON extraction at LLM-streaming latency, AND for greenfield Markdown → PDF authoring of plain documents (Tier-1: paragraphs, headings, lists, page breaks, base-14 fonts, ASCII). It does **not** cover: layout-aware table extraction with reading-order recovery (the v1.2 tagged-table path handles tagged PDFs only), OCR on scanned/image-only PDFs, encrypted PDFs (parser does not decrypt), or full PDF authoring (FlateDecode compression deferred — Zig 0.15.2 stdlib gap; charts / images / forms / TrueType subsetting not in scope yet). Fall back to **docling** for layout/OCR/CJK and to **qpdf / pypdf** for encryption — see *Fallback to docling* below.
+> **Scope.** pdf.zig is the **default** for PDF → text / Markdown / NDJSON extraction at LLM-streaming latency, AND for greenfield Markdown → PDF authoring of plain documents (Tier-1: paragraphs, headings, lists, page breaks, base-14 fonts, ASCII). It does **not** cover: layout-aware table extraction with reading-order recovery (the v1.2 tagged-table path handles tagged PDFs only), OCR on scanned/image-only PDFs, encrypted PDFs (parser does not decrypt), or full PDF authoring (FlateDecode content-stream compression — PR-W4 follow-up; charts / images / forms / TrueType subsetting not in scope yet). Fall back to **docling** for layout/OCR/CJK and to **qpdf / pypdf** for encryption — see *Fallback to docling* below.
 
 ---
 
@@ -35,7 +35,7 @@ pdf.zig ships in three loosely-coupled layers, and the layers split into **reade
 **Purpose**: In-process PDF read AND fresh write for Zig consumers — same parser/writer, no NDJSON marshalling overhead
 
 - Built as part of `zig build` from `/Users/lf/Projects/Pro/pdf.zig`. Upstream's `src/` tree is preserved; pdf.zig's additions layer alongside (`docs/`, `audit/`, `bake-off/`, `scripts/`).
-- **Toolchain**: Zig 0.15.2 only (`/opt/homebrew/opt/zig@0.15/bin/zig`). The default `zig` on this machine is 0.16, which breaks the build (stdlib moved `std.Thread.Mutex` → `std.Io.Mutex`, `std.process.Child.run` signature changed, etc.). Always pin.
+- **Toolchain**: Zig 0.16.0. Use the default `zig` (managed by ZVM at `~/.zvm/bin/zig`) or any `zig` resolving to 0.16.x. Earlier 0.15.x toolchains will not compile this tree (the codebase uses `std.Io.Writer` / `std.Io.Dir` / `std.process.Init` / `std.compress.flate.Compress` and other 0.16-only stdlib surfaces). Sibling Zig projects on this machine that still pin to 0.15.2 (`ft/`, `c7/`, `Izabella/`, `ziglib/`) keep working through their own explicit `/opt/homebrew/opt/zig@0.15/bin/zig` invocations — pdf.zig is hermetically isolated from them (no `build.zig.zon`, no path imports).
 - **Build mode**: **ReleaseSafe**, not ReleaseFast — quality bar is "zero panics on the Alfred 1,776-PDF corpus", not raw throughput.
 - **Reader API** (entry: `src/root.zig`): `Document.openFromMemory(allocator, bytes, ErrorConfig)`, `doc.pageCount()`, `doc.metadata()`, `doc.extractMarkdown(page_num, allocator)`, `doc.getOutline(allocator)`, `doc.getFormFields(allocator)`. All allocator-explicit; deinit pairs symmetric.
 - **Writer API** (PR-W1+W2+W3+W6, `src/pdf_writer.zig` + `src/pdf_document.zig`):
@@ -43,7 +43,7 @@ pdf.zig ships in three loosely-coupled layers, and the layers split into **reade
   - High level: `pdf_document.DocumentBuilder` — single-use builder with balanced `/Pages` tree (fan-out 10), `addPage` returning a `*PageBuilder`, `addAuxiliaryObject` / `reserveAuxiliaryObject` + `setAuxiliaryPayload` (cyclic graphs like /Outlines ↔ items), `setInfoDict`, `setCatalogExtras`. Writes `/Info` ref into the trailer automatically when set. After `write()` the builder is consumed (`written = true`); subsequent mutations return `error.DocumentAlreadyWritten`.
   - Page level: `PageBuilder.drawText(x, y, font, size, text)` — typed `BT … Tj ET` op composer with auto-resource emission; `appendContent` for raw content streams (TJ kerning, Tm matrices, etc.); `setResourcesRaw` to override the auto `/Resources/Font` dict; `setPageExtras` for `/Annots`/`/Group`/`/StructParents`. `markFontUsed(font)` returns the resource name (`/F0`..`/F13`) for `Tf` operators in raw streams.
   - Fonts: 14 standard PDF Type 1 base-14 fonts via `BuiltinFont` enum; WinAnsiEncoding for the 12 ASCII-friendly ones, native encoding for Symbol/ZapfDingbats.
-- **What the writer does NOT do**: FlateDecode compression (PR-W4 deferred — Zig 0.15.2's `std.compress.flate.Compress` is broken: `@panic("TODO")` in `drain` + `Simple.finish` compile error); TrueType subsetting / UTF-8 outside WinAnsi; charts; images; encryption; signatures; linearization. Tier-1 = readable, valid PDFs with text-only content. Output is uncompressed (4-5× larger than typical) but every viewer reads it.
+- **What the writer does NOT do**: FlateDecode content-stream compression (PR-W4 follow-up — unblocked by the 0.16 toolchain bump but not yet wired into `DocumentBuilder`); TrueType subsetting / UTF-8 outside WinAnsi; charts; images; encryption; signatures; linearization. Tier-1 = readable, valid PDFs with text-only content. Output is uncompressed (4-5× larger than typical) but every viewer reads it.
 - **Quality evidence** (per README *Status* + audit):
   - 0 crashes on Alfred's 1,776-PDF corpus.
   - 11 fuzz targets × 1M iters each (`zig build fuzz`).
@@ -138,7 +138,7 @@ Unlike a build system, pdf.zig has no compilation targets at the user level — 
 - **Don't ignore the terminal `{"kind":"fatal"}` record** — it's the contract for parser death. SIGABRT is suppressed in release; if your pipeline doesn't surface fatal records, you'll see "exit 1, no error message".
 - **Don't load the entire NDJSON output into a buffer before parsing** — the per-page flush is meaningless if you re-buffer.
 - **Don't pass `**bold**` / fenced code / tables to `pdf.zig new`** — it preserves them as raw chars (no inline formatting in Tier-1). For richer output, fall back to `pandoc` + a real Markdown→PDF engine.
-- **Don't expect `pdf.zig new` to compress streams** — Tier-1 emits raw uncompressed content. Files are 4-5× typical size; readable by every viewer. (PR-W4 deferred until Zig 0.16+ ships a working flate compressor.)
+- **Don't expect `pdf.zig new` to compress streams** — Tier-1 emits raw uncompressed content. Files are 4-5× typical size; readable by every viewer. PR-W4 (FlateDecode wiring via 0.16's `std.compress.flate.Compress`) is the next writer follow-up.
 
 ---
 
@@ -244,7 +244,7 @@ pdf.zig is the default for ~90% of PDF → text work but **deliberately doesn't 
 | Figures, captions, document understanding | `docling` | full document-AI pipeline |
 | Form field extraction | `pypdf` / `pdfplumber` | pdf.zig's reader exposes /AcroForm fields (PR-17) but does not validate / fill them |
 | Encrypted PDF (password protected) | `qpdf --decrypt` then re-run pdf.zig, or `pypdf` | parser does not implement password-decrypt |
-| FlateDecode compression on emitted PDFs | (none — accept 4-5× size) | PR-W4 deferred; Zig 0.15.2's flate compressor is broken upstream |
+| FlateDecode compression on emitted PDFs | (none — accept 4-5× size) | PR-W4 follow-up; 0.16 ships a working `std.compress.flate.Compress`, just not wired into `DocumentBuilder` yet |
 
 ### Fallback recipe (CLI)
 
@@ -323,9 +323,9 @@ If pdf.zig output is < 50% of pymupdf4llm's char count on a non-trivial doc, sus
 
 ```bash
 cd /Users/lf/Projects/Pro/pdf.zig
-/opt/homebrew/opt/zig@0.15/bin/zig build test --summary all      # 1133/1133 expected (post-W6 series)
-/opt/homebrew/opt/zig@0.15/bin/zig build alloc-failure-test       # FailingAllocator stress over parse paths
-/opt/homebrew/opt/zig@0.15/bin/zig build fuzz                     # 11 targets × 1M iters (slow)
+zig build test --summary all      # 1133/1133 expected (post-W6 series)
+zig build alloc-failure-test       # FailingAllocator stress over parse paths
+zig build fuzz                     # 11 targets × 1M iters (slow)
 ```
 
 ### Known cache trap
@@ -345,9 +345,9 @@ pdf.zig has no on-disk cache; each invocation re-parses the document. If repeate
   - **Symlink the in-tree build**: `ln -s /Users/lf/Projects/Pro/pdf.zig/zig-out/bin/pdf.zig ~/.local/bin/pdf.zig` — quick-and-dirty; updates as you rebuild.
 
 ### 2. Zig version mismatch breaks the build
-- **Symptom**: `zig build` errors with `std.Thread.Mutex` not found / `std.process.Child.run` argument mismatch / stdlib API drift.
-- **Cause**: the default `zig` on this machine is 0.16; pdf.zig pins 0.15.2.
-- **Fix**: always invoke `/opt/homebrew/opt/zig@0.15/bin/zig`. The repo's CLAUDE.md (`/Users/lf/Projects/Pro/CLAUDE.md`) documents this; respect it.
+- **Symptom**: `zig build` errors with `std.io.Writer` namespace missing / `argsAlloc` not found / `ArrayList.writer(allocator)` not found / stdlib API drift.
+- **Cause**: a 0.15.x `zig` is on `$PATH` (Homebrew's `zig@0.15` keg, or another project's pinned binary). pdf.zig requires 0.16.0+.
+- **Fix**: switch the active toolchain (e.g. `zvm use 0.16.0`) and rebuild. The default `zig` should resolve to 0.16.x — verify with `zig version`.
 
 ### 3. Version string lag
 - **Symptom**: `pdf.zig --version` says `0.1.0-dev`; README and Git tag say `v1.0-rc2` / `v1.2-rc3+`.
@@ -530,16 +530,16 @@ for i in range(doc.page_count):
 brew tap laurentfabre/pdf.zig && brew install pdf.zig       # recommended
 brew upgrade pdf.zig
 # Or build from source:
-cd /Users/lf/Projects/Pro/pdf.zig && /opt/homebrew/opt/zig@0.15/bin/zig build -Doptimize=ReleaseSafe
+cd /Users/lf/Projects/Pro/pdf.zig && zig build -Doptimize=ReleaseSafe
 sudo install -m 755 zig-out/bin/pdf.zig /usr/local/bin/
 ```
 
 ### Run the test suite
 ```bash
 cd /Users/lf/Projects/Pro/pdf.zig
-/opt/homebrew/opt/zig@0.15/bin/zig build test --summary all  # 1133/1133
-/opt/homebrew/opt/zig@0.15/bin/zig build alloc-failure-test
-/opt/homebrew/opt/zig@0.15/bin/zig build fuzz                # 11 targets × 1M iters
+zig build test --summary all  # 1133/1133
+zig build alloc-failure-test
+zig build fuzz                # 11 targets × 1M iters
 ```
 
 ### Fallback (docling)
@@ -577,7 +577,7 @@ pdf.zig extract decrypted.pdf
 - **Forget that `--version` lags the README tag** — use `git describe`.
 - **Install docling preemptively** — ~2 GB; install only when a fallback case surfaces.
 - **Ignore terminal `kind:"fatal"` records** — they're how parser death is reported in release.
-- **Use the default `zig` binary for the build** — it's 0.16; pdf.zig pins 0.15.2 at `/opt/homebrew/opt/zig@0.15/bin/zig`.
+- **Use a 0.15.x `zig` binary** — pdf.zig requires 0.16.0+. Sibling projects (`ft/`, `c7/`, `Izabella/`, `ziglib/`) still pin 0.15.2 via `/opt/homebrew/opt/zig@0.15/bin/zig` and are unaffected.
 - **Mutate a parsed `Document`** — it's read-only; build a fresh one via `DocumentBuilder`.
 - **Reuse a `DocumentBuilder` after `write()`** — single-use; build fresh per output.
 - **Pass non-ASCII to `pdf.zig new`** — bytes drop silently; transliterate first or use pandoc.

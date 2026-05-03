@@ -93,7 +93,7 @@ fn fuzzStreamJsonString(rng: std.Random, allocator: std.mem.Allocator, scratch: 
     // Worst-case escape: every byte → 6-char \u00XX (e.g. all 0x01s).
     // Double again for the surrounding quotes + slack.
     var out_buf: [98304]u8 = undefined;
-    var aw = std.io.Writer.fixed(&out_buf);
+    var aw = std.Io.Writer.fixed(&out_buf);
     try stream.writeJsonString(&aw, scratch[0..len]);
 
     const written = aw.buffered();
@@ -126,8 +126,8 @@ fn fuzzStreamEnvelopeMeta(rng: std.Random, allocator: std.mem.Allocator, scratch
     rng.bytes(scratch[src_len + title_len .. src_len + title_len + author_len]);
 
     var out_buf: [32768]u8 = undefined;
-    var aw = std.io.Writer.fixed(&out_buf);
-    var env = stream.Envelope.init(&aw, scratch[0..src_len]);
+    var aw = std.Io.Writer.fixed(&out_buf);
+    var env = stream.Envelope.initWithId(&aw, scratch[0..src_len], "01234567-89ab-7cde-8f01-23456789abcd".*);
     try env.emitMeta(.{
         .pages = rng.int(u32),
         .encrypted = rng.boolean(),
@@ -145,9 +145,9 @@ fn fuzzStreamEnvelopePage(rng: std.Random, allocator: std.mem.Allocator, scratch
     const md_len = rng.intRangeAtMost(usize, 0, scratch.len);
     rng.bytes(scratch[0..md_len]);
 
-    var aw = std.io.Writer.Allocating.init(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
-    var env = stream.Envelope.init(&aw.writer, "fuzz.pdf");
+    var env = stream.Envelope.initWithId(&aw.writer, "fuzz.pdf", "01234567-89ab-7cde-8f01-23456789abcd".*);
     try env.emitPage(rng.int(u32), scratch[0..md_len], &.{});
 
     const written = aw.written();
@@ -169,7 +169,7 @@ fn fuzzChunkBreakFinder(rng: std.Random, allocator: std.mem.Allocator, scratch: 
     // Each chunk record can be up to ~6× input (escape worst-case) plus
     // envelope overhead; with many small chunks the cumulative output
     // can exceed input by ~10×. Grow as needed via Allocating writer.
-    var aw = std.io.Writer.Allocating.init(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     var env = stream.Envelope.initWithId(&aw.writer, "fuzz.pdf", "01234567-89ab-7cde-8f01-23456789abcd".*);
     const t = tokenizer.Tokenizer.init(.heuristic);
@@ -583,11 +583,21 @@ fn fuzzLinkContinuationsRandom(rng: std.Random, allocator: std.mem.Allocator, sc
 /// crash leaves the offending bytes on disk at /tmp/pdf_zig_last_<tag>.bin
 /// for minimization. Failures are silent — this is debug-only.
 fn dumpReproducer(tag: []const u8, bytes: []const u8) void {
-    var path_buf: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/tmp/pdf_zig_last_{s}.bin", .{tag}) catch return;
-    const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return;
-    defer file.close();
-    file.writeAll(bytes) catch {};
+    // 0.16: file ops require an Io and the per-target fn signature has
+    // none. Use raw POSIX syscalls so the reproducer-dump escape hatch
+    // keeps working without threading Io through every TargetFn.
+    var path_buf: [256:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/pdf_zig_last_{s}.bin", .{tag}) catch return;
+    const flags: std.posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    const fd = std.posix.openatZ(std.posix.AT.FDCWD, path.ptr, flags, 0o644) catch return;
+    defer _ = std.posix.system.close(fd);
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.posix.system.write(fd, bytes[written..].ptr, bytes.len - written);
+        const n: isize = @bitCast(@as(usize, @bitCast(rc)));
+        if (n <= 0) return;
+        written += @intCast(n);
+    }
 }
 
 // ============================================================================
@@ -731,40 +741,38 @@ fn fuzzLatticePassBSpans(rng: std.Random, allocator: std.mem.Allocator, scratch:
 const DEFAULT_ITERS: u64 = 1_000_000;
 const PROGRESS_EVERY: u64 = 100_000;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const env_iters = std.process.getEnvVarOwned(arena_alloc, "PDFZIG_FUZZ_ITERS") catch null;
+    // 0.16: `getEnvVarOwned` is gone; env vars come from `init.environ_map`
+    // (parsed once at process start). `.get` returns a borrow that lives
+    // for the whole process, so the per-target arena.reset()s below can't
+    // invalidate it (the PR-4c page-allocator dance is no longer needed).
+    const env_iters = init.environ_map.get("PDFZIG_FUZZ_ITERS");
     const iters = if (env_iters) |s|
         std.fmt.parseInt(u64, s, 10) catch DEFAULT_ITERS
     else
         DEFAULT_ITERS;
 
-    // PR-4c: env_target is referenced inside the per-target loop
-    // below, AFTER each target's iter loop has called
-    // `arena.reset(.retain_capacity)`. If allocated from arena_alloc
-    // the reset would invalidate the string and the next
-    // `mem.eql(u8, f, target.name)` comparison would segfault with
-    // `target_filter` pointing at reused arena memory. Allocate from
-    // page_allocator so the slice survives every reset; we free it
-    // at end-of-main.
-    const env_target = std.process.getEnvVarOwned(std.heap.page_allocator, "PDFZIG_FUZZ_TARGET") catch null;
-    defer if (env_target) |s| std.heap.page_allocator.free(s);
-    const target_filter = env_target;
+    const target_filter = init.environ_map.get("PDFZIG_FUZZ_TARGET");
 
-    const env_aggressive = std.process.getEnvVarOwned(arena_alloc, "PDFZIG_FUZZ_AGGRESSIVE") catch null;
+    const env_aggressive = init.environ_map.get("PDFZIG_FUZZ_AGGRESSIVE");
     const aggressive_enabled = if (env_aggressive) |s| !std.mem.eql(u8, s, "0") else false;
 
-    const env_seed = std.process.getEnvVarOwned(arena_alloc, "PDFZIG_FUZZ_SEED") catch null;
+    const env_seed = init.environ_map.get("PDFZIG_FUZZ_SEED");
+    const wall_seed: u64 = blk: {
+        const now = std.Io.Timestamp.now(init.io, .real);
+        break :blk @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
+    };
     const base_seed: u64 = if (env_seed) |s|
-        std.fmt.parseInt(u64, s, 0) catch @as(u64, @intCast(@max(0, std.time.milliTimestamp())))
+        std.fmt.parseInt(u64, s, 0) catch wall_seed
     else
-        @as(u64, @intCast(@max(0, std.time.milliTimestamp())));
+        wall_seed;
 
     var stderr_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stderr().writer(&stderr_buf);
+    var bw = std.Io.File.stderr().writer(init.io, &stderr_buf);
     const out = &bw.interface;
     defer out.flush() catch {};
 
@@ -787,7 +795,7 @@ pub fn main() !void {
 
     var scratch: [8192]u8 = undefined;
 
-    const t_total = std.time.milliTimestamp();
+    const t_total = std.Io.Timestamp.now(init.io, .real).toMilliseconds();
     var failures: u32 = 0;
 
     for (TARGETS, 0..) |target, ti| {
@@ -802,7 +810,7 @@ pub fn main() !void {
         try out.print("[{d}/{d}] {s}: ", .{ ti + 1, TARGETS.len, target.name });
         try out.flush();
 
-        const t_start = std.time.milliTimestamp();
+        const t_start = std.Io.Timestamp.now(init.io, .real).toMilliseconds();
         var iter: u64 = 0;
         var target_failures: u32 = 0;
         while (iter < iters) : (iter += 1) {
@@ -836,12 +844,12 @@ pub fn main() !void {
                 try out.flush();
             }
         }
-        const elapsed_ms = std.time.milliTimestamp() - t_start;
+        const elapsed_ms = std.Io.Timestamp.now(init.io, .real).toMilliseconds() - t_start;
         try out.print(" {d} iters in {d} ms ({d} fail)\n", .{ iters, elapsed_ms, target_failures });
         failures += target_failures;
     }
 
-    const total_ms = std.time.milliTimestamp() - t_total;
+    const total_ms = std.Io.Timestamp.now(init.io, .real).toMilliseconds() - t_total;
     try out.print("\nTotal: {d} target(s) × {d} iters in {d} ms — {d} invariant violation(s)\n", .{ TARGETS.len, iters, total_ms, failures });
 
     if (failures > 0) {

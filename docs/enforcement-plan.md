@@ -1,6 +1,6 @@
 # Enforcement plan — branch protection, PR gates, agent conventions
 
-Status as of 2026-04-30. Single-author public repo (`laurentfabre/pdf.zig`), Zig 0.15.2.
+Status as of 2026-05-03. Single-author public repo (`laurentfabre/pdf.zig`), Zig 0.16.0.
 
 Adapted from the zlsx companion repo's enforcement plan (`/Users/lf/Projects/Pro/zlsx/docs/enforcement-plan.md`). Same five-phase shape; pdf.zig-specific paths and CI matrix.
 

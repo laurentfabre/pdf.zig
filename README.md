@@ -102,7 +102,7 @@ The package keeps the upstream-compat import name `zpdf` for ABI continuity.
 ```bash
 git clone https://github.com/laurentfabre/pdf.zig
 cd pdf.zig
-zig build -Doptimize=ReleaseSafe       # requires zig 0.15.2
+zig build -Doptimize=ReleaseSafe       # requires zig 0.16.0+
 ./zig-out/bin/pdf.zig --help
 ```
 

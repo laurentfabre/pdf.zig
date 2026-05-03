@@ -260,7 +260,7 @@ fn parseOutputMode(s: []const u8) !OutputMode {
 pub fn findH1Heading(md: []const u8) ?[]const u8 {
     var iter = std.mem.splitScalar(u8, md, '\n');
     while (iter.next()) |line| {
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
         if (!std.mem.startsWith(u8, trimmed, "# ")) continue;
         if (std.mem.startsWith(u8, trimmed, "## ")) continue; // skip H2+
         const title = std.mem.trim(u8, trimmed[2..], " \t\r");
@@ -288,56 +288,56 @@ pub fn computeScanFlag(pages_emitted: u32, scanned_pages: u32, has_fonts: bool, 
 
 // ---- Run ----
 
-pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !ExitCode {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !ExitCode {
     const cmd = parseArgs(args) catch |err| {
-        try writeArgError(err);
+        try writeArgError(io, err);
         return .arg_error;
     };
 
     return switch (cmd) {
         .help => blk: {
-            try writeHelp();
+            try writeHelp(io);
             break :blk .ok;
         },
         .version => blk: {
-            try writeVersion();
+            try writeVersion(io);
             break :blk .ok;
         },
-        .extract => |ea| try runExtract(allocator, ea),
-        .chunk => |ea| try runExtract(allocator, ea),
-        .info => |ia| try runInfo(allocator, ia),
-        .new => |na| try runNew(allocator, na),
+        .extract => |ea| try runExtract(allocator, io, ea),
+        .chunk => |ea| try runExtract(allocator, io, ea),
+        .info => |ia| try runInfo(allocator, io, ia),
+        .new => |na| try runNew(allocator, io, na),
     };
 }
 
-fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
+fn runExtract(allocator: std.mem.Allocator, io: std.Io, args: ExtractArgs) !ExitCode {
     try stream.registerSignalHandlers();
 
     var out_buf: [8192]u8 = undefined;
     const out_file = if (args.output_path) |path|
-        std.fs.cwd().createFile(path, .{}) catch |err| {
+        std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
             var serr_buf: [256]u8 = undefined;
-            var sbw = std.fs.File.stderr().writer(&serr_buf);
+            var sbw = std.Io.File.stderr().writer(io, &serr_buf);
             const sw = &sbw.interface;
             sw.print("pdf.zig: cannot open output {s}: {s}\n", .{ path, @errorName(err) }) catch {};
             sw.flush() catch {};
             return .io_error;
         }
     else
-        std.fs.File.stdout();
-    defer if (args.output_path != null) out_file.close();
+        std.Io.File.stdout();
+    defer if (args.output_path != null) out_file.close(io);
 
-    var bw = out_file.writer(&out_buf);
+    var bw = out_file.writer(io, &out_buf);
     const writer = &bw.interface;
     defer writer.flush() catch {};
 
     const source = sourceBasename(args.input);
-    var env = stream.Envelope.init(writer, source);
+    var env = stream.Envelope.init(io, writer, source);
 
-    const t_start = std.time.milliTimestamp();
+    const t_start = std.Io.Timestamp.now(io, .real).toMilliseconds();
 
     const stdin_data: ?[]u8 = if (std.mem.eql(u8, args.input, "-"))
-        readStdinAlloc(allocator) catch |err| {
+        readStdinAlloc(allocator, io) catch |err| {
             return try fatalFromOpenError(&env, writer, err);
         }
     else
@@ -347,7 +347,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     const doc = (if (stdin_data) |data|
         zpdf.Document.openFromMemory(allocator, data, zpdf.ErrorConfig.default())
     else
-        zpdf.Document.open(allocator, args.input)) catch |err| {
+        zpdf.Document.open(allocator, io, args.input)) catch |err| {
         return try fatalFromOpenError(&env, writer, err);
     };
     defer doc.close();
@@ -541,7 +541,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     if (args.images_mode == .path) {
         doc_id_buf = try deriveDocId(allocator, args.input);
         if (args.images_dir) |dir| {
-            std.fs.cwd().makePath(dir) catch {};
+            std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
     }
 
@@ -549,7 +549,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
         if (stream.wasInterrupted()) |sig| {
             try env.emitInterrupted(sig);
             try writer.flush();
-            return if (sig == std.posix.SIG.TERM) .interrupted_term else .interrupted_int;
+            return if (sig == @intFromEnum(std.posix.SIG.TERM)) .interrupted_term else .interrupted_int;
         }
 
         // PR-17 codex r1 F1: keep `last_page_seen` updated regardless
@@ -716,6 +716,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                         for (images, 0..) |img, img_idx| {
                             const ec = try emitImageRecord(
                                 allocator,
+                                io,
                                 &env,
                                 args,
                                 doc_id_buf,
@@ -773,7 +774,7 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
                 current_section_title = null;
             }
         }
-        const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - t_start);
+        const elapsed_ms: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds() - t_start);
         // PR-11 [feat]: scanned-PDF heuristic — flag the doc as
         // "scanned" when ≥ scan_threshold% of pages produced under
         // 50 B of markdown AND the document has at least one font
@@ -795,18 +796,18 @@ fn runExtract(allocator: std.mem.Allocator, args: ExtractArgs) !ExitCode {
     return .ok;
 }
 
-fn runInfo(allocator: std.mem.Allocator, args: InfoArgs) !ExitCode {
+fn runInfo(allocator: std.mem.Allocator, io: std.Io, args: InfoArgs) !ExitCode {
     try stream.registerSignalHandlers();
 
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std.Io.File.stdout().writer(io, &stdout_buf);
     const writer = &bw.interface;
     defer writer.flush() catch {};
 
     const source = sourceBasename(args.input);
 
     const stdin_data: ?[]u8 = if (std.mem.eql(u8, args.input, "-"))
-        readStdinAlloc(allocator) catch |err| {
+        readStdinAlloc(allocator, io) catch |err| {
             try writer.print("error: reading stdin: {s}\n", .{@errorName(err)});
             return .io_error;
         }
@@ -815,11 +816,11 @@ fn runInfo(allocator: std.mem.Allocator, args: InfoArgs) !ExitCode {
     defer if (stdin_data) |d| allocator.free(d);
 
     if (args.as_json) {
-        var env = stream.Envelope.init(writer, source);
+        var env = stream.Envelope.init(io, writer, source);
         const doc = (if (stdin_data) |data|
             zpdf.Document.openFromMemory(allocator, data, zpdf.ErrorConfig.default())
         else
-            zpdf.Document.open(allocator, args.input)) catch |err| {
+            zpdf.Document.open(allocator, io, args.input)) catch |err| {
             return try fatalFromOpenError(&env, writer, err);
         };
         defer doc.close();
@@ -842,7 +843,7 @@ fn runInfo(allocator: std.mem.Allocator, args: InfoArgs) !ExitCode {
     const doc = (if (stdin_data) |data|
         zpdf.Document.openFromMemory(allocator, data, zpdf.ErrorConfig.default())
     else
-        zpdf.Document.open(allocator, args.input)) catch |err| {
+        zpdf.Document.open(allocator, io, args.input)) catch |err| {
         try writer.print("error: failed to open {s}: {s}\n", .{ args.input, @errorName(err) });
         return mapOpenErrorToExit(err);
     };
@@ -910,6 +911,7 @@ fn extensionForFilter(filter: ?[]const u8) ?[]const u8 {
 /// stays readable.
 fn emitImageRecord(
     allocator: std.mem.Allocator,
+    io: std.Io,
     env: *stream.Envelope,
     args: ExtractArgs,
     doc_id: []const u8,
@@ -968,7 +970,7 @@ fn emitImageRecord(
                     try allocator.dupe(u8, filename);
                 defer allocator.free(full_path);
 
-                std.fs.cwd().writeFile(.{ .sub_path = full_path, .data = img.payload.? }) catch {
+                std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = img.payload.? }) catch {
                     // I/O failed — fall through to the warning emission below.
                     var warn_buf: [128]u8 = undefined;
                     const warn_str = std.fmt.bufPrint(
@@ -1011,14 +1013,14 @@ fn emitImageRecord(
 /// expected hotel PDF (~50 MiB) and below the practical 32-bit limit.
 const STDIN_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-fn readStdinAlloc(allocator: std.mem.Allocator) ![]u8 {
+fn readStdinAlloc(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    const stdin = std.fs.File.stdin();
+    const stdin = std.Io.File.stdin();
     var chunk_buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = stdin.read(&chunk_buf) catch |err| switch (err) {
+        const n = stdin.readStreaming(io, &.{&chunk_buf}) catch |err| switch (err) {
             error.WouldBlock => continue,
             else => return err,
         };
@@ -1045,7 +1047,7 @@ fn mapOpenErrorToExit(err: anyerror) ExitCode {
     };
 }
 
-fn fatalFromOpenError(env: *stream.Envelope, writer: *std.io.Writer, err: anyerror) !ExitCode {
+fn fatalFromOpenError(env: *stream.Envelope, writer: *std.Io.Writer, err: anyerror) !ExitCode {
     const fk: stream.FatalErrorKind = switch (err) {
         error.OutOfMemory => .oom,
         error.FileNotFound, error.AccessDenied => .io,
@@ -1098,9 +1100,9 @@ pub fn resolvePageRange(allocator: std.mem.Allocator, spec: ?[]const u8, total: 
     return try list.toOwnedSlice(allocator);
 }
 
-fn writeArgError(err: ArgError) !void {
+fn writeArgError(io: std.Io, err: ArgError) !void {
     var buf: [256]u8 = undefined;
-    var bw = std.fs.File.stderr().writer(&buf);
+    var bw = std.Io.File.stderr().writer(io, &buf);
     const w = &bw.interface;
     defer w.flush() catch {};
     const msg = switch (err) {
@@ -1120,23 +1122,23 @@ fn writeArgError(err: ArgError) !void {
 
 /// PR-W5 [feat]: read markdown from stdin or a file, render via
 /// `markdown_to_pdf`, write the result to `args.output_path`.
-fn runNew(allocator: std.mem.Allocator, args: NewArgs) !ExitCode {
+fn runNew(allocator: std.mem.Allocator, io: std.Io, args: NewArgs) !ExitCode {
     const markdown_to_pdf = @import("markdown_to_pdf.zig");
 
     // Read input source.
     const md_bytes = if (std.mem.eql(u8, args.input, "-"))
-        readStdinAlloc(allocator) catch |err| {
+        readStdinAlloc(allocator, io) catch |err| {
             var serr_buf: [256]u8 = undefined;
-            var sbw = std.fs.File.stderr().writer(&serr_buf);
+            var sbw = std.Io.File.stderr().writer(io, &serr_buf);
             const sw = &sbw.interface;
             sw.print("pdf.zig: cannot read stdin: {s}\n", .{@errorName(err)}) catch {};
             sw.flush() catch {};
             return .io_error;
         }
     else
-        std.fs.cwd().readFileAlloc(allocator, args.input, 32 * 1024 * 1024) catch |err| {
+        std.Io.Dir.cwd().readFileAlloc(io, args.input, allocator, .limited(32 * 1024 * 1024)) catch |err| {
             var serr_buf: [256]u8 = undefined;
-            var sbw = std.fs.File.stderr().writer(&serr_buf);
+            var sbw = std.Io.File.stderr().writer(io, &serr_buf);
             const sw = &sbw.interface;
             sw.print("pdf.zig: cannot read {s}: {s}\n", .{ args.input, @errorName(err) }) catch {};
             sw.flush() catch {};
@@ -1147,19 +1149,19 @@ fn runNew(allocator: std.mem.Allocator, args: NewArgs) !ExitCode {
     const pdf_bytes = try markdown_to_pdf.render(allocator, md_bytes);
     defer allocator.free(pdf_bytes);
 
-    const out_file = std.fs.cwd().createFile(args.output_path, .{ .truncate = true }) catch |err| {
+    const out_file = std.Io.Dir.cwd().createFile(io, args.output_path, .{ .truncate = true }) catch |err| {
         var serr_buf: [256]u8 = undefined;
-        var sbw = std.fs.File.stderr().writer(&serr_buf);
+        var sbw = std.Io.File.stderr().writer(io, &serr_buf);
         const sw = &sbw.interface;
         sw.print("pdf.zig: cannot create {s}: {s}\n", .{ args.output_path, @errorName(err) }) catch {};
         sw.flush() catch {};
         return .io_error;
     };
-    defer out_file.close();
+    defer out_file.close(io);
 
-    out_file.writeAll(pdf_bytes) catch |err| {
+    out_file.writeStreamingAll(io, pdf_bytes) catch |err| {
         var serr_buf: [256]u8 = undefined;
-        var sbw = std.fs.File.stderr().writer(&serr_buf);
+        var sbw = std.Io.File.stderr().writer(io, &serr_buf);
         const sw = &sbw.interface;
         sw.print("pdf.zig: write failed for {s}: {s}\n", .{ args.output_path, @errorName(err) }) catch {};
         sw.flush() catch {};
@@ -1168,9 +1170,9 @@ fn runNew(allocator: std.mem.Allocator, args: NewArgs) !ExitCode {
     return .ok;
 }
 
-fn writeHelp() !void {
+fn writeHelp(io: std.Io) !void {
     var buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&buf);
+    var bw = std.Io.File.stdout().writer(io, &buf);
     const w = &bw.interface;
     defer w.flush() catch {};
     try w.writeAll(
@@ -1215,9 +1217,9 @@ fn writeHelp() !void {
     );
 }
 
-fn writeVersion() !void {
+fn writeVersion(io: std.Io) !void {
     var buf: [128]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&buf);
+    var bw = std.Io.File.stdout().writer(io, &buf);
     const w = &bw.interface;
     defer w.flush() catch {};
     try w.writeAll("pdf.zig 0.1.0-dev\n");
@@ -1465,15 +1467,21 @@ test "PR-19 follow-up: extensionForFilter only allows DCT and JPX" {
 test "PR-19 follow-up: path mode writes DCT image to disk + emits relative path" {
     const allocator = std.testing.allocator;
 
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    const tmp_path = try std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
     defer allocator.free(tmp_path);
 
     const fixed_doc_id: [36]u8 = "01234567-89ab-7cde-8f01-23456789abcd".*;
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", fixed_doc_id);
 
     const args: ExtractArgs = .{
@@ -1490,7 +1498,7 @@ test "PR-19 follow-up: path mode writes DCT image to disk + emits relative path"
         .payload = fake_payload,
     };
 
-    const ec = try emitImageRecord(allocator, &env, args, "doc", 1, 1, img);
+    const ec = try emitImageRecord(allocator, io, &env, args, "doc", 1, 1, img);
     try std.testing.expectEqual(ExitCode.ok, ec);
 
     // The NDJSON record must reference the relative path under tmp_path.
@@ -1500,7 +1508,7 @@ test "PR-19 follow-up: path mode writes DCT image to disk + emits relative path"
     try std.testing.expect(std.mem.indexOf(u8, written, "\"warnings\":") == null);
 
     // The file must be on disk and contain the original payload.
-    const file_data = try tmp.dir.readFileAlloc(allocator, "doc-page1-img1.jpg", 1024);
+    const file_data = try tmp.dir.readFileAlloc(io, "doc-page1-img1.jpg", allocator, .limited(1024));
     defer allocator.free(file_data);
     try std.testing.expectEqualSlices(u8, fake_payload, file_data);
 }
@@ -1508,9 +1516,13 @@ test "PR-19 follow-up: path mode writes DCT image to disk + emits relative path"
 test "PR-19 follow-up: path mode emits warning for unsupported filter" {
     const allocator = std.testing.allocator;
 
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     const fixed_doc_id: [36]u8 = "01234567-89ab-7cde-8f01-23456789abcd".*;
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", fixed_doc_id);
 
     const args: ExtractArgs = .{ .input = "x.pdf", .images_mode = .path };
@@ -1521,7 +1533,7 @@ test "PR-19 follow-up: path mode emits warning for unsupported filter" {
         .encoding = "FlateDecode",
         .payload = null,
     };
-    const ec = try emitImageRecord(allocator, &env, args, "doc", 1, 1, img);
+    const ec = try emitImageRecord(allocator, io, &env, args, "doc", 1, 1, img);
     try std.testing.expectEqual(ExitCode.ok, ec);
 
     const written = aw.buffered();

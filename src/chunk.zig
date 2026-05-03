@@ -122,7 +122,7 @@ fn splitGiantPage(
         try env.emitChunk(chunk_id, &.{page.index}, slice, slice_tokens, cut.kind);
         chunk_id += 1;
 
-        rest = std.mem.trimLeft(u8, rest[cut.byte_offset..], " \t\n\r");
+        rest = std.mem.trimStart(u8, rest[cut.byte_offset..], " \t\n\r");
     }
 
     return chunk_id;
@@ -178,7 +178,7 @@ const FIXED_DOC_ID2: uuid.String = "01234567-89ab-7cde-8f01-23456789abcd".*;
 
 test "two small pages pack into one chunk" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID2);
 
     const pages = [_]Page{
@@ -196,7 +196,7 @@ test "two small pages pack into one chunk" {
 
 test "three pages split into multiple chunks at page boundaries" {
     var buf: [8192]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID2);
 
     // Each page ~16 bytes / 4 bytes/token ≈ 4 tokens; max_tokens = 5 forces
@@ -216,7 +216,7 @@ test "three pages split into multiple chunks at page boundaries" {
 
 test "giant page is split on heading preference" {
     var buf: [8192]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID2);
 
     const md =
@@ -244,7 +244,7 @@ test "chunk respects max_tokens contract on CJK-heavy pages" {
     while (i + 3 <= rep.len) : (i += 3) {
         rep[i] = 0xe4; rep[i + 1] = 0xbd; rep[i + 2] = 0xa0; // 你
     }
-    var aw = std.io.Writer.Allocating.init(std.testing.allocator);
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw.deinit();
     var env = stream.Envelope.initWithId(&aw.writer, "fuzz.pdf", FIXED_DOC_ID2);
     const t = tokenizer.Tokenizer.init(.heuristic);
@@ -271,7 +271,7 @@ test "chunk respects max_tokens contract on CJK-heavy pages" {
 
 test "max_tokens = 0 is rejected" {
     var buf: [256]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID2);
     const pages = [_]Page{.{ .index = 0, .markdown = "anything" }};
     try std.testing.expectError(error.InvalidMaxTokens, chunkPages(
@@ -284,7 +284,7 @@ test "max_tokens = 0 is rejected" {
 
 test "empty page list emits zero chunks" {
     var buf: [256]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = stream.Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID2);
     const n = try chunkPages(std.testing.allocator, &.{}, .{
         .max_tokens = 100,

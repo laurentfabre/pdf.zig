@@ -8,9 +8,27 @@ pub const ZpdfDocument = opaque {};
 
 var c_allocator: std.mem.Allocator = std.heap.page_allocator;
 
+// Lazy-initialised Io singleton. The C ABI has no equivalent of
+// `std.process.Init`, so we build one ourselves on first use. The
+// initialisation is single-shot and guarded by an atomic flag — fine
+// for the typical Python/C consumer where the first call is single-
+// threaded. Concurrent first calls would race, but the cost is at
+// most a duplicate Threaded init that leaks; subsequent reads see a
+// fully-published value.
+var capi_threaded: std.Io.Threaded = undefined;
+var capi_io_ready: std.atomic.Value(bool) = .init(false);
+
+fn capiIo() std.Io {
+    if (!capi_io_ready.load(.acquire)) {
+        capi_threaded = .init(c_allocator, .{});
+        capi_io_ready.store(true, .release);
+    }
+    return capi_threaded.io();
+}
+
 export fn zpdf_open(path_ptr: [*:0]const u8) ?*ZpdfDocument {
     const path = std.mem.span(path_ptr);
-    const doc = zpdf.Document.open(c_allocator, path) catch return null;
+    const doc = zpdf.Document.open(c_allocator, capiIo(), path) catch return null;
     return @ptrCast(doc);
 }
 
@@ -55,10 +73,11 @@ export fn zpdf_extract_page(handle: ?*ZpdfDocument, page_num: c_int, out_len: *u
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
         if (page_num < 0) return null;
 
-        var buffer: std.ArrayList(u8) = .empty;
-        doc.extractText(@intCast(page_num), buffer.writer(c_allocator)) catch return null;
+        var aw = std.Io.Writer.Allocating.init(c_allocator);
+        defer aw.deinit();
+        doc.extractText(@intCast(page_num), &aw.writer) catch return null;
 
-        const slice = buffer.toOwnedSlice(c_allocator) catch return null;
+        const slice = aw.toOwnedSlice() catch return null;
         out_len.* = slice.len;
         return slice.ptr;
     }

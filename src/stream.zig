@@ -270,18 +270,18 @@ pub const ChunkBreak = enum {
 pub const Envelope = struct {
     doc_id: uuid.String,
     source: []const u8,
-    writer: *std.io.Writer,
+    writer: *std.Io.Writer,
 
-    pub fn init(writer: *std.io.Writer, source: []const u8) Envelope {
+    pub fn init(io: std.Io, writer: *std.Io.Writer, source: []const u8) Envelope {
         return .{
-            .doc_id = uuid.v7(),
+            .doc_id = uuid.v7(io),
             .source = source,
             .writer = writer,
         };
     }
 
     /// Override doc_id (used in tests for determinism).
-    pub fn initWithId(writer: *std.io.Writer, source: []const u8, doc_id: uuid.String) Envelope {
+    pub fn initWithId(writer: *std.Io.Writer, source: []const u8, doc_id: uuid.String) Envelope {
         return .{ .doc_id = doc_id, .source = source, .writer = writer };
     }
 
@@ -664,7 +664,7 @@ pub const Envelope = struct {
 /// set of escapes required by RFC 8259. Valid UTF-8 sequences pass through;
 /// invalid bytes are replaced with `�` per Unicode Standard §3.9 so the
 /// output is always well-formed JSON regardless of upstream encoding bugs.
-pub fn writeJsonString(writer: *std.io.Writer, s: []const u8) !void {
+pub fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeAll("\"");
     var i: usize = 0;
     while (i < s.len) {
@@ -745,8 +745,8 @@ pub fn writeJsonString(writer: *std.io.Writer, s: []const u8) !void {
 
 pub var interrupted_flag = std.atomic.Value(c_int).init(0);
 
-fn handleInterrupt(sig: c_int) callconv(.c) void {
-    interrupted_flag.store(sig, .seq_cst);
+fn handleInterrupt(sig: std.posix.SIG) callconv(.c) void {
+    interrupted_flag.store(@intCast(@intFromEnum(sig)), .seq_cst);
 }
 
 /// Install signal handlers per architecture.md §6.4.
@@ -785,7 +785,7 @@ const FIXED_DOC_ID: uuid.String = "01234567-89ab-7cde-8f01-23456789abcd".*;
 
 test "envelope record contains kind, doc_id, source" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "test.pdf", FIXED_DOC_ID);
     try env.emitMeta(.{ .pages = 5, .encrypted = false });
     const written = aw.buffered();
@@ -798,7 +798,7 @@ test "envelope record contains kind, doc_id, source" {
 
 test "string escape: quotes, backslash, control chars" {
     var buf: [256]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     try writeJsonString(&aw, "a\"b\\c\nd\te\x01f");
     const written = aw.buffered();
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\nd\\te\\u0001f\"", written);
@@ -806,7 +806,7 @@ test "string escape: quotes, backslash, control chars" {
 
 test "string escape: valid UTF-8 passes through" {
     var buf: [256]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     try writeJsonString(&aw, "café 你好 €");
     const written = aw.buffered();
     try std.testing.expectEqualStrings("\"café 你好 €\"", written);
@@ -814,7 +814,7 @@ test "string escape: valid UTF-8 passes through" {
 
 test "string escape: invalid UTF-8 → U+FFFD replacement" {
     var buf: [256]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     // \xfe\xff is a UTF-16BE BOM; bytes are not valid UTF-8 leading bytes.
     try writeJsonString(&aw, "abc\xfe\xff M\x00 i\x00");
     const written = aw.buffered();
@@ -827,7 +827,7 @@ test "string escape: invalid UTF-8 → U+FFFD replacement" {
 
 test "string escape: Unicode line separators (U+0085 / U+2028 / U+2029) are escaped" {
     var buf: [256]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     // U+0085 = C2 85, U+2028 = E2 80 A8, U+2029 = E2 80 A9 in UTF-8.
     try writeJsonString(&aw, "a\xc2\x85b\xe2\x80\xa8c\xe2\x80\xa9d");
     const written = aw.buffered();
@@ -839,7 +839,7 @@ test "string escape: Unicode line separators (U+0085 / U+2028 / U+2029) are esca
 
 test "string escape: truncated UTF-8 sequence → U+FFFD" {
     var buf: [256]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     // \xc3 is a 2-byte UTF-8 leading byte but missing the continuation.
     try writeJsonString(&aw, "x\xc3");
     const written = aw.buffered();
@@ -848,7 +848,7 @@ test "string escape: truncated UTF-8 sequence → U+FFFD" {
 
 test "page record escapes embedded newlines in markdown" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitPage(0, "line1\nline2\nline3", &.{});
     const written = aw.buffered();
@@ -863,7 +863,7 @@ test "page record escapes embedded newlines in markdown" {
 
 test "page record with warnings array" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitPage(2, "ok", &.{
         .{ .code = "cmap_missing", .message = "font has no ToUnicode CMap" },
@@ -875,7 +875,7 @@ test "page record with warnings array" {
 
 test "PR-18: emitPageWithSpans appends spans:[] with bbox + font_size" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitPageWithSpans(1, "Hello world", &.{}, &.{
         .{ .text = "Hello", .bbox = .{ 72, 720, 100, 732 }, .font_size = 12 },
@@ -892,7 +892,7 @@ test "PR-18: emitPageWithSpans appends spans:[] with bbox + font_size" {
 
 test "PR-18: emitPageWithSpans omits font_name when null but emits when set" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitPageWithSpans(1, "x", &.{}, &.{
         .{ .text = "x", .bbox = .{ 0, 0, 10, 10 }, .font_size = 12, .font_name = "Helvetica" },
@@ -903,7 +903,7 @@ test "PR-18: emitPageWithSpans omits font_name when null but emits when set" {
 
 test "PR-18: emitPageWithSpans handles empty spans array as []" {
     var buf: [1024]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitPageWithSpans(1, "no text", &.{}, &.{});
     const written = aw.buffered();
@@ -912,7 +912,7 @@ test "PR-18: emitPageWithSpans handles empty spans array as []" {
 
 test "PR-20: emitAnnotations basic shape (subtype + rect)" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitAnnotations(1, &.{
         .{ .subtype = "highlight", .rect = .{ 100, 200, 300, 220 } },
@@ -932,7 +932,7 @@ test "PR-20: emitAnnotations basic shape (subtype + rect)" {
 
 test "PR-20: emitAnnotations emits contents/author/modified when present" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitAnnotations(2, &.{
         .{
@@ -951,7 +951,7 @@ test "PR-20: emitAnnotations emits contents/author/modified when present" {
 
 test "PR-20: emitAnnotations with empty list still emits the record" {
     var buf: [1024]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitAnnotations(1, &.{});
     const written = aw.buffered();
@@ -960,7 +960,7 @@ test "PR-20: emitAnnotations with empty list still emits the record" {
 
 test "PR-19: emitImage emits page + bbox + pixel dims" {
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitImage(3, .{ .bbox = .{ 100, 500, 300, 650 }, .width_px = 200, .height_px = 150 });
     const written = aw.buffered();
@@ -975,7 +975,7 @@ test "PR-19: emitImage emits page + bbox + pixel dims" {
 
 test "PR-19: emitImage surfaces /Filter as encoding when set" {
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitImage(1, .{
         .bbox = .{ 0, 0, 100, 100 },
@@ -989,7 +989,7 @@ test "PR-19: emitImage surfaces /Filter as encoding when set" {
 
 test "PR-19 base64: emitImage emits payload_b64 when set" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitImage(2, .{
         .bbox = .{ 0, 0, 100, 100 },
@@ -1005,7 +1005,7 @@ test "PR-19 base64: emitImage emits payload_b64 when set" {
 
 test "PR-19 base64: emitImage emits null payload_b64 + warnings for unsupported filter" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     const ws: []const []const u8 = &.{"unsupported_filter:FlateDecode"};
     try env.emitImage(1, .{
@@ -1022,7 +1022,7 @@ test "PR-19 base64: emitImage emits null payload_b64 + warnings for unsupported 
 
 test "PR-19 metadata: emitImage omits payload_b64 field entirely" {
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitImage(1, .{
         .bbox = .{ 0, 0, 100, 100 },
@@ -1038,7 +1038,7 @@ test "PR-19 metadata: emitImage omits payload_b64 field entirely" {
 
 test "PR-21: emitStructTreeEmpty produces null root" {
     var buf: [1024]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitStructTreeEmpty();
     const written = aw.buffered();
@@ -1048,7 +1048,7 @@ test "PR-21: emitStructTreeEmpty produces null root" {
 
 test "PR-21: beginStructTreeRecord + write body + end emits well-formed JSON" {
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.beginStructTreeRecord();
     // Caller-controlled body — minimal hand-written tree.
@@ -1061,7 +1061,7 @@ test "PR-21: beginStructTreeRecord + write body + end emits well-formed JSON" {
 
 test "fatal record carries error kind + recoverable" {
     var buf: [1024]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "bad.pdf", FIXED_DOC_ID);
     try env.emitFatal(.{
         .kind = .encrypted,
@@ -1075,7 +1075,7 @@ test "fatal record carries error kind + recoverable" {
 
 test "chunk record emits pages array + tokens_est + break" {
     var buf: [1024]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitChunk(0, &.{ 0, 1, 2 }, "## Heading\n\ntext", 12, .section_heading);
     const written = aw.buffered();
@@ -1087,7 +1087,7 @@ test "chunk record emits pages array + tokens_est + break" {
 
 test "table cell with text is emitted with `text` field" {
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "menu.pdf", FIXED_DOC_ID);
     try env.emitTable(.{
         .page = 2,
@@ -1109,7 +1109,7 @@ test "table cell with text is emitted with `text` field" {
 
 test "table record emits page + engine + cell grid + confidence" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "menu.pdf", FIXED_DOC_ID);
     try env.emitTable(.{
         .page = 3,
@@ -1138,7 +1138,7 @@ test "table record emits page + engine + cell grid + confidence" {
 
 test "form record emits fields array with name, type, value, rect" {
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "form.pdf", FIXED_DOC_ID);
     try env.emitForm(&.{
         .{ .name = "guest_name", .value = "L. Fabre", .field_type = .text, .rect = .{ 100, 700, 300, 720 } },
@@ -1155,7 +1155,7 @@ test "form record emits fields array with name, type, value, rect" {
 
 test "links record emits per-page items with rect + uri/dest_page" {
     var buf: [2048]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitLinks(3, &.{
         .{ .rect = .{ 12.0, 200.0, 88.5, 215.5 }, .uri = "https://example.com/" },
@@ -1172,7 +1172,7 @@ test "links record emits per-page items with rect + uri/dest_page" {
 
 test "interrupted record carries signal number" {
     var buf: [1024]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitInterrupted(2);
     const written = aw.buffered();
@@ -1182,7 +1182,7 @@ test "interrupted record carries signal number" {
 
 test "emitSummary omits quality_flag when null (PR-11 default)" {
     var buf: [512]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitSummary(.{ .pages_emitted = 1, .bytes_emitted = 11, .warnings_count = 0, .elapsed_ms = 5 });
     const written = aw.buffered();
@@ -1191,7 +1191,7 @@ test "emitSummary omits quality_flag when null (PR-11 default)" {
 
 test "emitSummary emits quality_flag when set (PR-11 scanned)" {
     var buf: [512]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitSummary(.{
         .pages_emitted = 4,
@@ -1207,7 +1207,7 @@ test "emitSummary emits quality_flag when set (PR-11 scanned)" {
 // PR-17 [feat]: section record schema test.
 test "emitSection writes section_id, title, start_page, end_page" {
     var buf: [512]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitSection(0, "Introduction", 1, 4);
     const written = aw.buffered();
@@ -1220,7 +1220,7 @@ test "emitSection writes section_id, title, start_page, end_page" {
 
 test "emitSection escapes title with quotes and newlines" {
     var buf: [512]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitSection(7, "Tab\there\nand \"quotes\"", 5, 7);
     const written = aw.buffered();
@@ -1234,7 +1234,7 @@ test "emitSection escapes title with quotes and newlines" {
 
 test "every record is valid JSON Lines (one trailing newline, no embedded newlines)" {
     var buf: [4096]u8 = undefined;
-    var aw = std.io.Writer.fixed(&buf);
+    var aw = std.Io.Writer.fixed(&buf);
     var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
     try env.emitMeta(.{ .pages = 3, .encrypted = false });
     try env.emitPage(0, "hello\nworld", &.{});
