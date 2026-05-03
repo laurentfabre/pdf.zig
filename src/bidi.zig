@@ -483,6 +483,50 @@ fn applyL2(states: []const CharState, allocator: std.mem.Allocator) ![]usize {
     return order;
 }
 
+/// Take a UTF-8 buffer that may contain multiple `\n`-separated
+/// paragraphs, run each line through `process()` in turn, and return
+/// the concatenated result. Lines without any strong-RTL character are
+/// passed through byte-for-byte (cheap `containsRtl` pre-pass).
+///
+/// `\n` separators are preserved in the output. The final byte is also
+/// preserved exactly: input ending in `\n` produces output ending in
+/// `\n`; input not so ending does not.
+///
+/// Allocator-owned result.
+pub fn processLines(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) ![]u8 {
+    if (!containsRtl(text)) {
+        return allocator.dupe(u8, text);
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, text.len);
+
+    var start: usize = 0;
+    while (start < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        const line = text[start..nl];
+        if (containsRtl(line)) {
+            const reordered = try process(allocator, line, null);
+            defer allocator.free(reordered);
+            try out.appendSlice(allocator, reordered);
+        } else {
+            try out.appendSlice(allocator, line);
+        }
+        if (nl < text.len) {
+            try out.append(allocator, '\n');
+            start = nl + 1;
+        } else {
+            start = text.len;
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 /// Public entry point: take a UTF-8 logical-order paragraph and return
 /// an allocated UTF-8 visual-order paragraph.
 ///
@@ -770,4 +814,238 @@ test "process: digits adjacent to Hebrew preserved as LTR run" {
     const out = try process(allocator, logical, null);
     defer allocator.free(out);
     try std.testing.expectEqualStrings(expected, out);
+}
+
+// ---------------------------------------------------------------------------
+// Hand-curated UAX #9 spec coverage (W1–W7, N1–N2, I1–I2, L1–L2).
+//
+// The PR body documents the rationale: full BidiTest.txt conformance
+// is out of scope; these cases are picked to exercise each rule's
+// effect on representative input.
+// ---------------------------------------------------------------------------
+
+test "spec W1: NSM after Hebrew letter inherits R" {
+    const allocator = std.testing.allocator;
+    // <05D0> (R) + <05B7> (NSM, Hebrew patah). NSM should resolve to R
+    // and reverse with the letter under L2.
+    const logical = "\u{05D0}\u{05B7}";
+    const expected = "\u{05B7}\u{05D0}";
+    const out = try process(allocator, logical, null);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "spec W1: NSM at sor takes paragraph direction" {
+    const allocator = std.testing.allocator;
+    // NSM as the first character of a paragraph — sor is L (default
+    // base direction), so the NSM resolves to L and the output stays
+    // logical-order.
+    const logical = "\u{05B7}A";
+    const out = try process(allocator, logical, null);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(logical, out);
+}
+
+test "spec W2: EN preceded by AL → AN" {
+    // Direct unit on the resolution table — feeding through process
+    // would also implicitly verify W2, but locking the class transition
+    // here keeps regressions on the rule itself loud.
+    var states = [_]CharState{
+        .{ .cp = 0x0623, .byte_off = 0, .byte_len = 2, .class = .AL, .level = 0 },
+        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .level = 0 },
+    };
+    applyW2(&states, 1);
+    try std.testing.expectEqual(BidiClass.AN, states[1].class);
+}
+
+test "spec W3: AL → R after weak resolution" {
+    var states = [_]CharState{
+        .{ .cp = 0x0627, .byte_off = 0, .byte_len = 2, .class = .AL, .level = 1 },
+    };
+    applyW3(&states);
+    try std.testing.expectEqual(BidiClass.R, states[0].class);
+}
+
+test "spec W4: single CS between two ENs → EN" {
+    // "1,2" → CS becomes EN.
+    var states = [_]CharState{
+        .{ .cp = '1', .byte_off = 0, .byte_len = 1, .class = .EN, .level = 0 },
+        .{ .cp = ',', .byte_off = 1, .byte_len = 1, .class = .CS, .level = 0 },
+        .{ .cp = '2', .byte_off = 2, .byte_len = 1, .class = .EN, .level = 0 },
+    };
+    applyW4(&states);
+    try std.testing.expectEqual(BidiClass.EN, states[1].class);
+}
+
+test "spec W5: ETs adjacent to EN absorbed" {
+    // "$ 9" — ET ($) preceding EN should become EN; whitespace stays.
+    var states = [_]CharState{
+        .{ .cp = '$', .byte_off = 0, .byte_len = 1, .class = .ET, .level = 0 },
+        .{ .cp = '9', .byte_off = 1, .byte_len = 1, .class = .EN, .level = 0 },
+    };
+    applyW5(&states);
+    try std.testing.expectEqual(BidiClass.EN, states[0].class);
+}
+
+test "spec W6: leftover ES/ET/CS → ON" {
+    // ET not adjacent to EN should fall through to ON via W6.
+    var states = [_]CharState{
+        .{ .cp = '$', .byte_off = 0, .byte_len = 1, .class = .ET, .level = 0 },
+        .{ .cp = 'A', .byte_off = 1, .byte_len = 1, .class = .L, .level = 0 },
+    };
+    applyW5(&states);
+    applyW6(&states);
+    try std.testing.expectEqual(BidiClass.ON, states[0].class);
+}
+
+test "spec W7: EN preceded by L → L" {
+    // "A 5" — EN preceded by L (with WS in between) becomes L.
+    var states = [_]CharState{
+        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .level = 0 },
+        .{ .cp = ' ', .byte_off = 1, .byte_len = 1, .class = .WS, .level = 0 },
+        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .level = 0 },
+    };
+    applyW7(&states, 0);
+    try std.testing.expectEqual(BidiClass.L, states[2].class);
+}
+
+test "spec N1: neutrals between two Rs adopt R" {
+    // <05D0> ' ' <05D1> — WS between two Hebrew letters takes R per N1.
+    var states = [_]CharState{
+        .{ .cp = 0x05D0, .byte_off = 0, .byte_len = 2, .class = .R, .level = 1 },
+        .{ .cp = ' ', .byte_off = 2, .byte_len = 1, .class = .WS, .level = 1 },
+        .{ .cp = 0x05D1, .byte_off = 3, .byte_len = 2, .class = .R, .level = 1 },
+    };
+    applyN1N2(&states, 1);
+    try std.testing.expectEqual(BidiClass.R, states[1].class);
+}
+
+test "spec N2: bracketing-mismatch neutrals take embedding direction" {
+    // L ' ' R — strong types differ, paragraph_level=0 (LTR), so the
+    // WS resolves to L per N2.
+    var states = [_]CharState{
+        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .level = 0 },
+        .{ .cp = ' ', .byte_off = 1, .byte_len = 1, .class = .WS, .level = 0 },
+        .{ .cp = 0x05D0, .byte_off = 2, .byte_len = 2, .class = .R, .level = 0 },
+    };
+    applyN1N2(&states, 0);
+    try std.testing.expectEqual(BidiClass.L, states[1].class);
+}
+
+test "spec I1: at even level, R += 1, AN/EN += 2" {
+    var states = [_]CharState{
+        .{ .cp = 0x05D0, .byte_off = 0, .byte_len = 2, .class = .R, .level = 0 },
+        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .EN, .level = 0 },
+        .{ .cp = '5', .byte_off = 3, .byte_len = 1, .class = .AN, .level = 0 },
+    };
+    applyI1I2(&states);
+    try std.testing.expectEqual(@as(u8, 1), states[0].level);
+    try std.testing.expectEqual(@as(u8, 2), states[1].level);
+    try std.testing.expectEqual(@as(u8, 2), states[2].level);
+}
+
+test "spec I2: at odd level, L/EN/AN += 1" {
+    var states = [_]CharState{
+        .{ .cp = 'A', .byte_off = 0, .byte_len = 1, .class = .L, .level = 1 },
+        .{ .cp = '5', .byte_off = 1, .byte_len = 1, .class = .EN, .level = 1 },
+        .{ .cp = '5', .byte_off = 2, .byte_len = 1, .class = .AN, .level = 1 },
+    };
+    applyI1I2(&states);
+    try std.testing.expectEqual(@as(u8, 2), states[0].level);
+    try std.testing.expectEqual(@as(u8, 2), states[1].level);
+    try std.testing.expectEqual(@as(u8, 2), states[2].level);
+}
+
+test "spec L1: trailing whitespace resets to paragraph level" {
+    const allocator = std.testing.allocator;
+    // RTL paragraph with trailing space — the space should sit at the
+    // visual right edge after L1+L2 (it's level-0 inside an otherwise
+    // level-1 paragraph), but since the paragraph base is RTL the
+    // visual order still places it at the visual *left* of the content
+    // because L2 reverses level-≥1 runs. The logical order
+    // "<05D0><05D1> " becomes visual " <05D1><05D0>".
+    const logical = "\u{05D0}\u{05D1} ";
+    const expected = " \u{05D1}\u{05D0}";
+    const out = try process(allocator, logical, null);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "spec L2: nested-level reversal of mixed RTL+LTR run" {
+    const allocator = std.testing.allocator;
+    // LTR base ("Hello "<05D0><05D1>"!") — the Hebrew run is the only
+    // level-1 segment and reverses; "Hello " and "!" stay LTR.
+    const logical = "Hello \u{05D0}\u{05D1}!";
+    const expected = "Hello \u{05D1}\u{05D0}!";
+    const out = try process(allocator, logical, null);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "spec L1: paragraph separator resets" {
+    // B characters are at paragraph level after L1 regardless of the
+    // weak class evolution.
+    const allocator = std.testing.allocator;
+    const logical = "\u{05D0}\u{05D1}\n";
+    const out = try process(allocator, logical, null);
+    defer allocator.free(out);
+    // Trailing '\n' is preserved in place at paragraph level (0 from
+    // perspective of the L2 reversal — but here the paragraph_level is
+    // 1 because first strong is Hebrew). The Hebrew letters reverse;
+    // the '\n' (B) sits at level 1 (post-L1 reset to paragraph_level=1)
+    // so it goes through the level-1 reversal too. End result: the '\n'
+    // ends up at the visual left edge.
+    try std.testing.expectEqualStrings("\n\u{05D1}\u{05D0}", out);
+}
+
+test "processLines: multi-line input preserves separators" {
+    const allocator = std.testing.allocator;
+    const input = "Hello\n\u{05D0}\u{05D1}\nWorld";
+    const out = try processLines(allocator, input);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("Hello\n\u{05D1}\u{05D0}\nWorld", out);
+}
+
+test "processLines: pure-LTR is byte-identical" {
+    const allocator = std.testing.allocator;
+    const input = "Line1\nLine2\nLine3";
+    const out = try processLines(allocator, input);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(input, out);
+}
+
+test "processLines: trailing newline preserved" {
+    const allocator = std.testing.allocator;
+    const out = try processLines(allocator, "\u{05D0}\u{05D1}\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("\u{05D1}\u{05D0}\n", out);
+}
+
+test "spec W7: digits before Hebrew word in LTR paragraph stay LTR" {
+    const allocator = std.testing.allocator;
+    // Paragraph base: LTR (first strong is 'A'). "A 5 <05D0><05D1>" —
+    // the digit 5 is preceded (looking back through weak types) by L,
+    // so W7 fires and EN→L. The Hebrew word reverses in its own run.
+    const logical = "A 5 \u{05D0}\u{05D1}";
+    const expected = "A 5 \u{05D1}\u{05D0}";
+    const out = try process(allocator, logical, null);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "spec mixed: Arabic + European digits + ASCII brackets" {
+    const allocator = std.testing.allocator;
+    // Paragraph base: RTL (first strong is Arabic).
+    // <0623><0628> "(" "12" ")" — digits get level 2 (preceded by AL,
+    // promoted to AN by W2; AN at even level 0 would += 2 but this
+    // paragraph is level-1, so AN += 1 → level 2). The brackets are
+    // neutrals between AN runs; per N1 they take strong R (since AN
+    // counts as R for N1). At level 1 they reverse.
+    const logical = "\u{0623}\u{0628}(12)";
+    const out = try process(allocator, logical, null);
+    defer allocator.free(out);
+    // Visual: ")" "12" "(" then the Arabic letters reversed.
+    // Brackets resolve to R via N1 → level 1; digits at level 2
+    // (preserve internal order under L2's pairwise reversal).
+    try std.testing.expectEqualStrings(")12(\u{0628}\u{0623}", out);
 }
