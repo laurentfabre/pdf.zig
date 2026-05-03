@@ -2541,6 +2541,14 @@ pub fn generateBidiPdf(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return pdf.toOwnedSlice();
 }
 
+// PR-16 fixture provenance: the expected_visual strings below are
+// computed from UAX #9 §L2 by hand, not captured from a pymupdf4llm
+// reference. The PR description says the acceptance gate is
+// "character-for-character with pymupdf4llm" — this is enforced
+// out-of-band by the project bake-off (`docs/alfred-bakeoff-report.md`)
+// rather than in CI, because vendoring a pinned pymupdf4llm reference
+// would mean adding a Python dependency to the Zig test runner.
+// Codex P1 noted this gap. Tracking issue: see PR #49 comments.
 test "generateBidiPdf: Hebrew round-trips through extractText in visual order" {
     const allocator = std.testing.allocator;
     const root = @import("root.zig");

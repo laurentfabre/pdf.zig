@@ -47,6 +47,18 @@ pub const MarkdownOptions = struct {
     /// scan and a `dupe` per line; the cost is small and consistent
     /// with the user's expectation that round-tripped text matches
     /// the original logical order.
+    ///
+    /// Caveat (Codex P2, deferred): the markdown renderer assembles
+    /// each line by sorting spans by `x0` ascending within a row
+    /// (see `spansToElements` below). For real-world RTL PDFs whose
+    /// producer emits one Tj per glyph cluster in visual order, this
+    /// pre-sort already places spans in visual order — running bidi
+    /// over that input double-reorders. The CLI's `extractText` path
+    /// is unaffected because it bidi-processes the content stream
+    /// output line-by-line, not after geometric x-sorting.
+    /// A proper fix needs logical-order span recovery (e.g. honour
+    /// the producer's Tj sequence), which is a Stage-2 task —
+    /// tracked alongside the BidiTest.txt conformance work.
     apply_bidi: bool = true,
 };
 
