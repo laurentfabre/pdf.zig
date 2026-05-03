@@ -169,10 +169,40 @@ def evaluate(entry: dict, *, skip_real: bool) -> Optional[FileResult]:
     )
 
 
+def _common_byte_prefix(a: bytes, b: bytes) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 def summarise(results: list[FileResult]) -> dict:
-    by_lang: dict[str, dict] = {lang: {"total": 0, "horizontal": 0, "horizontal_match": 0, "vertical": 0, "vertical_warned": 0} for lang in LANGS}
+    """Aggregate by language.
+
+    Tracks two distinct gates:
+      - horizontal_char_match: NFC + whitespace-collapsed equality (per-file).
+        Tolerant of trailing-newline / page-feed differences that
+        pymupdf4llm and pdf.zig disagree on.
+      - horizontal_byte_ratio: aggregate prefix-match bytes over reference
+        bytes across all horizontal files in the language. This is the
+        true ``≥95% byte-identical text`` invariant from architecture.md
+        §11: it weights by file size and refuses to let whitespace
+        collapse hide regressions.
+    """
+    bucket_keys = {
+        "total": 0,
+        "horizontal": 0,
+        "horizontal_char_match": 0,
+        "horizontal_byte_match": 0,
+        "horizontal_ref_bytes": 0,
+        "horizontal_prefix_bytes": 0,
+        "vertical": 0,
+        "vertical_warned": 0,
+    }
+    by_lang: dict[str, dict] = {lang: dict(bucket_keys) for lang in LANGS}
     for r in results:
-        bucket = by_lang.setdefault(r.lang, {"total": 0, "horizontal": 0, "horizontal_match": 0, "vertical": 0, "vertical_warned": 0})
+        bucket = by_lang.setdefault(r.lang, dict(bucket_keys))
         bucket["total"] += 1
         if r.wmode == 1:
             bucket["vertical"] += 1
@@ -181,7 +211,14 @@ def summarise(results: list[FileResult]) -> dict:
         else:
             bucket["horizontal"] += 1
             if r.char_identical:
-                bucket["horizontal_match"] += 1
+                bucket["horizontal_char_match"] += 1
+            if r.byte_identical:
+                bucket["horizontal_byte_match"] += 1
+            if r.reference_text is not None:
+                ref_b = r.reference_text.encode("utf-8")
+                got_b = r.pdfzig_text.encode("utf-8")
+                bucket["horizontal_ref_bytes"] += len(ref_b)
+                bucket["horizontal_prefix_bytes"] += _common_byte_prefix(got_b, ref_b)
     return by_lang
 
 
@@ -204,16 +241,22 @@ def main() -> int:
 
     by_lang = summarise(results)
 
-    # Acceptance: ≥ 95 % char-identity on horizontal pages per language.
-    horizontal_match_rate: dict[str, float] = {}
+    # Acceptance gate: ≥ 95 % byte-identical text per language. The byte
+    # ratio is the architecture.md §11 invariant; the char-identity rate
+    # is reported alongside as a softer signal but does not gate.
+    horizontal_byte_ratio: dict[str, float] = {}
+    horizontal_char_match_rate: dict[str, float] = {}
     failed_langs: list[str] = []
     for lang, b in by_lang.items():
         if b["horizontal"] == 0:
-            horizontal_match_rate[lang] = float("nan")
+            horizontal_byte_ratio[lang] = float("nan")
+            horizontal_char_match_rate[lang] = float("nan")
             continue
-        rate = b["horizontal_match"] / b["horizontal"]
-        horizontal_match_rate[lang] = rate
-        if rate < TARGET_BYTE_EQUALITY:
+        ref_total = b["horizontal_ref_bytes"]
+        byte_ratio = (b["horizontal_prefix_bytes"] / ref_total) if ref_total > 0 else 0.0
+        horizontal_byte_ratio[lang] = byte_ratio
+        horizontal_char_match_rate[lang] = b["horizontal_char_match"] / b["horizontal"]
+        if byte_ratio < TARGET_BYTE_EQUALITY:
             failed_langs.append(lang)
 
     # Acceptance: every vertical-writing PDF must trigger the warning.
@@ -223,12 +266,13 @@ def main() -> int:
             vertical_failures.append(r.id)
 
     summary = {
-        "version": 1,
+        "version": 2,
         "n_files": len(results),
         "by_lang": by_lang,
-        "horizontal_match_rate": horizontal_match_rate,
+        "horizontal_byte_ratio": horizontal_byte_ratio,
+        "horizontal_char_match_rate": horizontal_char_match_rate,
         "vertical_failures": vertical_failures,
-        "target_horizontal_match_rate": TARGET_BYTE_EQUALITY,
+        "target_horizontal_byte_ratio": TARGET_BYTE_EQUALITY,
         "results": [asdict(r) for r in results],
     }
 
@@ -237,11 +281,21 @@ def main() -> int:
     out_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"\nwrote {out_path}")
-    print("=== Per-language horizontal char-identity ===")
+    print("=== Per-language horizontal byte-identity (gate) ===")
     for lang in LANGS:
-        rate = horizontal_match_rate.get(lang, float("nan"))
+        rate = horizontal_byte_ratio.get(lang, float("nan"))
         rate_pct = "n/a" if rate != rate else f"{rate * 100:.1f}%"
-        print(f"  {lang}: {rate_pct} ({by_lang[lang]['horizontal_match']}/{by_lang[lang]['horizontal']})")
+        b = by_lang[lang]
+        print(
+            f"  {lang}: {rate_pct} "
+            f"({b['horizontal_prefix_bytes']}/{b['horizontal_ref_bytes']} bytes, "
+            f"{b['horizontal_byte_match']}/{b['horizontal']} files exact)"
+        )
+    print("=== Per-language horizontal char-identity (informational) ===")
+    for lang in LANGS:
+        rate = horizontal_char_match_rate.get(lang, float("nan"))
+        rate_pct = "n/a" if rate != rate else f"{rate * 100:.1f}%"
+        print(f"  {lang}: {rate_pct} ({by_lang[lang]['horizontal_char_match']}/{by_lang[lang]['horizontal']})")
     print("=== Vertical-writing warning emission ===")
     for lang in LANGS:
         b = by_lang[lang]
@@ -249,7 +303,7 @@ def main() -> int:
 
     rc = 0
     if failed_langs:
-        print(f"\nFAIL: languages below {TARGET_BYTE_EQUALITY * 100:.0f}% horizontal match: {failed_langs}", file=sys.stderr)
+        print(f"\nFAIL: languages below {TARGET_BYTE_EQUALITY * 100:.0f}% byte-identical: {failed_langs}", file=sys.stderr)
         rc = 1
     if vertical_failures:
         print(f"FAIL: vertical-writing PDFs missing warning: {vertical_failures}", file=sys.stderr)
