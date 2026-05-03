@@ -1985,6 +1985,45 @@ test "PR-15: synthetic CJK Identity-V flags vertical writing" {
     try std.testing.expect(doc.pageHasVerticalWriting(0));
 }
 
+test "PR-15: CMap-stream /WMode 1 def triggers vertical detection" {
+    // Codex review: the predefined Identity-V path was tested but the
+    // CMap-stream /WMode parser path in src/encoding.zig wasn't pinned.
+    // Build a fixture that keeps Encoding=/Identity-H but injects
+    // /WMode 1 def into the ToUnicode CMap stream — pageHasVerticalWriting
+    // must still return true.
+    const allocator = std.testing.allocator;
+    const cps = [_]u21{ '中', '文' };
+    const pdf_data = try testpdf.generateCjkCidFontPdfEx(
+        allocator,
+        &cps,
+        .cmap_stream_wmode,
+    );
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    try std.testing.expect(doc.pageHasVerticalWriting(0));
+}
+
+test "PR-15: horizontal fixture with no /WMode in CMap stays wmode 0" {
+    // Negative control for the test above: same fixture builder, .horizontal
+    // source, must NOT trigger the vertical-writing flag.
+    const allocator = std.testing.allocator;
+    const cps = [_]u21{ '中', '文' };
+    const pdf_data = try testpdf.generateCjkCidFontPdfEx(
+        allocator,
+        &cps,
+        .horizontal,
+    );
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    try std.testing.expect(!doc.pageHasVerticalWriting(0));
+}
+
 test "PR-15: every fixture in the synthetic CJK corpus parses + opens" {
     const allocator = std.testing.allocator;
     for (testpdf.cjk_fixtures) |fixture| {

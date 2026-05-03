@@ -2436,10 +2436,45 @@ pub fn generateLatticeWithTextPdf(allocator: std.mem.Allocator) ![]u8 {
 /// codepoint is BMP (≤ 0xFFFF — no surrogate pairs in the synthetic
 /// corpus). `wmode == 1` selects /Identity-V instead of /Identity-H.
 /// The expected extracted text (UTF-8) round-trips the input.
+/// PR-15 follow-up: how the synthetic CJK fixture should advertise its
+/// vertical-writing intent. Codex review surfaced that we only had
+/// coverage for the predefined `*-V` path; the CMap-stream
+/// `/WMode 1 def` path was untested even though both feed the same
+/// `Encoding.wmode` field.
+pub const CjkWModeSource = enum {
+    /// `wmode = 0`: Encoding=/Identity-H, no `/WMode` in the ToUnicode CMap.
+    horizontal,
+    /// `wmode = 1` advertised via Encoding=/Identity-V (predefined name).
+    encoding_identity_v,
+    /// `wmode = 1` advertised via `/WMode 1 def` inside a ToUnicode CMap
+    /// stream while Encoding stays /Identity-H. Pins the
+    /// CMap-stream `/WMode` parse path in `src/encoding.zig`.
+    cmap_stream_wmode,
+};
+
+pub fn generateCjkCidFontPdfEx(
+    allocator: std.mem.Allocator,
+    codepoints: []const u21,
+    source: CjkWModeSource,
+) ![]u8 {
+    const enc_is_v = source == .encoding_identity_v;
+    const cmap_wmode_one = source == .cmap_stream_wmode;
+    return generateCjkCidFontPdfImpl(allocator, codepoints, enc_is_v, cmap_wmode_one);
+}
+
 pub fn generateCjkCidFontPdf(
     allocator: std.mem.Allocator,
     codepoints: []const u21,
     wmode: u8,
+) ![]u8 {
+    return generateCjkCidFontPdfImpl(allocator, codepoints, wmode == 1, false);
+}
+
+fn generateCjkCidFontPdfImpl(
+    allocator: std.mem.Allocator,
+    codepoints: []const u21,
+    encoding_is_vertical: bool,
+    cmap_wmode_one: bool,
 ) ![]u8 {
     var pdf = std.Io.Writer.Allocating.init(allocator);
     errdefer pdf.deinit();
@@ -2480,7 +2515,7 @@ pub fn generateCjkCidFontPdf(
     try writer.writeAll("\nendstream\nendobj\n");
 
     // Object 5: Type0 Font (Composite CID font).
-    const enc_name: []const u8 = if (wmode == 1) "/Identity-V" else "/Identity-H";
+    const enc_name: []const u8 = if (encoding_is_vertical) "/Identity-V" else "/Identity-H";
     const obj5_offset = pdf.written().len;
     try writer.writeAll("5 0 obj\n");
     try writer.writeAll("<< /Type /Font /Subtype /Type0 /BaseFont /CJKFixture\n");
@@ -2507,6 +2542,10 @@ pub fn generateCjkCidFontPdf(
     try mw.writeAll("/CIDInit /ProcSet findresource begin\n");
     try mw.writeAll("12 dict begin\nbegincmap\n");
     try mw.writeAll("/CMapType 2 def\n/CMapName /CJKFixtureCMap def\n");
+    if (cmap_wmode_one) {
+        // Pins the CMap-stream `/WMode` parse path in src/encoding.zig.
+        try mw.writeAll("/WMode 1 def\n");
+    }
     try mw.writeAll("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
 
     // Deduplicate codepoints so the CMap is well-formed (bfchar
