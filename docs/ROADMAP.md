@@ -2,10 +2,13 @@
 title: "pdf.zig — Roadmap"
 project: pdf.zig
 status: active
-current: v1.2-rc3
-next: v1.2-rc4
+current: v1.5 writer Tier-2 (post-0.16 migration)
+next: PR-15 + PR-16 merge → v1.4 / v1.5 GA cut
 default_branch: main
 toolchain: zig 0.16.0
+in_flight:
+  - "PR #49 — PR-16 Bidi UAX #9 (non-draft, ready)"
+  - "PR #50 — PR-15 CJK harness + 30-PDF real-corpus manifest (draft)"
 loop:
   pick: "/next-pr"
   review_fix: "/pr-cycle"
@@ -17,7 +20,7 @@ tags:
 aliases:
   - "pdf.zig roadmap"
 created: 2026-04-27
-updated: 2026-04-27
+updated: 2026-05-04
 ---
 
 > [!abstract] What this file is

@@ -69,6 +69,32 @@ binary_kb:: 647
 
 ---
 
+## 🔖 Checkpoint — 2026-05-04
+
+> [!info]+ Resume-from-this-row state for a fresh Claude session
+> If you're loading this project cold, this is what's true on `main` right now.
+
+**Toolchain**: Zig 0.16.0 (default `zig` via ZVM at `~/.zvm/bin/zig`). 0.15.2 no longer compiles this tree. Sibling Pro/ projects (`ft/`, `c7/`, `Izabella/`, `ziglib/`) keep their own 0.15 pin via `/opt/homebrew/opt/zig@0.15/bin/zig`; pdf.zig is hermetically isolated (no `build.zig.zon`, no path imports). See AGENTS.md §Architecture/Native-Layer for the full toolchain note.
+
+**Shipped since the v1.2-rc3 dossier above**:
+- **PR-17** — `kind:"section"` long-PDF checkpoint records (#30-era; ticked).
+- **PR-18** — citation-grade `--bboxes` flag (#30, ticked via #31).
+- **PR-19** — image extraction. Three modes shipped: `--images` metadata-only (#35), `encoding` field surfaced from /Filter (#38), `--images=base64` payload (#39), `--images=path` file-extraction with safe filename derivation (#41); ticked via #42.
+- **PR-20** — non-/Link annotation extraction (#33, ticked via #34).
+- **PR-21** — PDF/UA structure-tree NDJSON output via `--struct-tree` (#36, ticked via #37).
+- **0.16 migration** (#45) — all stdlib API drift handled across 25 source + 8 docs/CI files. 1378 → 1743 tests now passing on 0.16.
+- **PR-W4** — FlateDecode content-stream compression (#47, ticked via #48). `DocumentBuilder.compress_content_streams = true` opts in; level-6 zlib-wrapped DEFLATE; 256 B threshold; 50 %+ size reduction on 3-page text PDFs.
+
+**In flight (open PRs)**:
+- **#49 — PR-16 Bidi (UAX #9 Level-1)** — non-draft, all-green CI. 1051 LOC `src/bidi.zig` covering W1–W7, N1–N2, I1–I2, L1–L2; wired into `Document.extractText` + markdown renderer; Hebrew + Arabic synthesized fixtures via `testpdf.generateBidiPdf`. **Decision pending**: merge as-is.
+- **#50 — PR-15 CJK harness + vertical-writing warning + 30-PDF real-corpus manifest** — DRAFT, all-green CI. Synthetic fixtures land 100 % byte-equality (ja / zh / ko); `vertical_writing_unsupported` warning emits cleanly; `audit/cjk-pdfs/real-corpus-manifest.json` lists 30 IA-sourced PDFs (10 ja + 10 zh + 10 ko, all PD-Mark / CC0); `audit/fetch_real_corpus.py` downloads on demand (license-cross-check enforced; PDFs gitignored). 30/30 pass `--dry-run`. **Decision pending**: ready-for-review + merge as partial PR (real-corpus byte-equality numbers still need a one-time local run via the fetcher), OR fetch-and-baseline first.
+
+**Roadmap remaining (post-#49 + #50)**: PR-5/6/7 dataset materialisation (Python audit work; bandwidth + license review), PR-10 v1.2 GA tag, PR-12/13 OCR shell-out (depends on `ocrmypdf` / `tesseract` external binaries), PR-14 encrypted-with-empty-password retry (blocked: parser has no decryption infrastructure — RC4/AES-128/AES-256 standard-security-handler is a separate substantial project).
+
+**Worktrees** (in `.claude/worktrees/`): two — `agent-aebad913a98ee387d` for PR #49, `agent-a71b066a29f7e1bd6` for PR #50. Both safe to remove once their PRs merge: `git worktree remove .claude/worktrees/agent-...` and the agents will not need them again.
+
+---
+
 ## Quick navigation
 
 | Section | What's there |
