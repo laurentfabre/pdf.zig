@@ -39,10 +39,12 @@ const std = @import("std");
 const pdf_writer = @import("pdf_writer.zig");
 const pdf_document = @import("pdf_document.zig");
 const font_embedder = @import("font_embedder.zig");
+const image_writer = @import("image_writer.zig");
 
 pub const BuiltinFont = pdf_document.BuiltinFont;
 pub const NUM_BUILTIN_FONTS = pdf_document.NUM_BUILTIN_FONTS;
 pub const EmbeddedFontRef = font_embedder.EmbeddedFontRef;
+pub const ImageRef = image_writer.ImageRef;
 
 /// Opaque, non-zero font handle. The wrapped u32 is the index into
 /// `ResourceRegistry.fonts`; callers MUST treat it as opaque.
@@ -62,8 +64,13 @@ pub const FontEntry = union(enum) {
     embedded: *EmbeddedFontRef,
 };
 
-/// Reserved for PR-W8 — currently no constructors.
-pub const ImageEntry = struct {};
+/// PR-W8 [feat]: registry-owned image XObject. The registry owns
+/// `bytes` (the encoded payload) so the page's content stream can
+/// reference the image by handle, the image survives until document
+/// `write()`, and the original caller buffer can be freed early.
+pub const ImageEntry = struct {
+    ref: ImageRef,
+};
 
 /// Reserved for PR-W10 — currently no constructors.
 pub const ColorSpaceEntry = struct {};
@@ -72,10 +79,11 @@ pub const ColorSpaceEntry = struct {};
 /// the lookup is a stack array, not a hash map.
 const builtin_dedupe_size: usize = NUM_BUILTIN_FONTS;
 
-/// Inline storage for a resource name (`/F<index>`). 12 bytes covers
-/// `/F` + any u32 in decimal (max 10 digits); +1 for the length byte.
+/// Inline storage for a resource name (`/F<index>` / `/Im<index>`).
+/// 16 bytes covers `/Im` + any u32 in decimal (max 10 digits) + a
+/// little headroom; the +1 length byte is separate.
 const NameBuf = struct {
-    bytes: [12]u8,
+    bytes: [16]u8,
     len: u8,
 
     fn slice(self: *const NameBuf) []const u8 {
@@ -85,6 +93,13 @@ const NameBuf = struct {
     fn fromIndex(idx: u32) NameBuf {
         var nb: NameBuf = .{ .bytes = undefined, .len = 0 };
         const written = std.fmt.bufPrint(&nb.bytes, "/F{d}", .{idx}) catch unreachable;
+        nb.len = @intCast(written.len);
+        return nb;
+    }
+
+    fn fromImageIndex(idx: u32) NameBuf {
+        var nb: NameBuf = .{ .bytes = undefined, .len = 0 };
+        const written = std.fmt.bufPrint(&nb.bytes, "/Im{d}", .{idx}) catch unreachable;
         nb.len = @intCast(written.len);
         return nb;
     }
@@ -122,6 +137,13 @@ pub const ResourceRegistry = struct {
     /// slice valid until `deinit`.
     font_names: std.ArrayList(NameBuf),
 
+    /// PR-W8: indirect-object number per image handle, parallel to
+    /// `images`. Mirrors `font_obj_nums`.
+    image_obj_nums: std.ArrayList(u32),
+    /// PR-W8: pre-formatted resource names (`/Im0`, `/Im1`, …),
+    /// parallel to `images`.
+    image_names: std.ArrayList(NameBuf),
+
     /// Builtin-font dedup. `[idx]` is the `FontHandle` previously
     /// allocated for `BuiltinFont(idx)`, or null if not yet seen.
     /// Stack-allocated; bounded by `NUM_BUILTIN_FONTS` (14).
@@ -142,6 +164,8 @@ pub const ResourceRegistry = struct {
             .color_spaces = .empty,
             .font_obj_nums = .empty,
             .font_names = .empty,
+            .image_obj_nums = .empty,
+            .image_names = .empty,
         };
     }
 
@@ -153,10 +177,17 @@ pub const ResourceRegistry = struct {
             .embedded => |ref| ref.deinit(),
         };
         self.fonts.deinit(self.allocator);
+        // PR-W8: free the per-image owned byte buffers before the
+        // ArrayList drops the entries.
+        for (self.images.items) |*entry| {
+            self.allocator.free(entry.ref.bytes);
+        }
         self.images.deinit(self.allocator);
         self.color_spaces.deinit(self.allocator);
         self.font_obj_nums.deinit(self.allocator);
         self.font_names.deinit(self.allocator);
+        self.image_obj_nums.deinit(self.allocator);
+        self.image_names.deinit(self.allocator);
     }
 
     /// Register a builtin font. Idempotent: registering the same
@@ -302,6 +333,75 @@ pub const ResourceRegistry = struct {
         std.debug.assert(idx < self.fonts.items.len);
         return self.fonts.items[idx];
     }
+
+    // ---------- PR-W8 image surface ----------
+
+    /// Register an image XObject. Takes ownership of `ref.bytes` —
+    /// caller passes a fresh buffer (typically the document copies
+    /// the source bytes before calling). Each registration produces
+    /// a new handle; identical bytes registered twice yield two
+    /// distinct image objects (no dedup at this layer — small images
+    /// rarely repeat, and dedup needs hash-table state we'd rather
+    /// not pay for in steady state).
+    pub fn registerImage(self: *ResourceRegistry, ref: ImageRef) Error!ImageHandle {
+        if (self.object_nums_assigned) return error.ObjectNumbersAlreadyAssigned;
+
+        const new_idx: u32 = @intCast(self.images.items.len);
+        try self.images.append(self.allocator, .{ .ref = ref });
+        errdefer _ = self.images.pop();
+        try self.image_obj_nums.append(self.allocator, 0);
+        errdefer _ = self.image_obj_nums.pop();
+        try self.image_names.append(self.allocator, NameBuf.fromImageIndex(new_idx));
+        errdefer _ = self.image_names.pop();
+
+        return @enumFromInt(new_idx);
+    }
+
+    /// Stable resource name (`/Im0`, `/Im1`, …) keyed on handle index.
+    /// Lifetime matches the registry.
+    pub fn imageResourceName(self: *const ResourceRegistry, handle: ImageHandle) []const u8 {
+        const idx = @intFromEnum(handle);
+        std.debug.assert(idx < self.images.items.len);
+        return self.image_names.items[idx].slice();
+    }
+
+    /// Number of registered images.
+    pub fn imageCount(self: *const ResourceRegistry) usize {
+        return self.images.items.len;
+    }
+
+    /// Reserve one indirect-object number per image. Mirrors
+    /// `assignFontObjectNumbers`; called by `DocumentBuilder.write`
+    /// alongside it.
+    pub fn assignImageObjectNumbers(self: *ResourceRegistry, w: *pdf_writer.Writer) !void {
+        // Mirror of font flow: registry is frozen for FONT registration
+        // by `object_nums_assigned`, but images may be assigned in the
+        // same pass — so we simply flip the same flag here.
+        for (self.images.items, 0..) |*entry, i| {
+            const num = try w.allocObjectNum();
+            self.image_obj_nums.items[i] = num;
+            entry.ref.obj_num = num;
+        }
+    }
+
+    /// Indirect-object number for an image handle.
+    pub fn imageObjectNum(self: *const ResourceRegistry, handle: ImageHandle) u32 {
+        const idx = @intFromEnum(handle);
+        std.debug.assert(idx < self.image_obj_nums.items.len);
+        const num = self.image_obj_nums.items[idx];
+        std.debug.assert(num != 0);
+        return num;
+    }
+
+    /// Emit one indirect object per registered image. Calls
+    /// `image_writer.emitImageObject` for each entry (DCT / raw /
+    /// flate dispatch lives there).
+    pub fn emitImageObjects(self: *const ResourceRegistry, w: *pdf_writer.Writer) !void {
+        for (self.images.items) |*entry| {
+            std.debug.assert(entry.ref.obj_num != 0);
+            try image_writer.emitImageObject(&entry.ref, w);
+        }
+    }
 };
 
 // ---------- tests ----------
@@ -349,6 +449,35 @@ test "registerBuiltinFont rejects after assignFontObjectNumbers" {
         error.ObjectNumbersAlreadyAssigned,
         reg.registerBuiltinFont(.times_roman),
     );
+}
+
+test "registerImage assigns /Im<idx> names sequentially" {
+    var reg = ResourceRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+    const bytes_a = try std.testing.allocator.dupe(u8, "AAA");
+    const ref_a: ImageRef = .{
+        .bytes = bytes_a,
+        .encoding = .dct_passthrough,
+        .width = 1,
+        .height = 1,
+        .bits_per_component = 8,
+        .colorspace = .rgb,
+    };
+    const h0 = try reg.registerImage(ref_a);
+    const bytes_b = try std.testing.allocator.dupe(u8, "BBB");
+    const ref_b: ImageRef = .{
+        .bytes = bytes_b,
+        .encoding = .dct_passthrough,
+        .width = 1,
+        .height = 1,
+        .bits_per_component = 8,
+        .colorspace = .gray,
+    };
+    const h1 = try reg.registerImage(ref_b);
+    try std.testing.expect(h0 != h1);
+    try std.testing.expectEqualStrings("/Im0", reg.imageResourceName(h0));
+    try std.testing.expectEqualStrings("/Im1", reg.imageResourceName(h1));
+    try std.testing.expectEqual(@as(usize, 2), reg.imageCount());
 }
 
 test "FailingAllocator: registerBuiltinFont leaks nothing on OOM" {

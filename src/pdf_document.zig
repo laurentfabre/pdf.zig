@@ -41,11 +41,15 @@ const pdf_writer = @import("pdf_writer.zig");
 const pdf_resources = @import("pdf_resources.zig");
 const font_embedder = @import("font_embedder.zig");
 const truetype = @import("truetype.zig");
+const image_writer = @import("image_writer.zig");
+const jpeg_meta = @import("jpeg_meta.zig");
 
 pub const FontHandle = pdf_resources.FontHandle;
 pub const ImageHandle = pdf_resources.ImageHandle;
 pub const ColorSpaceHandle = pdf_resources.ColorSpaceHandle;
 pub const ResourceRegistry = pdf_resources.ResourceRegistry;
+pub const ImageColorSpace = image_writer.ColorSpace;
+pub const ImageEncoding = image_writer.Encoding;
 
 /// Number of children per `/Pages` node. ISO 32000-1 doesn't mandate
 /// a specific fan-out; values between 8 and 32 are typical. 10 keeps
@@ -160,6 +164,9 @@ pub const PageBuilder = struct {
     /// dedupe'd via linear scan on insert (page font sets are small —
     /// typical PDFs use 1–4 fonts per page).
     font_handles: std.ArrayList(FontHandle),
+    /// PR-W8: per-page image handles referenced by `drawImage`. Same
+    /// dedup-on-insert shape as `font_handles`.
+    image_handles: std.ArrayList(ImageHandle),
     /// Document-wide resource registry. Borrowed from the owning
     /// `DocumentBuilder`; not owned. Pages MUST NOT outlive the
     /// document.
@@ -187,6 +194,7 @@ pub const PageBuilder = struct {
             .resources_raw = .empty,
             .extras_raw = .empty,
             .font_handles = .empty,
+            .image_handles = .empty,
             .registry = registry,
             .allocator = allocator,
         };
@@ -197,6 +205,7 @@ pub const PageBuilder = struct {
         self.resources_raw.deinit(self.allocator);
         self.extras_raw.deinit(self.allocator);
         self.font_handles.deinit(self.allocator);
+        self.image_handles.deinit(self.allocator);
     }
 
     /// Append `handle` to this page's font set if not already present.
@@ -246,6 +255,55 @@ pub const PageBuilder = struct {
         const handle = try self.registry.registerBuiltinFont(font);
         try self.rememberFontHandle(handle);
         return self.registry.fontResourceName(handle);
+    }
+
+    fn rememberImageHandle(self: *PageBuilder, handle: ImageHandle) !void {
+        for (self.image_handles.items) |h| if (h == handle) return;
+        try self.image_handles.append(self.allocator, handle);
+    }
+
+    /// PR-W8 [feat]: place a registered image at `(x, y)` (PDF user
+    /// space, origin = bottom-left) scaled to `(w_pt, h_pt)` points.
+    /// Emits the standard PDF idiom for placing an XObject image:
+    /// `q W H 0 0 X Y cm /Im<n> Do Q`. The CTM (`cm` operator) here is
+    /// `[w_pt 0 0 h_pt x y]` because /Image XObjects are defined on a
+    /// 1×1 unit square — the cm scales it to the requested size and
+    /// translates to (x, y).
+    pub fn drawImage(
+        self: *PageBuilder,
+        x: f64,
+        y: f64,
+        w_pt: f64,
+        h_pt: f64,
+        handle: ImageHandle,
+    ) !void {
+        if (!std.math.isFinite(x) or !std.math.isFinite(y) or
+            !std.math.isFinite(w_pt) or !std.math.isFinite(h_pt))
+        {
+            return error.InvalidReal;
+        }
+        if (w_pt <= 0 or h_pt <= 0) return error.InvalidReal;
+
+        try self.rememberImageHandle(handle);
+        const name = self.registry.imageResourceName(handle);
+
+        var scratch_aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer scratch_aw.deinit();
+        const ws = &scratch_aw.writer;
+
+        try ws.writeAll("q ");
+        try writeRealTo(ws, w_pt);
+        try ws.writeAll(" 0 0 ");
+        try writeRealTo(ws, h_pt);
+        try ws.writeAll(" ");
+        try writeRealTo(ws, x);
+        try ws.writeAll(" ");
+        try writeRealTo(ws, y);
+        try ws.writeAll(" cm ");
+        try ws.writeAll(name);
+        try ws.writeAll(" Do Q\n");
+
+        try self.content.appendSlice(self.allocator, scratch_aw.written());
     }
 
     /// PR-W3 [feat]: emit `BT /Fk size Tf x y Td (escaped) Tj ET`
@@ -557,6 +615,60 @@ pub const DocumentBuilder = struct {
         return self.registry.registerEmbeddedFont(ref);
     }
 
+    /// PR-W8 [feat]: register a JPEG image. `bytes` is the full JPEG
+    /// stream (must start with `FF D8`); we parse the SOF for geometry
+    /// + colorspace, then duplicate the bytes into the registry so the
+    /// caller can free the original buffer immediately. The image is
+    /// emitted with `/Filter /DCTDecode` and the bytes are NOT
+    /// re-encoded — passthrough preserves all JPEG metadata.
+    pub fn addImageJpeg(self: *DocumentBuilder, bytes: []const u8) !ImageHandle {
+        if (self.written) return error.DocumentAlreadyWritten;
+        const meta = try jpeg_meta.parse(bytes);
+        const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+        const ref: image_writer.ImageRef = .{
+            .bytes = owned,
+            .encoding = .dct_passthrough,
+            .width = meta.width,
+            .height = meta.height,
+            .bits_per_component = meta.bits_per_component,
+            .colorspace = switch (meta.colorspace) {
+                .gray => .gray,
+                .rgb => .rgb,
+                .cmyk => .cmyk,
+            },
+        };
+        return self.registry.registerImage(ref);
+    }
+
+    /// PR-W8 [feat]: register a raw-sample image. `bytes` must hold
+    /// exactly `width * height * components(colorspace) * bits/8`
+    /// row-major sample bytes; we don't validate the size. If
+    /// `compress` is true the bytes are run through DEFLATE
+    /// (`/Filter /FlateDecode`); otherwise emitted uncompressed.
+    pub fn addImageRaw(
+        self: *DocumentBuilder,
+        bytes: []const u8,
+        width: u32,
+        height: u32,
+        cs: ImageColorSpace,
+        bits: u8,
+        compress: bool,
+    ) !ImageHandle {
+        if (self.written) return error.DocumentAlreadyWritten;
+        const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+        const ref: image_writer.ImageRef = .{
+            .bytes = owned,
+            .encoding = if (compress) .raw_flate else .raw_uncompressed,
+            .width = width,
+            .height = height,
+            .bits_per_component = bits,
+            .colorspace = cs,
+        };
+        return self.registry.registerImage(ref);
+    }
+
     /// PR-W6 [feat]: register an auxiliary indirect object with its
     /// payload set in one shot. Returns the allocated object number
     /// for the caller to use in refs. Equivalent to `reserveAuxiliary
@@ -637,6 +749,13 @@ pub const DocumentBuilder = struct {
         // resource BEFORE any leaf /Page references them. Pages emit
         // `/Font << /F0 N 0 R … >>` referencing these numbers, so the
         // numbers must be stable by the time leaf pages are written.
+        //
+        // PR-W8: image assignment first because the registry's freeze
+        // flag (`object_nums_assigned`) flips inside the font call —
+        // running images after fonts would trip
+        // `error.ObjectNumbersAlreadyAssigned` in
+        // `assignImageObjectNumbers`'s mirror check.
+        try self.registry.assignImageObjectNumbers(w);
         try self.registry.assignFontObjectNumbers(w);
 
         // Pull pre-allocated page/content nums into a local array for
@@ -727,6 +846,8 @@ pub const DocumentBuilder = struct {
         // referenced by every page that called `markFontUsed` /
         // `drawText` for the matching `BuiltinFont`.
         try self.registry.emitFontObjects(w);
+        // PR-W8: image XObjects.
+        try self.registry.emitImageObjects(w);
 
         // 3f. Auxiliary objects (outline items, annotations, form
         // fields, page-label trees, …). Each payload is the complete
@@ -798,18 +919,35 @@ fn emitAutoResources(
     registry: *const ResourceRegistry,
     page: *const PageBuilder,
 ) !void {
-    if (page.font_handles.items.len == 0) {
+    const has_fonts = page.font_handles.items.len > 0;
+    const has_images = page.image_handles.items.len > 0;
+    if (!has_fonts and !has_images) {
         try w.writeRaw("<< >>");
         return;
     }
-    try w.writeRaw("<< /Font << ");
-    for (page.font_handles.items) |handle| {
-        try w.writeRaw(registry.fontResourceName(handle));
-        try w.writeRaw(" ");
-        try w.writeRef(registry.fontObjectNum(handle), 0);
-        try w.writeRaw(" ");
+    try w.writeRaw("<< ");
+    if (has_fonts) {
+        try w.writeRaw("/Font << ");
+        for (page.font_handles.items) |handle| {
+            try w.writeRaw(registry.fontResourceName(handle));
+            try w.writeRaw(" ");
+            try w.writeRef(registry.fontObjectNum(handle), 0);
+            try w.writeRaw(" ");
+        }
+        try w.writeRaw(">>");
     }
-    try w.writeRaw(">> >>");
+    if (has_images) {
+        if (has_fonts) try w.writeRaw(" ");
+        try w.writeRaw("/XObject << ");
+        for (page.image_handles.items) |handle| {
+            try w.writeRaw(registry.imageResourceName(handle));
+            try w.writeRaw(" ");
+            try w.writeRef(registry.imageObjectNum(handle), 0);
+            try w.writeRaw(" ");
+        }
+        try w.writeRaw(">>");
+    }
+    try w.writeRaw(" >>");
 }
 
 /// Release all `Tree`-owned slices: `internal_node_objs`,
