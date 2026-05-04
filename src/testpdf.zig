@@ -55,7 +55,7 @@ pub fn generateTJPdf(allocator: std.mem.Allocator) ![]u8 {
     var doc = document.DocumentBuilder.init(allocator);
     defer doc.deinit();
     const page = try doc.addPage(.{ 0, 0, 612, 792 });
-    const f = page.markFontUsed(.helvetica);
+    const f = try page.markFontUsed(.helvetica);
     var content_buf: [128]u8 = undefined;
     const content = try std.fmt.bufPrint(
         &content_buf,
@@ -268,7 +268,7 @@ pub fn generateSuperscriptPdf(allocator: std.mem.Allocator) ![]u8 {
     var doc = document.DocumentBuilder.init(allocator);
     defer doc.deinit();
     const page = try doc.addPage(.{ 0, 0, 612, 792 });
-    const f = page.markFontUsed(.helvetica);
+    const f = try page.markFontUsed(.helvetica);
     var content_buf: [512]u8 = undefined;
     const content = try std.fmt.bufPrint(
         &content_buf,

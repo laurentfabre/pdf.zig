@@ -38,6 +38,12 @@
 
 const std = @import("std");
 const pdf_writer = @import("pdf_writer.zig");
+const pdf_resources = @import("pdf_resources.zig");
+
+pub const FontHandle = pdf_resources.FontHandle;
+pub const ImageHandle = pdf_resources.ImageHandle;
+pub const ColorSpaceHandle = pdf_resources.ColorSpaceHandle;
+pub const ResourceRegistry = pdf_resources.ResourceRegistry;
 
 /// Number of children per `/Pages` node. ISO 32000-1 doesn't mandate
 /// a specific fan-out; values between 8 and 32 are typical. 10 keeps
@@ -94,11 +100,16 @@ pub const BuiltinFont = enum(u4) {
         return self != .symbol and self != .zapf_dingbats;
     }
 
-    /// PR-W6.1 [feat]: resource name as it appears in the auto-emitted
-    /// `/Resources/Font` dict. Matches the `/F<index>` form that
-    /// `emitAutoResources` writes — callers injecting raw content
-    /// streams (TJ, Tm) via `page.appendContent` must use this exact
-    /// name in their `Tf` operator. Also used by `markFontUsed`.
+    /// PR-W6.1 [feat] / PR-W11 [refactor]: legacy enum→name mapping.
+    ///
+    /// **Deprecated.** As of PR-W11 the resource name is assigned by
+    /// the document-wide `ResourceRegistry` based on registration
+    /// order, NOT by the BuiltinFont enum value. Use
+    /// `page.markFontUsed(font)` (which returns the live name) or
+    /// `registry.fontResourceName(handle)` instead. This method is
+    /// retained only as a stable mapping for callers that still rely
+    /// on the Tier-1 fixed mapping; it does NOT match what the writer
+    /// actually emits.
     pub fn resourceName(self: BuiltinFont) []const u8 {
         return switch (self) {
             .helvetica => "/F0",
@@ -129,10 +140,11 @@ pub const PageBuilder = struct {
     content: std.ArrayList(u8),
     /// Raw bytes that make up the `/Resources` dict body, e.g.
     /// `"<< /Font << /F1 5 0 R >> >>"`. When non-empty, this fully
-    /// overrides the auto-emitted resources from `fonts_used`. When
-    /// empty AND `fonts_used` has any true entry, `write` synthesises
-    /// a `/Resources << /Font << /Fk << ...inline Type 1... >> >> >>`
-    /// dict on the fly. When both empty, emits `<< >>`.
+    /// overrides the auto-emitted resources synthesised from the
+    /// per-page `font_handles` set. When empty AND `font_handles` is
+    /// non-empty, `write` synthesises a `/Resources << /Font << /Fk
+    /// N 0 R … >> >>` dict referencing the shared font objects in the
+    /// document-level `ResourceRegistry`. When both empty, emits `<< >>`.
     resources_raw: std.ArrayList(u8),
     /// PR-W6 [feat]: extra raw bytes spliced into the leaf `/Page`
     /// dict between `/Resources` and `/Contents`. Used for `/Annots`,
@@ -140,10 +152,16 @@ pub const PageBuilder = struct {
     /// well-formed PDF tokens (must start with `/<Name>` and round-trip
     /// through the parser).
     extras_raw: std.ArrayList(u8),
-    /// PR-W3 [feat]: which BuiltinFont indices were referenced by
-    /// `drawText` on this page. The /Resources dict is auto-built
-    /// from this set during `write`.
-    fonts_used: [NUM_BUILTIN_FONTS]bool = @splat(false),
+    /// PR-W11 [refactor]: per-page set of `FontHandle`s referenced by
+    /// `drawText` / `markFontUsed`. Replaces the Tier-1 `fonts_used:
+    /// [14]bool`. Bounded by `registry.fontCount()`; we keep the list
+    /// dedupe'd via linear scan on insert (page font sets are small —
+    /// typical PDFs use 1–4 fonts per page).
+    font_handles: std.ArrayList(FontHandle),
+    /// Document-wide resource registry. Borrowed from the owning
+    /// `DocumentBuilder`; not owned. Pages MUST NOT outlive the
+    /// document.
+    registry: *ResourceRegistry,
     /// Allocator used for `content` + `resources_raw`. Set by the
     /// owning DocumentBuilder via `init`.
     allocator: std.mem.Allocator,
@@ -156,12 +174,18 @@ pub const PageBuilder = struct {
     /// Allocated alongside `obj_num`.
     content_obj_num: u32 = 0,
 
-    fn init(allocator: std.mem.Allocator, media_box: [4]f64) PageBuilder {
+    fn init(
+        allocator: std.mem.Allocator,
+        registry: *ResourceRegistry,
+        media_box: [4]f64,
+    ) PageBuilder {
         return .{
             .media_box = media_box,
             .content = .empty,
             .resources_raw = .empty,
             .extras_raw = .empty,
+            .font_handles = .empty,
+            .registry = registry,
             .allocator = allocator,
         };
     }
@@ -170,6 +194,15 @@ pub const PageBuilder = struct {
         self.content.deinit(self.allocator);
         self.resources_raw.deinit(self.allocator);
         self.extras_raw.deinit(self.allocator);
+        self.font_handles.deinit(self.allocator);
+    }
+
+    /// Append `handle` to this page's font set if not already present.
+    /// Linear scan is fine — typical pages reference a handful of
+    /// fonts.
+    fn rememberFontHandle(self: *PageBuilder, handle: FontHandle) !void {
+        for (self.font_handles.items) |h| if (h == handle) return;
+        try self.font_handles.append(self.allocator, handle);
     }
 
     pub fn appendContent(self: *PageBuilder, bytes: []const u8) !void {
@@ -201,15 +234,16 @@ pub const PageBuilder = struct {
         return self.obj_num;
     }
 
-    /// PR-W6.1 [feat]: register `font` in this page's auto-resources
-    /// set and return its resource name (`/F0`..`/F13`) for use in a
-    /// content-stream `Tf` operator. Use this when you need to call
-    /// `appendContent` with a hand-written content stream and want
-    /// the auto-emitted `/Resources/Font` dict to define the font
-    /// name your stream references.
-    pub fn markFontUsed(self: *PageBuilder, font: BuiltinFont) []const u8 {
-        self.fonts_used[@intFromEnum(font)] = true;
-        return font.resourceName();
+    /// PR-W6.1 [feat] / PR-W11 [refactor]: register `font` with the
+    /// document's `ResourceRegistry` (deduplicating across pages) and
+    /// record the returned handle on this page. Returns the resource
+    /// name (`/F<index>`) for use in a content-stream `Tf` operator.
+    /// The slice is owned by the registry and stable for the lifetime
+    /// of the document.
+    pub fn markFontUsed(self: *PageBuilder, font: BuiltinFont) ![]const u8 {
+        const handle = try self.registry.registerBuiltinFont(font);
+        try self.rememberFontHandle(handle);
+        return self.registry.fontResourceName(handle);
     }
 
     /// PR-W3 [feat]: emit `BT /Fk size Tf x y Td (escaped) Tj ET`
@@ -247,7 +281,9 @@ pub const PageBuilder = struct {
         }
         if (filtered.items.len == 0) return; // no-op for empty / all-dropped text
 
-        self.fonts_used[@intFromEnum(font)] = true;
+        const handle = try self.registry.registerBuiltinFont(font);
+        try self.rememberFontHandle(handle);
+        const font_name = self.registry.fontResourceName(handle);
 
         // Compose into a scratch buffer first so a partial-failure
         // doesn't leave the page's content stream half-written.
@@ -255,7 +291,7 @@ pub const PageBuilder = struct {
         defer scratch_aw.deinit();
         const ws = &scratch_aw.writer;
 
-        try ws.print("BT {s} ", .{font.resourceName()});
+        try ws.print("BT {s} ", .{font_name});
         try writeRealTo(ws, size);
         try ws.writeAll(" Tf ");
         try writeRealTo(ws, x);
@@ -311,6 +347,11 @@ pub const DocumentBuilder = struct {
     /// `written` to true; further mutating calls return
     /// `error.DocumentAlreadyWritten`.
     writer: pdf_writer.Writer,
+    /// PR-W11 [refactor]: document-wide resource registry. Pages hold
+    /// opaque handles; the registry assigns indirect-object numbers
+    /// at write-time and emits one font/image/colorspace object per
+    /// entry, shared across all pages.
+    registry: ResourceRegistry,
     /// Pages in document order. Each pointer is heap-owned; freed by
     /// `deinit`.
     pages: std.ArrayList(*PageBuilder),
@@ -350,6 +391,7 @@ pub const DocumentBuilder = struct {
         return .{
             .allocator = allocator,
             .writer = pdf_writer.Writer.init(allocator),
+            .registry = ResourceRegistry.init(allocator),
             .pages = .empty,
             .aux_objects = .empty,
             .info_payload = .empty,
@@ -367,6 +409,7 @@ pub const DocumentBuilder = struct {
         self.aux_objects.deinit(self.allocator);
         self.info_payload.deinit(self.allocator);
         self.catalog_extras_raw.deinit(self.allocator);
+        self.registry.deinit();
         self.writer.deinit();
     }
 
@@ -383,7 +426,7 @@ pub const DocumentBuilder = struct {
         const content_num = try self.writer.allocObjectNum();
         const page = try self.allocator.create(PageBuilder);
         errdefer self.allocator.destroy(page);
-        page.* = PageBuilder.init(self.allocator, media_box);
+        page.* = PageBuilder.init(self.allocator, &self.registry, media_box);
         page.obj_num = page_num;
         page.content_obj_num = content_num;
         try self.pages.append(self.allocator, page);
@@ -466,6 +509,12 @@ pub const DocumentBuilder = struct {
 
         const catalog = try w.allocObjectNum();
 
+        // PR-W11: reserve one indirect-object number per registered
+        // resource BEFORE any leaf /Page references them. Pages emit
+        // `/Font << /F0 N 0 R … >>` referencing these numbers, so the
+        // numbers must be stable by the time leaf pages are written.
+        try self.registry.assignFontObjectNumbers(w);
+
         // Pull pre-allocated page/content nums into a local array for
         // buildBalancedTree (which expects a slice of page nums).
         const page_obj_nums = try self.allocator.alloc(u32, num_pages);
@@ -523,7 +572,7 @@ pub const DocumentBuilder = struct {
             if (page.resources_raw.items.len > 0) {
                 try w.writeRaw(page.resources_raw.items);
             } else {
-                try emitAutoResources(w, page);
+                try emitAutoResources(w, &self.registry, page);
             }
             if (page.extras_raw.items.len > 0) {
                 try w.writeRaw(" ");
@@ -549,7 +598,13 @@ pub const DocumentBuilder = struct {
             try w.endObject();
         }
 
-        // 3e. Auxiliary objects (outline items, annotations, form
+        // 3e. PR-W11: shared resource objects (fonts, then images and
+        // colorspaces in W7/W8/W10). Emitted once per registry entry,
+        // referenced by every page that called `markFontUsed` /
+        // `drawText` for the matching `BuiltinFont`.
+        try self.registry.emitFontObjects(w);
+
+        // 3f. Auxiliary objects (outline items, annotations, form
         // fields, page-label trees, …). Each payload is the complete
         // dict / stream body — emitted verbatim between obj/endobj.
         // A reserved-but-unfilled aux object emits as `<< >>` so the
@@ -561,7 +616,7 @@ pub const DocumentBuilder = struct {
             try w.endObject();
         }
 
-        // 3f. /Info dict (optional).
+        // 3g. /Info dict (optional).
         if (self.info_obj_num) |info_num| {
             try w.beginObject(info_num, 0);
             try w.writeRaw(self.info_payload.items);
@@ -604,29 +659,31 @@ const Tree = struct {
     };
 };
 
-/// PR-W3 [feat]: synthesise the page's `/Resources` dict from
-/// `fonts_used`. If no fonts were touched, emits `<< >>`.
-fn emitAutoResources(w: *pdf_writer.Writer, page: *const PageBuilder) !void {
-    var any_font: bool = false;
-    for (page.fonts_used) |used| if (used) {
-        any_font = true;
-        break;
-    };
-    if (!any_font) {
+/// PR-W11 [refactor]: synthesise the page's `/Resources` dict by
+/// listing the fonts the page actually uses, each one referencing the
+/// shared font indirect-object emitted by the `ResourceRegistry`. If
+/// the page touched no fonts, emits `<< >>`.
+///
+/// Inheritance strategy: per-page minimal dict referencing shared
+/// font objects (one indirect-object per font, document-wide). See
+/// `pdf_resources.zig` module doc for the rationale (`/Parent`-based
+/// `/Resources` inheritance is legal but less robust against quirky
+/// readers).
+fn emitAutoResources(
+    w: *pdf_writer.Writer,
+    registry: *const ResourceRegistry,
+    page: *const PageBuilder,
+) !void {
+    if (page.font_handles.items.len == 0) {
         try w.writeRaw("<< >>");
         return;
     }
     try w.writeRaw("<< /Font << ");
-    for (page.fonts_used, 0..) |used, idx| {
-        if (!used) continue;
-        const font: BuiltinFont = @enumFromInt(idx);
-        try w.writeRaw(font.resourceName());
-        try w.writeRaw(" << /Type /Font /Subtype /Type1 /BaseFont /");
-        try w.writeRaw(font.baseFontName());
-        if (font.usesWinAnsi()) {
-            try w.writeRaw(" /Encoding /WinAnsiEncoding");
-        }
-        try w.writeRaw(" >> ");
+    for (page.font_handles.items) |handle| {
+        try w.writeRaw(registry.fontResourceName(handle));
+        try w.writeRaw(" ");
+        try w.writeRef(registry.fontObjectNum(handle), 0);
+        try w.writeRaw(" ");
     }
     try w.writeRaw(">> >>");
 }
@@ -891,7 +948,9 @@ test "drawText empty-after-filter is a no-op (no BT/ET emitted)" {
     // All bytes outside [0x20, 0x7e] for Helvetica.
     try page.drawText(50, 600, .helvetica, 10, "\xff\xfe\xfd");
     try std.testing.expectEqual(@as(usize, 0), page.content.items.len);
-    try std.testing.expect(!page.fonts_used[@intFromEnum(BuiltinFont.helvetica)]);
+    // PR-W11: empty-after-filter must not register the font on this
+    // page — the page would otherwise carry a useless /Font entry.
+    try std.testing.expectEqual(@as(usize, 0), page.font_handles.items.len);
 }
 
 test "drawText rejects nonfinite coords / size" {
@@ -915,11 +974,16 @@ test "auto-resources emits /Font dict with all used builtins" {
     try page.drawText(50, 660, .courier_bold, 12, "c");
     const bytes = try doc.write();
     defer allocator.free(bytes);
-    // Each font must appear via its BaseFont name + /Encoding (WinAnsi).
+    // PR-W11: each font now appears as a SHARED indirect object;
+    // /BaseFont strings live on those indirect objects, not inside
+    // each page's /Resources.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/BaseFont /Helvetica") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/BaseFont /Times-Roman") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/BaseFont /Courier-Bold") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/Encoding /WinAnsiEncoding") != null);
+    // The page's /Resources now references the shared objects via
+    // `/Fk N 0 R` rather than inlining the font dicts.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Font << /F0 ") != null);
 }
 
 test "auto-resources skips /Encoding for Symbol/Dingbats" {
@@ -932,7 +996,9 @@ test "auto-resources skips /Encoding for Symbol/Dingbats" {
     defer allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/BaseFont /Symbol") != null);
     // Symbol's font dict should NOT carry a /WinAnsiEncoding ref —
-    // its uses its own native encoding.
+    // it uses its own native encoding. PR-W11: the dict now lives in
+    // a shared indirect object, but the same scope-of-search assertion
+    // applies (find /BaseFont /Symbol, look forward to the next `>>`).
     const symbol_pos = std.mem.indexOf(u8, bytes, "/BaseFont /Symbol").?;
     const close_pos = std.mem.indexOfPos(u8, bytes, symbol_pos, ">>").?;
     const sym_dict = bytes[symbol_pos..close_pos];
@@ -1489,10 +1555,11 @@ test "PageBuilder.objNum is stable for cross-references" {
 }
 
 test "PageBuilder.markFontUsed name matches auto-resources output" {
-    // Codex r1 P3: the font→resource-name mapping appears in
-    // `BuiltinFont.resourceName`, `drawText`, and `emitAutoResources`.
-    // This test pins them together — if any of the three drift, this
-    // test fails before strict-consumer fixtures break in the wild.
+    // PR-W11 [refactor]: the font→resource-name mapping is now owned
+    // by `ResourceRegistry.fontResourceName` and consumed by both
+    // `drawText` (for the `Tf` operator) and `emitAutoResources` (for
+    // the per-page /Resources dict). This test pins them together —
+    // if either side drifts, strict-consumer fixtures will break.
     const allocator = std.testing.allocator;
     inline for (.{
         BuiltinFont.helvetica,
@@ -1504,15 +1571,24 @@ test "PageBuilder.markFontUsed name matches auto-resources output" {
         var doc = DocumentBuilder.init(allocator);
         defer doc.deinit();
         const page = try doc.addPage(.{ 0, 0, 612, 792 });
-        const f = page.markFontUsed(font);
+        const f = try page.markFontUsed(font);
         const bytes = try doc.write();
         defer allocator.free(bytes);
 
-        // The exact resource name appears in the /Resources/Font dict
-        // body (e.g. `/F0 << /Type /Font ...`).
-        var key_buf: [16]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buf, "{s} <<", .{f});
-        try std.testing.expect(std.mem.indexOf(u8, bytes, key) != null);
+        // PR-W11: the exact resource name appears in the per-page
+        // /Font dict referencing the shared font indirect object —
+        // `<resource_name> <obj_num> 0 R`.
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "{s} ", .{f});
+        const idx = std.mem.indexOf(u8, bytes, key) orelse return error.TestFailed;
+        // Following the name there must be `N 0 R`.
+        var rest = bytes[idx + key.len ..];
+        // Skip digits.
+        var n_end: usize = 0;
+        while (n_end < rest.len and std.ascii.isDigit(rest[n_end])) n_end += 1;
+        try std.testing.expect(n_end > 0);
+        try std.testing.expect(rest.len >= n_end + 4);
+        try std.testing.expectEqualStrings(" 0 R", rest[n_end .. n_end + 4]);
     }
 }
 
