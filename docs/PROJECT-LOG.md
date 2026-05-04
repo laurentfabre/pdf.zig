@@ -85,13 +85,16 @@ binary_kb:: 647
 - **0.16 migration** (#45) — all stdlib API drift handled across 25 source + 8 docs/CI files. 1378 → 1743 tests now passing on 0.16.
 - **PR-W4** — FlateDecode content-stream compression (#47, ticked via #48). `DocumentBuilder.compress_content_streams = true` opts in; level-6 zlib-wrapped DEFLATE; 256 B threshold; 50 %+ size reduction on 3-page text PDFs.
 
-**In flight (open PRs)**:
-- **#49 — PR-16 Bidi (UAX #9 Level-1)** — non-draft, all-green CI. 1051 LOC `src/bidi.zig` covering W1–W7, N1–N2, I1–I2, L1–L2; wired into `Document.extractText` + markdown renderer; Hebrew + Arabic synthesized fixtures via `testpdf.generateBidiPdf`. **Decision pending**: merge as-is.
-- **#50 — PR-15 CJK harness + vertical-writing warning + 30-PDF real-corpus manifest** — DRAFT, all-green CI. Synthetic fixtures land 100 % byte-equality (ja / zh / ko); `vertical_writing_unsupported` warning emits cleanly; `audit/cjk-pdfs/real-corpus-manifest.json` lists 30 IA-sourced PDFs (10 ja + 10 zh + 10 ko, all PD-Mark / CC0); `audit/fetch_real_corpus.py` downloads on demand (license-cross-check enforced; PDFs gitignored). 30/30 pass `--dry-run`. **Decision pending**: ready-for-review + merge as partial PR (real-corpus byte-equality numbers still need a one-time local run via the fetcher), OR fetch-and-baseline first.
+**Also shipped 2026-05-03/04 — Bidi + CJK + roadmap-tick**:
+- **#49 — PR-16 Bidi (UAX #9 Level-1)** (squash-merged): ~1051 LOC `src/bidi.zig` covering W1–W7, N1–N2, I1–I2, L1–L2. Wired into `Document.extractText` (and `extractAllText`, `extractTextFromFile`, `extractTextFromMemory`, capi, CLI, markdown renderer). Hebrew + Arabic synthesized fixtures via `testpdf.generateBidiPdf`. Codex review caught a P1 spec bug (L1 must read the BD1 *original* class, not the post-W/N mutated class) — fix folded with regression test. Final: 1751 tests pass.
+- **#50 — PR-15 CJK harness + 30-PDF real-corpus manifest** (squash-merged): synthetic 15-PDF fixture generator (5 ja + 5 zh + 5 ko, both writing modes), `vertical_writing_unsupported` warning emission gated on /WMode = 1 (CMap stream + Encoding paths), `audit/cjk-pdfs/real-corpus-manifest.json` listing 30 IA items (PD-Mark / CC0 / pre-1929), `audit/fetch_real_corpus.py` (license-cross-check, sha256, path-traversal-safe, PDF-magic sniff). Codex review caught P1 byte-aware quality gate + 3 P2 fetcher hardening + 1 P2 manifest correction — fixes folded. Final: 1436 tests pass; `--dry-run` 30/30 verifies.
+- **#52 — roadmap tick** (squash-merged): PR-15 + PR-16 marked shipped; ROADMAP frontmatter `current` / `next` bumped; `in_flight` block dropped.
 
-**Roadmap remaining (post-#49 + #50)**: PR-5/6/7 dataset materialisation (Python audit work; bandwidth + license review), PR-10 v1.2 GA tag, PR-12/13 OCR shell-out (depends on `ocrmypdf` / `tesseract` external binaries), PR-14 encrypted-with-empty-password retry (blocked: parser has no decryption infrastructure — RC4/AES-128/AES-256 standard-security-handler is a separate substantial project).
+**Roadmap state**: 27 of 33 items shipped (82 %). 6 remaining, all blocked or external: PR-5/6/7 dataset materialisation (audit-only; bandwidth + license review), PR-10 v1.2 GA tag (release process), PR-12/13 OCR shell-out (external `ocrmypdf` / `tesseract` deps), PR-14 encrypted-with-empty-password retry (blocked on parser-level decryption infra — RC4/AES-128/AES-256 standard-security-handler is a substantial separate project).
 
-**Worktrees** (in `.claude/worktrees/`): two — `agent-aebad913a98ee387d` for PR #49, `agent-a71b066a29f7e1bd6` for PR #50. Both safe to remove once their PRs merge: `git worktree remove .claude/worktrees/agent-...` and the agents will not need them again.
+**Resume hooks for the next session**:
+- Real CJK corpus run (one-time, ~500 MB download): `python3 audit/fetch_real_corpus.py` (or `--lang ja` to scope), then `python3 audit/v1_4_cjk_run.py` to gate against `pymupdf4llm`. PDFs gitignored under `audit/cjk-pdfs/real/*.pdf`.
+- Worktrees: cleaned up. Only `~/Projects/Pro/pdf.zig` (main checkout) remains.
 
 ---
 
