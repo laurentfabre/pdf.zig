@@ -38,9 +38,11 @@
 const std = @import("std");
 const pdf_writer = @import("pdf_writer.zig");
 const pdf_document = @import("pdf_document.zig");
+const font_embedder = @import("font_embedder.zig");
 
 pub const BuiltinFont = pdf_document.BuiltinFont;
 pub const NUM_BUILTIN_FONTS = pdf_document.NUM_BUILTIN_FONTS;
+pub const EmbeddedFontRef = font_embedder.EmbeddedFontRef;
 
 /// Opaque, non-zero font handle. The wrapped u32 is the index into
 /// `ResourceRegistry.fonts`; callers MUST treat it as opaque.
@@ -52,10 +54,12 @@ pub const ImageHandle = enum(u32) { _ };
 /// Reserved for PR-W10 (PDF/A sRGB ICC) — not yet exercised.
 pub const ColorSpaceHandle = enum(u32) { _ };
 
-/// Discriminated by the kind of font; embedded variants land in W7.
+/// PR-W7 [feat]: now extended with `embedded` variant. The embedded
+/// pointer is owned by the registry — `deinit` walks every entry and
+/// releases.
 pub const FontEntry = union(enum) {
     builtin: BuiltinFont,
-    // future: embedded: EmbeddedFontRef (W7 will fill this in)
+    embedded: *EmbeddedFontRef,
 };
 
 /// Reserved for PR-W8 — currently no constructors.
@@ -142,6 +146,12 @@ pub const ResourceRegistry = struct {
     }
 
     pub fn deinit(self: *ResourceRegistry) void {
+        // PR-W7: release every embedded-font ref. Builtin entries hold
+        // no heap state, so the union switch is short.
+        for (self.fonts.items) |entry| switch (entry) {
+            .builtin => {},
+            .embedded => |ref| ref.deinit(),
+        };
         self.fonts.deinit(self.allocator);
         self.images.deinit(self.allocator);
         self.color_spaces.deinit(self.allocator);
@@ -169,6 +179,41 @@ pub const ResourceRegistry = struct {
         return handle;
     }
 
+    /// PR-W7 [feat]: register an embedded TrueType font. Caller owns
+    /// `parsed` (the registry takes ownership of the
+    /// `EmbeddedFontRef` allocated for it). On error the
+    /// `EmbeddedFontRef` is deinit'd before returning so the caller
+    /// never sees a partially-registered ref.
+    pub fn registerEmbeddedFont(
+        self: *ResourceRegistry,
+        ref: *EmbeddedFontRef,
+    ) Error!FontHandle {
+        if (self.object_nums_assigned) {
+            ref.deinit();
+            return error.ObjectNumbersAlreadyAssigned;
+        }
+
+        const new_idx: u32 = @intCast(self.fonts.items.len);
+        self.fonts.append(self.allocator, .{ .embedded = ref }) catch |err| {
+            ref.deinit();
+            return err;
+        };
+        // If a later parallel-list append fails, both the popped slot
+        // AND the ref it carried must be released — otherwise the ref
+        // becomes orphaned (registry no longer references it; deinit
+        // walk skips it).
+        errdefer {
+            _ = self.fonts.pop();
+            ref.deinit();
+        }
+        try self.font_obj_nums.append(self.allocator, 0);
+        errdefer _ = self.font_obj_nums.pop();
+        try self.font_names.append(self.allocator, NameBuf.fromIndex(new_idx));
+        errdefer _ = self.font_names.pop();
+
+        return @enumFromInt(new_idx);
+    }
+
     /// Stable resource name (`/F0`, `/F1`, …) keyed on handle index.
     /// Collision-free across all handles. Returned slice is valid for
     /// the lifetime of the registry (backed by `font_names`).
@@ -184,9 +229,21 @@ pub const ResourceRegistry = struct {
     /// fail.
     pub fn assignFontObjectNumbers(self: *ResourceRegistry, w: *pdf_writer.Writer) !void {
         if (self.object_nums_assigned) return error.ObjectNumbersAlreadyAssigned;
-        for (self.fonts.items, 0..) |_, i| {
-            const num = try w.allocObjectNum();
-            self.font_obj_nums.items[i] = num;
+        for (self.fonts.items, 0..) |entry, i| {
+            switch (entry) {
+                .builtin => {
+                    const num = try w.allocObjectNum();
+                    self.font_obj_nums.items[i] = num;
+                },
+                .embedded => |ref| {
+                    // PR-W7: an embedded TT font costs 5 indirect
+                    // objects (Type0, CIDFontType2, FontDescriptor,
+                    // FontFile2, ToUnicode). The registry's
+                    // user-visible obj number is the Type0 wrapper.
+                    try font_embedder.assignObjectNumbers(ref, w);
+                    self.font_obj_nums.items[i] = font_embedder.fontResourceObjNum(ref);
+                },
+            }
         }
         self.object_nums_assigned = true;
     }
@@ -212,18 +269,24 @@ pub const ResourceRegistry = struct {
         for (self.fonts.items, 0..) |entry, i| {
             const obj_num = self.font_obj_nums.items[i];
             std.debug.assert(obj_num != 0);
-            try w.beginObject(obj_num, 0);
             switch (entry) {
                 .builtin => |bf| {
+                    try w.beginObject(obj_num, 0);
                     try w.writeRaw("<< /Type /Font /Subtype /Type1 /BaseFont /");
                     try w.writeRaw(bf.baseFontName());
                     if (bf.usesWinAnsi()) {
                         try w.writeRaw(" /Encoding /WinAnsiEncoding");
                     }
                     try w.writeRaw(" >>");
+                    try w.endObject();
+                },
+                .embedded => |ref| {
+                    // PR-W7: emit() opens its own beginObject blocks
+                    // (one each for the 5 indirect objects), so we do
+                    // NOT wrap it here.
+                    try font_embedder.emit(ref, w);
                 },
             }
-            try w.endObject();
         }
     }
 

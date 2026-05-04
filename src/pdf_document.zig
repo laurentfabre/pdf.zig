@@ -39,6 +39,8 @@
 const std = @import("std");
 const pdf_writer = @import("pdf_writer.zig");
 const pdf_resources = @import("pdf_resources.zig");
+const font_embedder = @import("font_embedder.zig");
+const truetype = @import("truetype.zig");
 
 pub const FontHandle = pdf_resources.FontHandle;
 pub const ImageHandle = pdf_resources.ImageHandle;
@@ -322,6 +324,69 @@ pub const PageBuilder = struct {
 
         try self.content.appendSlice(self.allocator, scratch_aw.written());
     }
+
+    /// PR-W7 [feat]: emit `BT /Fk size Tf x y Td <HEX> Tj ET` for an
+    /// embedded TrueType font, where HEX is the big-endian sequence of
+    /// CIDs (= original glyph IDs). Codepoints with no glyph in the
+    /// font are silently dropped (Tier-1 behaviour). UTF-8 errors trip
+    /// `error.InvalidUtf8`.
+    ///
+    /// `font` must be a handle returned by
+    /// `DocumentBuilder.embedFontFromMemory` — calling this with a
+    /// builtin handle yields `error.NotAnEmbeddedFont`.
+    pub fn drawTextUtf8(
+        self: *PageBuilder,
+        x: f64,
+        y: f64,
+        font: FontHandle,
+        size: f64,
+        utf8: []const u8,
+    ) !void {
+        if (!std.math.isFinite(x) or !std.math.isFinite(y) or !std.math.isFinite(size)) {
+            return error.InvalidReal;
+        }
+        if (size <= 0) return error.InvalidReal;
+
+        const entry = self.registry.fontEntry(font);
+        const ref = switch (entry) {
+            .embedded => |r| r,
+            .builtin => return error.NotAnEmbeddedFont,
+        };
+
+        // Decode UTF-8 → CIDs and remember each codepoint for the
+        // subsetter. Empty / all-dropped text is a no-op.
+        var cids: std.ArrayList(u16) = .empty;
+        defer cids.deinit(self.allocator);
+        var view = (std.unicode.Utf8View.init(utf8) catch return error.InvalidUtf8).iterator();
+        while (view.nextCodepoint()) |cp| {
+            try ref.rememberCodepoint(cp);
+            const cid = ref.cidForCodepoint(cp);
+            if (cid == 0) continue;
+            try cids.append(self.allocator, cid);
+        }
+        if (cids.items.len == 0) return;
+
+        try self.rememberFontHandle(font);
+        const font_name = self.registry.fontResourceName(font);
+
+        var scratch_aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer scratch_aw.deinit();
+        const ws = &scratch_aw.writer;
+
+        try ws.print("BT {s} ", .{font_name});
+        try writeRealTo(ws, size);
+        try ws.writeAll(" Tf ");
+        try writeRealTo(ws, x);
+        try ws.writeAll(" ");
+        try writeRealTo(ws, y);
+        try ws.writeAll(" Td <");
+        for (cids.items) |cid| {
+            try ws.print("{x:0>4}", .{cid});
+        }
+        try ws.writeAll("> Tj ET\n");
+
+        try self.content.appendSlice(self.allocator, scratch_aw.written());
+    }
 };
 
 /// Tiny mirror of `pdf_writer.Writer.writeReal`: emit a finite f64
@@ -375,6 +440,14 @@ pub const DocumentBuilder = struct {
     /// Streams ≤256 B stay raw even when this flag is true — the zlib
     /// wrapper overhead would inflate them.
     compress_content_streams: bool = false,
+    /// PR-W7 [feat]: heap-allocated `ParsedFont` instances for embedded
+    /// TrueType fonts. The registry's `EmbeddedFontRef` borrows from
+    /// these; freeing happens here on `deinit` because parse() owns the
+    /// glyph-offsets allocation (the input bytes are caller-owned).
+    parsed_fonts: std.ArrayList(*truetype.ParsedFont),
+    /// PR-W7 [feat]: caller-owned font byte buffers, retained for the
+    /// life of the document so `parsed_fonts[i].raw` slices stay valid.
+    embedded_font_bytes: std.ArrayList([]u8),
 
     const AuxObject = struct {
         obj_num: u32,
@@ -396,6 +469,8 @@ pub const DocumentBuilder = struct {
             .aux_objects = .empty,
             .info_payload = .empty,
             .catalog_extras_raw = .empty,
+            .parsed_fonts = .empty,
+            .embedded_font_bytes = .empty,
         };
     }
 
@@ -410,6 +485,16 @@ pub const DocumentBuilder = struct {
         self.info_payload.deinit(self.allocator);
         self.catalog_extras_raw.deinit(self.allocator);
         self.registry.deinit();
+        // PR-W7: registry's deinit released EmbeddedFontRefs (borrowed
+        // ParsedFont). Now release the parsed fonts and their input
+        // bytes — last-out so registry pointers were valid above.
+        for (self.parsed_fonts.items) |pf| {
+            pf.deinit(self.allocator);
+            self.allocator.destroy(pf);
+        }
+        self.parsed_fonts.deinit(self.allocator);
+        for (self.embedded_font_bytes.items) |b| self.allocator.free(b);
+        self.embedded_font_bytes.deinit(self.allocator);
         self.writer.deinit();
     }
 
@@ -431,6 +516,45 @@ pub const DocumentBuilder = struct {
         page.content_obj_num = content_num;
         try self.pages.append(self.allocator, page);
         return page;
+    }
+
+    /// PR-W7 [feat]: embed a TrueType font from a byte buffer. The
+    /// document copies `bytes` (so the caller may free immediately)
+    /// and returns a `FontHandle` usable in `PageBuilder.drawTextUtf8`.
+    /// `name` is the PostScript name (e.g. "Monaco"); the writer
+    /// adds a 6-letter subset prefix automatically.
+    ///
+    /// Errors:
+    /// - `error.CffNotSupported` for OTTO/CFF fonts (TrueType outlines
+    ///   only in v1 — see `truetype.zig` scope notes).
+    /// - `error.UnsupportedCmap` if the font lacks a Format-4 BMP cmap.
+    pub fn embedFontFromMemory(
+        self: *DocumentBuilder,
+        bytes: []const u8,
+        name: []const u8,
+    ) !FontHandle {
+        if (self.written) return error.DocumentAlreadyWritten;
+        // 1. Copy bytes into doc-owned storage (must outlive ParsedFont).
+        const owned_bytes = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned_bytes);
+
+        // 2. Parse + heap-allocate the ParsedFont.
+        const pf = try self.allocator.create(truetype.ParsedFont);
+        errdefer self.allocator.destroy(pf);
+        pf.* = try truetype.parse(self.allocator, owned_bytes);
+        errdefer pf.deinit(self.allocator);
+
+        // 3. Track in document state.
+        try self.embedded_font_bytes.append(self.allocator, owned_bytes);
+        errdefer _ = self.embedded_font_bytes.pop();
+        try self.parsed_fonts.append(self.allocator, pf);
+        errdefer _ = self.parsed_fonts.pop();
+
+        // 4. Build the EmbeddedFontRef and register it. registerEmbeddedFont
+        // takes ownership of `ref` even on failure; from here we DON'T
+        // errdefer ref.deinit().
+        const ref = try font_embedder.EmbeddedFontRef.init(self.allocator, pf, name);
+        return self.registry.registerEmbeddedFont(ref);
     }
 
     /// PR-W6 [feat]: register an auxiliary indirect object with its

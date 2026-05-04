@@ -260,6 +260,37 @@ pub fn build(b: *std.Build) void {
     });
     const run_markdown_to_pdf_unit_tests = b.addRunArtifact(markdown_to_pdf_unit_tests);
 
+    // PR-W7 [feat]: TrueType subset, ToUnicode CMap writer, and
+    // font-embedder. Each is a leaf module so it gets its own
+    // test target — `run test` would otherwise miss them (they're
+    // only referenced via `pub const` in root, not compile-time).
+    const truetype_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/truetype.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_truetype_unit_tests = b.addRunArtifact(truetype_unit_tests);
+
+    const cmap_writer_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cmap_writer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_cmap_writer_unit_tests = b.addRunArtifact(cmap_writer_unit_tests);
+
+    const font_embedder_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/font_embedder.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_font_embedder_unit_tests = b.addRunArtifact(font_embedder_unit_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_simd_unit_tests.step);
@@ -275,6 +306,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_pdf_writer_unit_tests.step);
     test_step.dependOn(&run_pdf_document_unit_tests.step);
     test_step.dependOn(&run_markdown_to_pdf_unit_tests.step);
+    test_step.dependOn(&run_truetype_unit_tests.step);
+    test_step.dependOn(&run_cmap_writer_unit_tests.step);
+    test_step.dependOn(&run_font_embedder_unit_tests.step);
 
     // Allocation-failure tests — Week 4 of architecture.md §11.
     // Asserts the documented shape of upstream OOM behaviour (Findings 001–003
