@@ -1735,7 +1735,7 @@ fn buildCorruptContentPdf(allocator: std.mem.Allocator, raw_content: []const u8)
     var doc = document.DocumentBuilder.init(allocator);
     defer doc.deinit();
     const page = try doc.addPage(.{ 0, 0, 612, 792 });
-    const f = page.markFontUsed(.helvetica);
+    const f = try page.markFontUsed(.helvetica);
     var buf: [1024]u8 = undefined;
     const stream = try std.fmt.bufPrint(&buf, "BT\n{s} 12 Tf\n{s}\nET\n", .{ f, raw_content });
     try page.appendContent(stream);
@@ -2037,4 +2037,82 @@ test "PR-15: every fixture in the synthetic CJK corpus parses + opens" {
         const expected_vertical = fixture.wmode == 1;
         try std.testing.expectEqual(expected_vertical, doc.pageHasVerticalWriting(0));
     }
+}
+
+// ---------- PR-W11 [refactor]: shared resource registry ----------
+
+test "PR-W11 registry-dedupe: 2 pages sharing Helvetica emit /BaseFont once" {
+    // Two pages, both calling drawText with .helvetica. Pre-W11 each
+    // page would inline its own /Type /Font dict, producing TWO copies
+    // of `/BaseFont /Helvetica` in the PDF bytes. With the registry,
+    // a single shared font indirect-object is emitted; the substring
+    // appears exactly once.
+    const allocator = std.testing.allocator;
+    const document = @import("pdf_document.zig");
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const p1 = try doc.addPage(.{ 0, 0, 612, 792 });
+    try p1.drawText(100, 700, .helvetica, 12, "page one");
+    const p2 = try doc.addPage(.{ 0, 0, 612, 792 });
+    try p2.drawText(100, 700, .helvetica, 12, "page two");
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    const needle = "/BaseFont /Helvetica";
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, pos, needle)) |found| {
+        count += 1;
+        pos = found + needle.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    // Sanity: extracted text from each page still resolves correctly,
+    // proving the per-page /Resources /Font N 0 R reference works.
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+    try std.testing.expectEqual(@as(usize, 2), d.pageCount());
+    const md0 = try d.extractMarkdown(0, allocator);
+    defer allocator.free(md0);
+    try std.testing.expect(std.mem.indexOf(u8, md0, "page one") != null);
+    const md1 = try d.extractMarkdown(1, allocator);
+    defer allocator.free(md1);
+    try std.testing.expect(std.mem.indexOf(u8, md1, "page two") != null);
+}
+
+test "PR-W11 stress: 1000-page Helvetica doc dedupes font dict + stays compact" {
+    // With Tier-1's inline /Font dict per page, this doc carried 1000 copies of
+    // `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding
+    // /WinAnsiEncoding >>` (~80 bytes each ≈ 80 KB of pure dict duplication).
+    // With the registry the dict is one indirect object; each page's /Resources
+    // is just `<< /Font << /F0 N 0 R >> >>`. Observed size ~277 KB; the 350 KB
+    // ceiling tolerates xref + page-tree growth but catches accidental
+    // re-inlining (which would push the file ≥360 KB).
+    const allocator = std.testing.allocator;
+    const document = @import("pdf_document.zig");
+    var doc = document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const N: usize = 1000;
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const p = try doc.addPage(.{ 0, 0, 612, 792 });
+        try p.drawText(100, 700, .helvetica, 12, "x");
+    }
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expect(bytes.len < 350 * 1024);
+
+    // Exactly one shared /BaseFont /Helvetica in the entire file.
+    const needle = "/BaseFont /Helvetica";
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, pos, needle)) |found| {
+        count += 1;
+        pos = found + needle.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
