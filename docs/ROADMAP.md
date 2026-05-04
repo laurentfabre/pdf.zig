@@ -2,13 +2,10 @@
 title: "pdf.zig — Roadmap"
 project: pdf.zig
 status: active
-current: v1.5 writer Tier-2 (post-0.16 migration)
-next: PR-15 + PR-16 merge → v1.4 / v1.5 GA cut
+current: v1.5 (post-Bidi + post-CJK)
+next: v1.5 GA tag once gold-set + bake-off rerun complete
 default_branch: main
 toolchain: zig 0.16.0
-in_flight:
-  - "PR #49 — PR-16 Bidi UAX #9 (non-draft, ready)"
-  - "PR #50 — PR-15 CJK harness + 30-PDF real-corpus manifest (draft)"
 loop:
   pick: "/next-pr"
   review_fix: "/pr-cycle"
@@ -289,7 +286,7 @@ updated: 2026-05-04
   > **Test strategy.** Two fixtures + integration test.
   > **Codex gate.** No infinite-loop cascade; correct error-code propagation.
 
-- [ ] **PR-15 · feat: CJK extraction quality + corpus test** _(harness shipped; 30-PDF real corpus pending license review)_
+- [x] **PR-15 · feat: CJK extraction quality + corpus test** _(shipped via #50; harness + synthetic corpus + 30-PDF real-corpus manifest with license-verifying fetcher)_
   > [!info]- Details
   > **Files-touched envelope.** Audit-only PR — `audit/cjk_subset.py`, `audit/cjk-pdfs/`, `audit/v1_4_cjk_run.py`, possibly `src/encoding.zig` regressions.
   > **Acceptance gate.**
@@ -301,7 +298,7 @@ updated: 2026-05-04
   > **Test strategy.** New corpus harness; if encoding regressions surface, scope follow-up `v1.4.1` PR.
   > **Codex gate.** 95 % threshold honest (not gamed by stripping); CJK-specific edge cases (full-width punctuation, ruby annotations).
 
-- [ ] **PR-16 · feat: Bidi (Arabic / Hebrew) — proper logical-order pass**
+- [x] **PR-16 · feat: Bidi (Arabic / Hebrew) — proper logical-order pass** _(shipped via #49; UAX #9 Level-1 wired into extractText + markdown renderer)_
   > [!info]- Details
   > **Why.** Architecture §9 case #10 (currently emit-as-is + warn).
   > **Files-touched envelope.** `src/encoding.zig` or new `src/bidi.zig`, `src/integration_test.zig`.
