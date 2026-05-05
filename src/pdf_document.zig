@@ -44,6 +44,7 @@ const truetype = @import("truetype.zig");
 const image_writer = @import("image_writer.zig");
 const jpeg_meta = @import("jpeg_meta.zig");
 const encrypt_writer = @import("encrypt_writer.zig");
+const xmp_writer = @import("xmp_writer.zig");
 
 pub const FontHandle = pdf_resources.FontHandle;
 pub const ImageHandle = pdf_resources.ImageHandle;
@@ -1032,6 +1033,14 @@ pub const DocumentBuilder = struct {
 
         const catalog = try w.allocObjectNum();
 
+        // PR-W10a: reserve the /Metadata stream's obj_num before any
+        // page leaf or shared resource so the catalog can reference
+        // it via `/Metadata N 0 R`. The stream body itself is emitted
+        // later, between W11 resources and aux objects.
+        if (self.pdfa_level != null and self.xmp_metadata_obj == null) {
+            self.xmp_metadata_obj = try w.allocObjectNum();
+        }
+
         // PR-W11: reserve one indirect-object number per registered
         // resource BEFORE any leaf /Page references them. Pages emit
         // `/Font << /F0 N 0 R … >>` referencing these numbers, so the
@@ -1058,6 +1067,11 @@ pub const DocumentBuilder = struct {
         try w.beginObject(catalog, 0);
         try w.writeRaw("<< /Type /Catalog /Pages ");
         try w.writeRef(tree.root_obj, 0);
+        // PR-W10a: link the XMP /Metadata stream from the catalog.
+        if (self.xmp_metadata_obj) |meta_obj| {
+            try w.writeRaw(" /Metadata ");
+            try w.writeRef(meta_obj, 0);
+        }
         if (self.catalog_extras_raw.items.len > 0) {
             try w.writeRaw(" ");
             try w.writeRaw(self.catalog_extras_raw.items);
@@ -1136,6 +1150,15 @@ pub const DocumentBuilder = struct {
         // PR-W8: image XObjects.
         try self.registry.emitImageObjects(w);
 
+        // PR-W10a: emit the XMP /Metadata stream when the caller has
+        // opted in via `markAsPdfA(level)`. The obj_num was reserved
+        // earlier in this function so the catalog could already
+        // reference it via `/Metadata N 0 R`. Emitted AFTER shared
+        // resources and BEFORE aux objects.
+        if (self.xmp_metadata_obj != null) {
+            try emitXmpMetadata(self, w);
+        }
+
         // 3f. Auxiliary objects (outline items, annotations, form
         // fields, page-label trees, …). Each payload is the complete
         // dict / stream body — emitted verbatim between obj/endobj.
@@ -1197,6 +1220,90 @@ pub const DocumentBuilder = struct {
         return bytes;
     }
 };
+
+// PR-W10a [feat]: emit the XMP /Metadata stream object.
+//
+// Pulls Title/Author/Subject from the /Info dict payload via a bounded
+// scan (see `infoLookupString`) so the same bytes reach both /Info
+// and XMP without the caller having to set them twice. Uses the
+// pre-reserved `xmp_metadata_obj` number stored on the builder.
+fn emitXmpMetadata(self: *DocumentBuilder, w: *pdf_writer.Writer) !void {
+    const meta_obj = self.xmp_metadata_obj orelse unreachable; // reserved earlier
+    const level = self.pdfa_level orelse unreachable; // gated by caller
+
+    const tag = @tagName(level);
+    const view = try xmp_writer.levelView(tag);
+
+    // Bounded /Info lookups. Each returns an owned slice (caller must
+    // free) or null. The owned slice is the *escaped-PDF* literal —
+    // for ASCII-only Title/Author/Subject (the 99% case today) the
+    // bytes pass straight through into XMP escapeXml. Non-ASCII or
+    // backslash-escaped /Info strings will appear verbatim — the
+    // typed setters in a follow-up PR will fix that.
+    const title = try infoLookupString(self, "/Title");
+    defer if (title) |t| self.allocator.free(t);
+    const author = try infoLookupString(self, "/Author");
+    defer if (author) |a| self.allocator.free(a);
+    const subject = try infoLookupString(self, "/Subject");
+    defer if (subject) |s| self.allocator.free(s);
+
+    const packet = try xmp_writer.emit(self.allocator, view, .{
+        .title = title,
+        .author = author,
+        .subject = subject,
+    });
+    defer self.allocator.free(packet);
+
+    try w.beginObject(meta_obj, 0);
+    // PDF/A requires `/Type /Metadata /Subtype /XML`. Stream is NOT
+    // compressed (PDF/A-1 forbids /Filter on /Metadata; PDF/A-2/3 do
+    // permit it but we keep raw for cross-version safety).
+    try w.writeStream(packet, " /Type /Metadata /Subtype /XML");
+    try w.endObject();
+}
+
+/// PR-W10a: bounded /Info dict scan for `key` (e.g. "/Title"). Returns
+/// an owned copy of the literal-string body (the bytes between the
+/// outer `(` and `)`) or null if missing or malformed.
+///
+/// Defensive limits:
+/// - Scans at most `xmp_writer.MAX_FIELD_BYTES` of value content.
+/// - Tracks paren depth to handle nested literals (`(a (b) c)`).
+/// - Bails on backslash-escaped sequences by passing them through
+///   verbatim — the XMP escape pass handles the rest.
+fn infoLookupString(self: *DocumentBuilder, key: []const u8) !?[]u8 {
+    const payload = self.info_payload.items;
+    if (payload.len == 0) return null;
+    const idx = std.mem.indexOf(u8, payload, key) orelse return null;
+    var i = idx + key.len;
+    // Skip whitespace before the value.
+    while (i < payload.len and (payload[i] == ' ' or payload[i] == '\t' or payload[i] == '\n' or payload[i] == '\r')) i += 1;
+    if (i >= payload.len or payload[i] != '(') return null;
+    i += 1;
+
+    var depth: u32 = 1;
+    const start = i;
+    const max_end = @min(payload.len, start + xmp_writer.MAX_FIELD_BYTES);
+    while (i < max_end) {
+        const c = payload[i];
+        if (c == '\\') {
+            // Skip the escaped byte; bounded by max_end.
+            i += 2;
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+        } else if (c == ')') {
+            depth -= 1;
+            if (depth == 0) {
+                return try self.allocator.dupe(u8, payload[start..i]);
+            }
+        }
+        i += 1;
+    }
+    // Truncated or unbalanced — refuse to emit a partial value.
+    return null;
+}
 
 // PR-W9 [feat]: vtable trampolines connecting the type-erased
 // pdf_writer.Writer.encryption pointer to the typed
@@ -2271,7 +2378,7 @@ test "PR-W4: compressed PDF round-trips through Document.openFromMemory + extrac
 
 // ---------- PR-WX1 [refactor]: catalog setters + page tagging hooks ----------
 
-test "PR-WX1: catalog setters store flags but emit byte-equivalent output" {
+test "PR-WX1: catalog setters with NO PDF/A emit byte-equivalent output" {
     const allocator = std.testing.allocator;
 
     // Reference: doc with no setter calls.
@@ -2284,32 +2391,94 @@ test "PR-WX1: catalog setters store flags but emit byte-equivalent output" {
     const ref_bytes = try ref.write();
     defer allocator.free(ref_bytes);
 
-    // Tagged: same content, but markAsTagged + setLang + markAsPdfA.
+    // Tagged-only: markAsTagged + setLang, but NO markAsPdfA. PR-W10a
+    // gates its XMP emission on `pdfa_level != null` — so the
+    // remaining tag/lang flags must still be byte-equivalent today.
     var tagged = DocumentBuilder.init(allocator);
     defer tagged.deinit();
     try tagged.markAsTagged();
     try tagged.markAsTagged(); // idempotent
     try tagged.setLang("en-US");
-    try tagged.markAsPdfA(.b2);
     {
         const page = try tagged.addPage(.{ 0, 0, 612, 792 });
         try page.drawText(72, 720, .helvetica, 12, "x");
     }
 
-    // Flag round-trip BEFORE write() consumes the builder.
     try std.testing.expect(tagged.mark_info_marked);
     try std.testing.expectEqualStrings("en-US", tagged.lang_bcp47.?);
-    try std.testing.expectEqual(@as(?PdfALevel, .b2), tagged.pdfa_level);
+    try std.testing.expectEqual(@as(?PdfALevel, null), tagged.pdfa_level);
     try std.testing.expectEqual(@as(?u32, null), tagged.xmp_metadata_obj);
-    try std.testing.expectEqual(@as(?u32, null), tagged.output_intents_obj);
-    try std.testing.expectEqual(@as(?u32, null), tagged.struct_tree_root_obj);
 
     const tagged_bytes = try tagged.write();
     defer allocator.free(tagged_bytes);
 
-    // Output must be byte-equivalent — setters store flags only,
-    // wave 3.2 will plumb emission.
     try std.testing.expectEqualSlices(u8, ref_bytes, tagged_bytes);
+}
+
+test "PR-W10a: markAsPdfA emits /Metadata stream + catalog ref" {
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    try doc.markAsPdfA(.b2);
+    {
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(72, 720, .helvetica, 12, "x");
+    }
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // Catalog references the metadata stream.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Metadata ") != null);
+    // XMP packet markers present.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<x:xmpmeta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<pdfaid:part>2</pdfaid:part>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<pdfaid:conformance>B</pdfaid:conformance>") != null);
+    // Stream object emitted with /Type /Metadata /Subtype /XML.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Type /Metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Subtype /XML") != null);
+    // Builder state mutated as expected.
+    try std.testing.expect(doc.xmp_metadata_obj != null);
+}
+
+test "PR-W10a: no markAsPdfA → no XMP packet" {
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    {
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(72, 720, .helvetica, 12, "x");
+    }
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<x:xmpmeta") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Metadata ") == null);
+    try std.testing.expectEqual(@as(?u32, null), doc.xmp_metadata_obj);
+}
+
+test "PR-W10a: /Info Title/Author/Subject lift into XMP" {
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    try doc.markAsPdfA(.u2);
+    _ = try doc.setInfoDict("<< /Title (Hello World) /Author (Alice) /Subject (Test Doc) >>");
+    {
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(72, 720, .helvetica, 12, "x");
+    }
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<dc:title>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Hello World") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Alice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Test Doc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<pdfaid:part>2</pdfaid:part>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<pdfaid:conformance>U</pdfaid:conformance>") != null);
 }
 
 test "PR-WX1: setLang twice frees the prior dupe (no leak)" {
@@ -2478,8 +2647,11 @@ test "PR-WX1: leftover open tag at deinit does not leak" {
 }
 
 test "PR-WX1: FailingAllocator sweep on setLang + markAsPdfA + beginTag" {
+    // PR-W10a bumps the alloc count: XMP packet allocation (escapeXml
+    // + ArrayList growth) adds ~10 allocator hits beyond what WX1
+    // measured. 64 covers the new ceiling with margin.
     var fail_index: usize = 0;
-    while (fail_index < 32) : (fail_index += 1) {
+    while (fail_index < 64) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         const allocator = failing.allocator();
 
