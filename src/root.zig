@@ -38,7 +38,6 @@ pub const crypto = @import("crypto.zig");
 pub const tables = @import("tables.zig");
 pub const lattice = @import("lattice.zig");
 pub const stream_table = @import("stream_table.zig");
-pub const xmp_writer = @import("xmp_writer.zig");
 
 // Re-exports
 pub const Object = parser.Object;
