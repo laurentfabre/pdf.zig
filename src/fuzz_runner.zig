@@ -3989,8 +3989,15 @@ fn a11yJsonBalance(out: []const u8) i32 {
 /// page_refs the synth tree wants to point at can be obtained via
 /// `doc.pages.items[0].ref`.
 fn a11yOpenSyntheticDoc(allocator: std.mem.Allocator) !*zpdf.Document {
+    // Codex review of ddf0900 [P2]: `Document.openFromMemory` is the
+    // caller-owned path — the returned `Document.data` is a borrowed
+    // pointer into `pdf_data`. Freeing `pdf_data` here would dangle
+    // that pointer; any access through `doc.data` (e.g. a future a11y
+    // target enabling MCID-text resolution) becomes UAF.
+    //
+    // Don't free here — let the per-iter arena reset (every 4096 iters
+    // in the driver loop) reclaim the bytes alongside the doc.
     const pdf_data = try testpdf.generateMinimalPdf(allocator, "iter-14");
-    defer allocator.free(pdf_data);
     return try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
 }
 
