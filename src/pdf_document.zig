@@ -2268,3 +2268,243 @@ test "PR-W4: compressed PDF round-trips through Document.openFromMemory + extrac
     try parsed.extractText(0, &aw.writer);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "Round trip text via Flate") != null);
 }
+
+// ---------- PR-WX1 [refactor]: catalog setters + page tagging hooks ----------
+
+test "PR-WX1: catalog setters store flags but emit byte-equivalent output" {
+    const allocator = std.testing.allocator;
+
+    // Reference: doc with no setter calls.
+    var ref = DocumentBuilder.init(allocator);
+    defer ref.deinit();
+    {
+        const page = try ref.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(72, 720, .helvetica, 12, "x");
+    }
+    const ref_bytes = try ref.write();
+    defer allocator.free(ref_bytes);
+
+    // Tagged: same content, but markAsTagged + setLang + markAsPdfA.
+    var tagged = DocumentBuilder.init(allocator);
+    defer tagged.deinit();
+    try tagged.markAsTagged();
+    try tagged.markAsTagged(); // idempotent
+    try tagged.setLang("en-US");
+    try tagged.markAsPdfA(.b2);
+    {
+        const page = try tagged.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(72, 720, .helvetica, 12, "x");
+    }
+
+    // Flag round-trip BEFORE write() consumes the builder.
+    try std.testing.expect(tagged.mark_info_marked);
+    try std.testing.expectEqualStrings("en-US", tagged.lang_bcp47.?);
+    try std.testing.expectEqual(@as(?PdfALevel, .b2), tagged.pdfa_level);
+    try std.testing.expectEqual(@as(?u32, null), tagged.xmp_metadata_obj);
+    try std.testing.expectEqual(@as(?u32, null), tagged.output_intents_obj);
+    try std.testing.expectEqual(@as(?u32, null), tagged.struct_tree_root_obj);
+
+    const tagged_bytes = try tagged.write();
+    defer allocator.free(tagged_bytes);
+
+    // Output must be byte-equivalent — setters store flags only,
+    // wave 3.2 will plumb emission.
+    try std.testing.expectEqualSlices(u8, ref_bytes, tagged_bytes);
+}
+
+test "PR-WX1: setLang twice frees the prior dupe (no leak)" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    try doc.setLang("en-US");
+    try doc.setLang("fr-FR");
+    try doc.setLang("ja-JP");
+    try std.testing.expectEqualStrings("ja-JP", doc.lang_bcp47.?);
+}
+
+test "PR-WX1: markAsPdfA implicitly tags the document" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    try std.testing.expect(!doc.mark_info_marked);
+    try doc.markAsPdfA(.u1);
+    try std.testing.expect(doc.mark_info_marked);
+    try std.testing.expectEqual(@as(?PdfALevel, .u1), doc.pdfa_level);
+}
+
+test "PR-WX1: beginTag/endTag round-trip — text still extracts" {
+    const zpdf = @import("root.zig");
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    try doc.markAsTagged();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    const mcid0 = try page.beginTag("H1", "Title alt text");
+    try page.drawText(72, 720, .helvetica, 18, "Hello Tagged");
+    try page.endTag();
+
+    try std.testing.expectEqual(@as(u32, 0), mcid0);
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // BDC/EMC operators present in the content stream.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/H1 <</MCID 0>> BDC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "EMC") != null);
+
+    // Reader still parses the content stream cleanly + extracts text.
+    var parsed = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer parsed.close();
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try parsed.extractText(0, &aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "Hello Tagged") != null);
+}
+
+test "PR-WX1: MCID counter is monotonic across pages" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const p1 = try doc.addPage(.{ 0, 0, 612, 792 });
+    const m0 = try p1.beginTag("P", null);
+    try p1.endTag();
+    const m1 = try p1.beginTag("P", null);
+    try p1.endTag();
+
+    const p2 = try doc.addPage(.{ 0, 0, 612, 792 });
+    const m2 = try p2.beginTag("P", null);
+    try p2.endTag();
+    const m3 = try p2.beginTag("Span", null);
+    try p2.endTag();
+
+    try std.testing.expectEqual(@as(u32, 0), m0);
+    try std.testing.expectEqual(@as(u32, 1), m1);
+    try std.testing.expectEqual(@as(u32, 2), m2);
+    try std.testing.expectEqual(@as(u32, 3), m3);
+    try std.testing.expectEqual(@as(u32, 4), doc.next_mcid);
+}
+
+test "PR-WX1: nested beginTag/endTag emit balanced BDC/EMC pairs" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    _ = try page.beginTag("Sect", null);
+    _ = try page.beginTag("P", null);
+    try page.drawText(72, 720, .helvetica, 12, "x");
+    try page.endTag(); // closes P
+    try page.endTag(); // closes Sect
+
+    try std.testing.expectEqual(@as(usize, 0), page.open_tag_stack.items.len);
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+    // Two BDC + two EMC visible in the stream.
+    var bdc_count: usize = 0;
+    var emc_count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, i, "BDC")) |pos| : (i = pos + 3) bdc_count += 1;
+    i = 0;
+    while (std.mem.indexOfPos(u8, bytes, i, "EMC")) |pos| : (i = pos + 3) emc_count += 1;
+    try std.testing.expectEqual(@as(usize, 2), bdc_count);
+    try std.testing.expectEqual(@as(usize, 2), emc_count);
+}
+
+test "PR-WX1: endTag without matching beginTag returns UnmatchedEndTag" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try std.testing.expectError(error.UnmatchedEndTag, page.endTag());
+
+    // Over-close after one matched pair.
+    _ = try page.beginTag("P", null);
+    try page.endTag();
+    try std.testing.expectError(error.UnmatchedEndTag, page.endTag());
+}
+
+test "PR-WX1: invalid tag name rejected" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+
+    try std.testing.expectError(error.InvalidTagName, page.beginTag("H 1", null));
+    try std.testing.expectError(error.InvalidTagName, page.beginTag("", null));
+    try std.testing.expectError(error.InvalidTagName, page.beginTag("/H1", null));
+    try std.testing.expectError(error.InvalidTagName, page.beginTag("H#31", null));
+
+    // Stack must remain empty — no half-open tag.
+    try std.testing.expectEqual(@as(usize, 0), page.open_tag_stack.items.len);
+    // MCID counter must not have advanced — validation runs before allocation.
+    try std.testing.expectEqual(@as(u32, 0), doc.next_mcid);
+
+    // Allowed alphabet: letters, digits, _, -.
+    _ = try page.beginTag("Heading_1-A", null);
+    try page.endTag();
+}
+
+test "PR-WX1: setters reject mutations after write (single-use guard)" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "x");
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.markAsTagged());
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.setLang("en-US"));
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.markAsPdfA(.b2));
+}
+
+test "PR-WX1: leftover open tag at deinit does not leak" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    _ = try page.beginTag("Figure", "alt"); // intentionally not closed
+    // deinit must free the duped "Figure" string + the stack itself.
+}
+
+test "PR-WX1: FailingAllocator sweep on setLang + markAsPdfA + beginTag" {
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+
+        var doc = DocumentBuilder.init(allocator);
+        defer doc.deinit();
+
+        const result = wx1AllocSweepFlow(&doc);
+        if (result) |bytes| {
+            allocator.free(bytes);
+        } else |err| {
+            // Same failure-mode set as the existing FailingAllocator
+            // smoke test — alloc failure may surface as either
+            // OutOfMemory or WriteFailed (Writer.Allocating wraps it).
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+        }
+    }
+}
+
+fn wx1AllocSweepFlow(doc: *DocumentBuilder) ![]u8 {
+    try doc.markAsTagged();
+    try doc.setLang("en-US");
+    try doc.markAsPdfA(.b2);
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    _ = try page.beginTag("H1", "Title");
+    try page.drawText(72, 720, .helvetica, 12, "x");
+    try page.endTag();
+    return doc.write();
+}
