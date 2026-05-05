@@ -31,6 +31,12 @@ const H2_SIZE: f64 = 18.0;
 const H3_SIZE: f64 = 14.0;
 const LINE_GAP: f64 = 1.4; // multiplier on font size
 
+/// PR-W10d [defensive]: hard ceiling on list-block nesting. Tier-1
+/// markdown doesn't even handle nested lists, so any value > 1 is a
+/// pure tripwire. Stays well under the `MAX_DEPTH = 64` ceiling on
+/// `setStructTree`.
+const MAX_LIST_DEPTH: usize = 8;
+
 /// Render `markdown` into a PDF byte buffer. Caller owns the result;
 /// free with `allocator.free(bytes)`.
 ///
@@ -45,8 +51,43 @@ pub fn render(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
 /// can resolve. When `io` is null the image-line handler silently skips
 /// (the existing "image errors don't fail the render" contract).
 pub fn renderWithIo(allocator: std.mem.Allocator, io: ?std.Io, markdown: []const u8) ![]u8 {
+    return renderCore(allocator, io, markdown, false);
+}
+
+/// PR-W10d [feat]: same as `renderWithIo`, but enables PDF/UA-style
+/// auto-tagging — every H1/H2/H3, paragraph, and list block is
+/// wrapped in matching `beginTag`/`endTag` (BDC/EMC) pairs, and a
+/// `/StructTreeRoot` is emitted whose shape mirrors the markdown
+/// block sequence. Round-trips back through PR-21's reader.
+///
+/// Single-`/P`-per-paragraph (option A from the W10 audit): a
+/// multi-line wrapped paragraph still gets exactly one `P` enclosure.
+/// List shape: `L → [LI → LBody → MCID]*` — no `/Lbl` marker today.
+///
+/// Bounded list nesting at depth 8 (Tier-1 markdown stays well under
+/// that ceiling).
+pub fn renderTagged(allocator: std.mem.Allocator, io: ?std.Io, markdown: []const u8) ![]u8 {
+    return renderCore(allocator, io, markdown, true);
+}
+
+fn renderCore(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    markdown: []const u8,
+    tagged: bool,
+) ![]u8 {
     var doc = pdf_document.DocumentBuilder.init(allocator);
     defer doc.deinit();
+
+    // PR-W10d [defensive]: arena owns every TaggedElement, child
+    // slice, and tag literal. It must outlive `doc.write()` because
+    // `setStructTree` only borrows. Held on the stack here, dropped
+    // at function return AFTER we've copied the bytes out of `doc`.
+    var tree_arena = std.heap.ArenaAllocator.init(allocator);
+    defer tree_arena.deinit();
+
+    var tree_storage: TreeBuilder = TreeBuilder.init(tree_arena.allocator());
+    if (tagged) try doc.markAsTagged();
 
     var renderer = Renderer{
         .allocator = allocator,
@@ -54,6 +95,8 @@ pub fn renderWithIo(allocator: std.mem.Allocator, io: ?std.Io, markdown: []const
         .doc = &doc,
         .page = null,
         .y = 0,
+        .tagged = tagged,
+        .tree = if (tagged) &tree_storage else null,
     };
     try renderer.beginPage();
 
@@ -64,6 +107,7 @@ pub fn renderWithIo(allocator: std.mem.Allocator, io: ?std.Io, markdown: []const
 
         // Page break marker: a line containing only `---`.
         if (std.mem.eql(u8, std.mem.trimStart(u8, line, " \t"), "---")) {
+            try renderer.closeListIfOpen();
             try renderer.beginPage();
             skip_blank = true;
             continue;
@@ -71,6 +115,7 @@ pub fn renderWithIo(allocator: std.mem.Allocator, io: ?std.Io, markdown: []const
 
         // Blank line collapses paragraphs but doesn't render anything.
         if (line.len == 0) {
+            try renderer.closeListIfOpen();
             if (!skip_blank) try renderer.advance(BODY_SIZE * 0.6);
             skip_blank = false;
             continue;
@@ -84,28 +129,41 @@ pub fn renderWithIo(allocator: std.mem.Allocator, io: ?std.Io, markdown: []const
             // (missing file, non-JPEG, parse failure) we skip silently
             // — markdown rendering shouldn't fail because one image
             // can't be decoded.
+            try renderer.closeListIfOpen();
             renderer.imageLine(path) catch {
                 continue;
             };
             continue;
         }
         if (std.mem.startsWith(u8, trimmed, "# ") and !std.mem.startsWith(u8, trimmed, "## ")) {
-            try renderer.heading(trimmed[2..], H1_SIZE);
+            try renderer.closeListIfOpen();
+            try renderer.heading(trimmed[2..], H1_SIZE, "H1");
         } else if (std.mem.startsWith(u8, trimmed, "## ") and !std.mem.startsWith(u8, trimmed, "### ")) {
-            try renderer.heading(trimmed[3..], H2_SIZE);
+            try renderer.closeListIfOpen();
+            try renderer.heading(trimmed[3..], H2_SIZE, "H2");
         } else if (std.mem.startsWith(u8, trimmed, "### ")) {
-            try renderer.heading(trimmed[4..], H3_SIZE);
+            try renderer.closeListIfOpen();
+            try renderer.heading(trimmed[4..], H3_SIZE, "H3");
         } else if (bulletPrefix(trimmed)) |skip| {
+            try renderer.openListIfClosed();
             // ASCII marker: drawText drops bytes outside 0x20..0x7e,
             // so `•` would render as nothing. `-` is the safe fallback.
             try renderer.listItem(trimmed[skip..], "-");
         } else if (numberedPrefix(trimmed)) |skip_count| {
+            try renderer.openListIfClosed();
             // Include the trailing dot; only the space is stripped.
             const num = trimmed[0 .. skip_count - 1];
             try renderer.listItem(trimmed[skip_count..], num);
         } else {
+            try renderer.closeListIfOpen();
             try renderer.paragraph(trimmed);
         }
+    }
+    try renderer.closeListIfOpen();
+
+    if (tagged) {
+        const root = try tree_storage.finish();
+        try doc.setStructTree(root);
     }
 
     return doc.write();
@@ -146,6 +204,98 @@ fn numberedPrefix(line: []const u8) ?usize {
     return p + 2;
 }
 
+/// PR-W10d [feat]: arena-backed accumulator for the document-level
+/// structure tree. All `TaggedElement` nodes, their `children`
+/// slices, and the heap-allocated `TaggedChild` arrays live on the
+/// arena passed to `init`. Nothing here is duped beyond what the
+/// arena owns; the resulting root pointer is borrowed by
+/// `DocumentBuilder.setStructTree` and must outlive `doc.write()`.
+const TreeBuilder = struct {
+    allocator: std.mem.Allocator,
+    /// Top-level (Document → ...) child collector.
+    doc_children: std.ArrayList(pdf_document.TaggedChild),
+    /// Active `L` element when a list block is open. When non-null,
+    /// the next list-item leaf is appended into `list_children`
+    /// instead of `doc_children`. Cleared by `closeList`.
+    list_elem: ?*pdf_document.TaggedElement = null,
+    list_children: std.ArrayList(pdf_document.TaggedChild) = .empty,
+    /// Bounded-nesting check (cheap tripwire — Tier-1 doesn't nest).
+    list_depth: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) TreeBuilder {
+        return .{
+            .allocator = allocator,
+            .doc_children = .empty,
+        };
+    }
+
+    /// Append a `<tag> → MCID` leaf to the document level.
+    fn addLeafBlock(self: *TreeBuilder, tag: []const u8, page_idx: usize, mcid: u32) !void {
+        const elem = try self.makeLeafElem(tag, page_idx, mcid);
+        try self.doc_children.append(self.allocator, .{ .element = elem });
+    }
+
+    /// Open a fresh `L` block. `closeList` flushes it to `doc_children`.
+    fn openList(self: *TreeBuilder) !void {
+        std.debug.assert(self.list_elem == null);
+        self.list_depth += 1;
+        if (self.list_depth > MAX_LIST_DEPTH) return error.ListNestingTooDeep;
+        const elem = try self.allocator.create(pdf_document.TaggedElement);
+        elem.* = .{ .tag = "L" };
+        self.list_elem = elem;
+        self.list_children = .empty;
+    }
+
+    /// Append a list item: `LI → LBody → MCID`. `LBody` wraps the
+    /// MCID leaf so reflow tools can target the body content
+    /// independently of any future `/Lbl` (label) sibling.
+    fn addListItem(self: *TreeBuilder, page_idx: usize, mcid: u32) !void {
+        std.debug.assert(self.list_elem != null);
+
+        const lbody_kids = try self.allocator.alloc(pdf_document.TaggedChild, 1);
+        lbody_kids[0] = .{ .mcid = .{ .page_idx = page_idx, .mcid = mcid } };
+        const lbody = try self.allocator.create(pdf_document.TaggedElement);
+        lbody.* = .{ .tag = "LBody", .children = lbody_kids };
+
+        const li_kids = try self.allocator.alloc(pdf_document.TaggedChild, 1);
+        li_kids[0] = .{ .element = lbody };
+        const li = try self.allocator.create(pdf_document.TaggedElement);
+        li.* = .{ .tag = "LI", .children = li_kids };
+
+        try self.list_children.append(self.allocator, .{ .element = li });
+    }
+
+    /// Close the active list, flushing it as a child of the doc-level
+    /// element. No-op when no list is open.
+    fn closeList(self: *TreeBuilder) !void {
+        const elem = self.list_elem orelse return;
+        elem.children = try self.list_children.toOwnedSlice(self.allocator);
+        try self.doc_children.append(self.allocator, .{ .element = elem });
+        self.list_elem = null;
+        self.list_depth -= 1;
+    }
+
+    fn makeLeafElem(self: *TreeBuilder, tag: []const u8, page_idx: usize, mcid: u32) !*pdf_document.TaggedElement {
+        const kids = try self.allocator.alloc(pdf_document.TaggedChild, 1);
+        kids[0] = .{ .mcid = .{ .page_idx = page_idx, .mcid = mcid } };
+        const elem = try self.allocator.create(pdf_document.TaggedElement);
+        elem.* = .{ .tag = tag, .children = kids };
+        return elem;
+    }
+
+    /// Finalize: wrap `doc_children` in a `Document` root. Returns a
+    /// borrowed pointer; lifetime is the arena's.
+    fn finish(self: *TreeBuilder) !*pdf_document.TaggedElement {
+        std.debug.assert(self.list_elem == null);
+        const root = try self.allocator.create(pdf_document.TaggedElement);
+        root.* = .{
+            .tag = "Document",
+            .children = try self.doc_children.toOwnedSlice(self.allocator),
+        };
+        return root;
+    }
+};
+
 const Renderer = struct {
     allocator: std.mem.Allocator,
     /// Optional `std.Io` for resolving `![alt](path)` image lines off
@@ -155,10 +305,21 @@ const Renderer = struct {
     page: ?*pdf_document.PageBuilder,
     /// Current y position (PDF user space, top of the next line).
     y: f64,
+    /// 0-based page index. Bumped by `beginPage`. Used by the
+    /// auto-tagger to bind MCID leaves to the right page.
+    page_idx: usize = 0,
+    /// PR-W10d: tagging mode. When false, every `beginTag`/`endTag`
+    /// call here is a no-op and the tree stays empty.
+    tagged: bool = false,
+    /// PR-W10d: collector for the `/StructTreeRoot` shape. Lives on
+    /// the arena owned by `renderCore`. Null in untagged mode.
+    tree: ?*TreeBuilder = null,
 
     fn beginPage(self: *Renderer) !void {
+        const first = self.page == null;
         self.page = try self.doc.addPage(.{ 0, 0, PAGE_WIDTH, PAGE_HEIGHT });
         self.y = PAGE_HEIGHT - MARGIN;
+        if (!first) self.page_idx += 1;
     }
 
     fn ensureSpace(self: *Renderer, needed: f64) !void {
@@ -173,16 +334,41 @@ const Renderer = struct {
         }
     }
 
-    fn heading(self: *Renderer, text: []const u8, size: f64) !void {
+    /// PR-W10d: open `/<tag> <</MCID N>> BDC` if tagging is on.
+    /// Returns the MCID (only meaningful when tagged).
+    fn beginBlockTag(self: *Renderer, tag: []const u8) !u32 {
+        if (!self.tagged) return 0;
+        const page = self.page.?;
+        return page.beginTag(tag, null);
+    }
+
+    /// PR-W10d: close the most recently opened tag with `EMC`.
+    fn endBlockTag(self: *Renderer) !void {
+        if (!self.tagged) return;
+        const page = self.page.?;
+        try page.endTag();
+    }
+
+    fn heading(self: *Renderer, text: []const u8, size: f64, tag: []const u8) !void {
         // Top spacing for headings, then descend for the line itself.
         try self.ensureSpace(size * LINE_GAP * 1.4);
         try self.advance(size * 0.5);
+        const start_page = self.page_idx;
+        const mcid = try self.beginBlockTag(tag);
         try self.drawTextLine(text, .helvetica_bold, size, MARGIN);
+        try self.endBlockTag();
+        if (self.tagged) try self.tree.?.addLeafBlock(tag, start_page, mcid);
         try self.advance(size * LINE_GAP);
     }
 
     fn paragraph(self: *Renderer, text: []const u8) !void {
+        // PR-W10d: single /P per paragraph, even when the body wraps
+        // across multiple drawn lines (option A from the W10 audit).
+        const start_page = self.page_idx;
+        const mcid = try self.beginBlockTag("P");
         try self.flowText(text, .helvetica, BODY_SIZE, MARGIN);
+        try self.endBlockTag();
+        if (self.tagged) try self.tree.?.addLeafBlock("P", start_page, mcid);
     }
 
     /// PR-W8 [feat]: load a JPEG from disk and place it at the current
@@ -219,9 +405,34 @@ const Renderer = struct {
         const marker_indent: f64 = MARGIN;
         const text_indent: f64 = MARGIN + 18;
         try self.ensureSpace(BODY_SIZE * LINE_GAP);
+
+        // PR-W10d: the marker glyph is drawn outside the LBody body
+        // (treated as presentation-only; reflow tools synthesize their
+        // own marker from the LI's position). Only the wrapped body
+        // text gets `LBody` BDC/EMC enclosure.
+        const start_page = self.page_idx;
         const page = self.page.?;
         try page.drawText(marker_indent, self.y - BODY_SIZE * 0.85, .helvetica, BODY_SIZE, marker);
+
+        const mcid = try self.beginBlockTag("LBody");
         try self.flowTextStart(text, .helvetica, BODY_SIZE, text_indent);
+        try self.endBlockTag();
+        if (self.tagged) try self.tree.?.addListItem(start_page, mcid);
+    }
+
+    /// PR-W10d: open a fresh `L` block on first list line. No-op if a
+    /// list is already open or if tagging is off.
+    fn openListIfClosed(self: *Renderer) !void {
+        if (!self.tagged) return;
+        if (self.tree.?.list_elem != null) return;
+        try self.tree.?.openList();
+    }
+
+    /// PR-W10d: close the active list block, flushing it into the
+    /// document children. No-op if no list is open or tagging is off.
+    fn closeListIfOpen(self: *Renderer) !void {
+        if (!self.tagged) return;
+        try self.tree.?.closeList();
     }
 
     /// Single-line draw at `(left, y - size*0.85)` (so the y-axis
@@ -454,4 +665,139 @@ test "render: long unbroken token hard-wraps in the content stream" {
     // The first chunk starts with the URL prefix (the prefix is
     // shorter than max_chars, so it fits intact in chunk #1).
     try std.testing.expect(std.mem.indexOf(u8, bytes, "(https://example.com") != null);
+}
+
+// PR-W10d [test]: tagged renderer round-trips through the structure
+// tree reader. The shape we assert mirrors the spec exactly:
+//   Document → [H1, P, L → [LI → LBody, LI → LBody]]
+test "PR-W10d: renderTagged round-trips H1 + P + bullet list shape" {
+    const allocator = std.testing.allocator;
+    const md =
+        \\# Title
+        \\
+        \\Body paragraph.
+        \\
+        \\- item one
+        \\- item two
+    ;
+    const bytes = try renderTagged(allocator, null, md);
+    defer allocator.free(bytes);
+
+    const zpdf = @import("root.zig");
+    var doc = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    try std.testing.expect(doc.hasStructureTree());
+    const tree = try doc.getStructTree();
+    try std.testing.expect(tree.root != null);
+    const root = tree.root.?;
+    try std.testing.expectEqualStrings("Document", root.struct_type);
+    // doc has 3 top-level children: H1, P, L
+    try std.testing.expectEqual(@as(usize, 3), root.children.len);
+
+    // H1 leaf
+    const h1 = root.children[0].element;
+    try std.testing.expectEqualStrings("H1", h1.struct_type);
+    try std.testing.expectEqual(@as(usize, 1), h1.children.len);
+    switch (h1.children[0]) {
+        .mcid => {},
+        .element => try std.testing.expect(false),
+    }
+
+    // P leaf (single /P, even for body text that fits on one line).
+    const p = root.children[1].element;
+    try std.testing.expectEqualStrings("P", p.struct_type);
+    try std.testing.expectEqual(@as(usize, 1), p.children.len);
+
+    // L → [LI → LBody → MCID, LI → LBody → MCID]
+    const list = root.children[2].element;
+    try std.testing.expectEqualStrings("L", list.struct_type);
+    try std.testing.expectEqual(@as(usize, 2), list.children.len);
+    for (list.children) |li_child| {
+        const li = li_child.element;
+        try std.testing.expectEqualStrings("LI", li.struct_type);
+        try std.testing.expectEqual(@as(usize, 1), li.children.len);
+        const lbody = li.children[0].element;
+        try std.testing.expectEqualStrings("LBody", lbody.struct_type);
+        try std.testing.expectEqual(@as(usize, 1), lbody.children.len);
+        switch (lbody.children[0]) {
+            .mcid => {},
+            .element => try std.testing.expect(false),
+        }
+    }
+}
+
+// PR-W10d [test]: BDC and EMC operators must be balanced. One BDC
+// per begin, one EMC per end. We count both in the content stream
+// bytes and assert equality, plus a positive count to make sure we
+// didn't accidentally turn tagging off.
+test "PR-W10d: BDC and EMC operators are balanced" {
+    const allocator = std.testing.allocator;
+    const md =
+        \\# Title
+        \\
+        \\Body paragraph.
+        \\
+        \\- item one
+        \\- item two
+    ;
+    const bytes = try renderTagged(allocator, null, md);
+    defer allocator.free(bytes);
+
+    var bdc: usize = 0;
+    var emc: usize = 0;
+    var i: usize = 0;
+    while (i + 4 <= bytes.len) : (i += 1) {
+        if (std.mem.eql(u8, bytes[i .. i + 4], " BDC")) bdc += 1;
+        if (std.mem.eql(u8, bytes[i .. i + 3], "EMC")) emc += 1;
+    }
+    // 1 H1 + 1 P + 2 LBody = 4 BDC/EMC pairs at minimum.
+    try std.testing.expect(bdc >= 4);
+    try std.testing.expectEqual(bdc, emc);
+}
+
+// PR-W10d [test]: untagged `render` is byte-equivalent to its
+// pre-W10d behaviour. We don't snapshot the entire file; we only
+// guarantee that the untagged path emits no BDC/EMC and no
+// `/StructTreeRoot` reference in the catalog.
+test "PR-W10d: untagged render emits no BDC/EMC and no StructTreeRoot" {
+    const allocator = std.testing.allocator;
+    const md =
+        \\# Title
+        \\
+        \\Body paragraph.
+        \\
+        \\- item
+    ;
+    const bytes = try render(allocator, md);
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "BDC") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "EMC") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/StructTreeRoot") == null);
+}
+
+// PR-W10d [test]: a multi-line wrapped paragraph still gets a single
+// `/P` enclosure (option A from the W10 audit). The body wraps to
+// multiple Tj lines but only one BDC/EMC pair surrounds them.
+test "PR-W10d: multi-line paragraph emits a single /P" {
+    const allocator = std.testing.allocator;
+    const md = "The quick brown fox jumps over the lazy dog. " ** 8;
+    const bytes = try renderTagged(allocator, null, md);
+    defer allocator.free(bytes);
+
+    // Count `/P <</MCID` occurrences. Should be exactly 1 even though
+    // the wrapped paragraph emits many Tj operators.
+    var p_count: usize = 0;
+    var search = bytes;
+    while (std.mem.indexOf(u8, search, "/P <</MCID")) |idx| : (search = search[idx + 1 ..]) {
+        p_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), p_count);
+
+    // And: the paragraph body emits >1 Tj (so we know the wrap
+    // actually produced multiple lines under the same /P).
+    var tj: usize = 0;
+    var s = bytes;
+    while (std.mem.indexOf(u8, s, ") Tj")) |idx| : (s = s[idx + 4 ..]) tj += 1;
+    try std.testing.expect(tj >= 2);
 }
