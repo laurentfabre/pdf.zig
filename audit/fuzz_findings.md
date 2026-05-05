@@ -114,7 +114,8 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 | decompress_ascii_hex_diff | **108.6 s** | iter-5 — ASCIIHex encode/decode differential |
 | decompress_filter_chain_diff | **63.0 s** | iter-5 — filter chain ownership transfer |
 | pdf_of_pdf_roundtrip | **794.7 s** | iter-7 — multi-stage adversarial PDF-of-PDF (4M stage-cycles at 1M iters × 4 stages) |
-| **Total** | **4788.6 s (79 min 49 s) at 1M post-iter-7 — 38/38 clean, base seed `0x19df7f8182f`. iter-8 (bidi)/9 (cff repro-only)/10 (pdf_resources)/11 (attr_flattener) 1M rerun pending.** | |
+| **Total (post-iter-25 comprehensive 1M)** | **8 217.4 s (137 min 17 s) — 73/73 default-gate targets clean at 1M iters, base seed pinned via isolated `--cache-dir`.** Surfaced **Finding 012** (outline stack overflow) at iter ~600k of `outline_adversarial_mutate`, which has now been gated `reproducer_only` in 052faa2-followups. Heavy targets: font_embedder_emit_minimal_ttf 393 s, pagetree_balanced_shape 562 s, encrypt_authenticate_user_roundtrip 312 s, mcid_resolver_resolve_batch_parallel 223 s. The 6 `reproducer_only` targets and 2 `aggressive` targets are skipped from the sweep per their gating. | |
+| Prior post-iter-7 reference (38 default-gate targets) | 4 788.6 s (79 min 49 s) | preserved for cross-reference |
 
 The aggressive-gated `decompress_ascii85_roundtrip` is `reproducer_only` and skipped from the default + aggressive sweeps; deterministically reproduces Finding 005 below.
 
