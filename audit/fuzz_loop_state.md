@@ -7,6 +7,61 @@
 
 ## Loop shape
 
+> **Updated 2026-05-05 (post-iter-2):** the user added two directives —
+> *escalate complexity per iter* (move beyond shallow byte-fuzz) and
+> *audit for format-string vulnerabilities*. The complexity ladder
+> below replaces the old flat inventory; the format-string audit
+> findings are recorded inline.
+
+### Complexity ladder (apply on top of the per-module inventory)
+
+| Tier | Technique | Used in |
+|---:|---|---|
+| 1 | **Random-bytes byte-fuzz.** Drop random / biased bytes into a single entrypoint; assert no panic + simple bounds. | iter 0–1 (xmp / encrypt / md / truetype / jpeg / decompress) |
+| 2 | **Single-call deep-API fuzz.** Reach a non-public-byte entrypoint directly (e.g. `Parser.parseObject` / `Parser.initAt`); assert structural post-conditions on returned objects (no NaN reals, depth ≤ MAX, `pos ≤ data.len`). | iter 2 (parser) |
+| 3 | **Round-trip + property fuzz.** Encode → decode → equal; or decode → re-encode → re-decode → equal. Surfaces algebraic bugs the floor invariant misses. | iter 1 (encrypt + ASCII85 round-trip) |
+| 4 | **Stateful sequence fuzz.** Drive a multi-call sequence (e.g. interpreter `q`/`Q` interleaving, BDC/EMC nesting, document-builder `addPage` / `setStructTree` / `write`); assert state-machine invariants across the sequence. | iter 3 (interpreter) |
+| 5 | **Differential fuzz.** Run two implementations on the same input (e.g. our cmap parser vs `harfbuzz`-derived reference; our flate vs `std.compress.flate`); flag mismatches. | tier 5 — open |
+| 6 | **Coverage-guided mutation fuzz.** AFL-style: track basic-block coverage, bias toward inputs that hit new edges. Zig has `zig fuzz` ≥0.16; not yet wired in. | tier 6 — open |
+| 7 | **Multi-stage adversarial fuzz.** PDF-of-PDF: parse → mutate → emit → re-parse → mutate → … on the same fixture. Surfaces serialise/parse asymmetries. | tier 7 — open |
+
+Future iters should pick the lowest-numbered tier the module hasn't
+been hit at yet, OR escalate one tier on a previously-fuzzed module
+when its current tier comes up clean.
+
+### Format-string audit (one-off, 2026-05-05)
+
+Audited every `std.fmt.bufPrint` / `allocPrint` / `format`,
+`std.debug.print`, and writer `.print(…)` site (511 total).
+
+**Findings:**
+
+- **No traditional format-string vulns.** Zig 0.16's
+  `std.fmt.format` and friends require the format string to be a
+  comptime-known string literal. Passing attacker-controlled bytes
+  as the format-string slot would fail to compile.
+- **ANSI / terminal-escape leakage via stderr error messages
+  (LOW severity)**: `src/main.zig:158` (`Error opening {s}: {}`),
+  `src/main.zig:171` (`Error creating {s}: {}`),
+  `src/main.zig:165` (encryption warning), and similar paths in
+  `cli_pdfzig.zig` echo user-supplied PDF paths verbatim into
+  stderr. A malicious filename containing `\x1b[…]` could inject
+  ANSI escapes and pollute the user's terminal. Not exploitable
+  beyond DoS-of-terminal-state; the user has to volunteer the
+  filename. Logged here for completeness; revisit if pdf.zig grows
+  any path that prints PDF-internal strings (e.g. `/Title` from
+  the document /Info dict) to stderr.
+- **JSON-escape boundary is heavily fuzzed.** `writeJsonString` in
+  `src/stream.zig` is called on every attacker-controlled string
+  field on the NDJSON output path (titles, page text, font names,
+  URIs, image data, struct-element /Alt and /ActualText, …).
+  Already covered by `stream_json_string` at 1M iters clean.
+- **Action items:** none currently warrant a fuzz target. If a
+  future feature emits PDF /Info or /Title strings to stderr,
+  factor a `sanitiseForTerminal` helper and fuzz it.
+
+## Loop shape (per-iter sequence)
+
 Each iteration:
 
 1. **Pick** the next module from the deepening inventory (below).
