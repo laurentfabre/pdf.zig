@@ -39,6 +39,8 @@ const cff = @import("cff.zig");
 const pdf_resources = @import("pdf_resources.zig");
 const image_writer = @import("image_writer.zig");
 const pdf_writer = @import("pdf_writer.zig");
+const attr_flattener = @import("attr_flattener.zig");
+const structtree = @import("structtree.zig");
 
 // ============================================================================
 // Target registry
@@ -201,6 +203,13 @@ const TARGETS = [_]Target{
     .{ .name = "pdf_resources_builtin_dedup", .run = fuzzPdfResourcesBuiltinDedup },
     .{ .name = "pdf_resources_image_register_assign", .run = fuzzPdfResourcesImageRegisterAssign },
     .{ .name = "pdf_resources_freeze_after_assign", .run = fuzzPdfResourcesFreezeAfterAssign },
+    // Iter-11 (audit/fuzz_loop_state.md row 11 — attr_flattener.zig).
+    // Pure functions on a *const StructTree. SUT-independent invariants:
+    // independent re-walk comparison, byte-idempotent re-flatten, depth-
+    // bound boundary symmetry between flatten and flattenInPlace.
+    .{ .name = "attr_flattener_random_tree", .run = fuzzAttrFlattenerRandomTree },
+    .{ .name = "attr_flattener_in_place_idempotent", .run = fuzzAttrFlattenerInPlaceIdempotent },
+    .{ .name = "attr_flattener_depth_bound", .run = fuzzAttrFlattenerDepthBound },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -3474,6 +3483,313 @@ fn fuzzPdfResourcesFreezeAfterAssign(rng: std.Random, allocator: std.mem.Allocat
                 }
             }
         }
+    }
+}
+
+
+// ============================================================================
+// Targets — attr_flattener (PR-23b inheritance walker, row 11)
+// ============================================================================
+//
+// `attr_flattener.flatten` walks a parsed StructTree and computes the
+// effective `/Lang`, `/Alt`, `/ActualText`, and `resolved_role` for every
+// element by inheriting from the nearest ancestor with the slot set.
+// `flattenInPlace` is the mutating sibling that writes the inherited
+// values back onto descendants directly.
+//
+// Both surfaces are pure functions on a `*const StructTree` (or `*StructTree`
+// for the in-place variant) — no parser, no XRef, no Document. The
+// existing `tagged_table_mutation` target already shows how to synth a
+// StructTree in arena.
+//
+// SUT-independent invariants only (iter-7 P2 lesson):
+//   - The harness re-walks the tree from the root and computes the
+//     "expected" effective attrs by following parent pointers — and
+//     compares to the SUT's map.
+//   - Idempotency: flattenInPlace twice yields the same field values
+//     by-bytes as flattenInPlace once.
+//   - Negative space: own-set fields MUST NOT be overwritten.
+//   - Depth bound: error.StructTreeTooDeep iff depth ≥ MAX_FLATTEN_DEPTH.
+//
+// All three targets are default-gate; the surface is small and
+// self-contained, identical to iter-10's pdf_resources pattern.
+
+/// Per-element string slots are drawn from a fixed pool (or null).
+/// All slices in the pool are `.rodata` so they survive arena shrink
+/// and pointer-equality comparisons across walks are well-defined.
+const ATTR_POOL_ALT = [_][]const u8{ "alt-A", "alt-B", "alt-C" };
+const ATTR_POOL_ACTUAL = [_][]const u8{ "actual-X", "actual-Y", "actual-Z" };
+const ATTR_POOL_LANG = [_][]const u8{ "en-US", "fr-FR", "ja-JP" };
+const ATTR_POOL_ROLE = [_][]const u8{ "P", "Sect", "H1" };
+const ATTR_POOL_TYPE = [_][]const u8{ "Document", "Sect", "P", "Span", "Table", "TR", "TD", "Figure" };
+
+/// Pick a pool entry or null with ~1/3 null bias so inheritance gets
+/// exercised on most paths.
+fn pickOptional(rng: std.Random, pool: []const []const u8) ?[]const u8 {
+    if (rng.intRangeAtMost(u8, 0, 2) == 0) return null;
+    return pool[rng.intRangeAtMost(usize, 0, pool.len - 1)];
+}
+
+/// Recursively build a random tree under `arena`. Tracks the elements
+/// list in `out_elements` (caller-owned) so the caller can iterate
+/// every element later for SUT-independent re-walks.
+fn buildRandomStructTree(
+    aa: std.mem.Allocator,
+    rng: std.Random,
+    out_elements: *std.ArrayList(*structtree.StructElement),
+    depth: u32,
+    max_depth: u32,
+) anyerror!*structtree.StructElement {
+    // Branching factor: 0..3 children at each level. Depth gate caps
+    // total size; over-deep paths cut off at max_depth.
+    const n_kids: usize = if (depth >= max_depth) 0 else rng.intRangeAtMost(usize, 0, 3);
+
+    var kids: std.ArrayList(structtree.StructChild) = .empty;
+    for (0..n_kids) |_| {
+        const sub = try buildRandomStructTree(aa, rng, out_elements, depth + 1, max_depth);
+        try kids.append(aa, .{ .element = sub });
+    }
+    const kids_slice = try kids.toOwnedSlice(aa);
+
+    const elem = try aa.create(structtree.StructElement);
+    elem.* = .{
+        .struct_type = ATTR_POOL_TYPE[rng.intRangeAtMost(usize, 0, ATTR_POOL_TYPE.len - 1)],
+        .alt_text = pickOptional(rng, &ATTR_POOL_ALT),
+        .actual_text = pickOptional(rng, &ATTR_POOL_ACTUAL),
+        .lang = pickOptional(rng, &ATTR_POOL_LANG),
+        .resolved_role = pickOptional(rng, &ATTR_POOL_ROLE),
+        .children = kids_slice,
+    };
+    try out_elements.append(aa, elem);
+    return elem;
+}
+
+/// SUT-independent oracle: re-walk the tree and compute, for each
+/// element pointer, the effective `(alt, actual, lang, role)` according
+/// to the documented inheritance rules — element-own value wins,
+/// otherwise nearest ancestor with the slot set.
+const ExpectedAttrs = struct {
+    alt: ?[]const u8,
+    actual: ?[]const u8,
+    lang: ?[]const u8,
+    role: ?[]const u8,
+};
+fn walkExpected(
+    elem: *const structtree.StructElement,
+    inherited: ExpectedAttrs,
+    out: *std.AutoHashMap(*const structtree.StructElement, ExpectedAttrs),
+    aa: std.mem.Allocator,
+) anyerror!void {
+    const eff: ExpectedAttrs = .{
+        .alt = elem.alt_text orelse inherited.alt,
+        .actual = elem.actual_text orelse inherited.actual,
+        .lang = elem.lang orelse inherited.lang,
+        .role = elem.resolved_role orelse inherited.role,
+    };
+    try out.put(elem, eff);
+    for (elem.children) |child| switch (child) {
+        .element => |sub| try walkExpected(sub, eff, out, aa),
+        .mcid => {},
+    };
+}
+
+/// T1: drive `flatten()` on a random tree; assert map size + per-element
+/// field equality against the SUT-independent oracle.
+fn fuzzAttrFlattenerRandomTree(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var elements: std.ArrayList(*structtree.StructElement) = .empty;
+
+    // Root sometimes absent → empty-map invariant.
+    const has_root = rng.intRangeAtMost(u8, 0, 9) != 0;
+    var tree: structtree.StructTree = .{
+        .root = null,
+        .elements = &.{},
+        .allocator = aa,
+    };
+    if (has_root) {
+        const max_depth = rng.intRangeAtMost(u32, 0, 12); // well under MAX_FLATTEN_DEPTH=64
+        const root = try buildRandomStructTree(aa, rng, &elements, 0, max_depth);
+        tree.root = root;
+    }
+
+    var got = try attr_flattener.flatten(&tree, allocator);
+    defer got.deinit();
+
+    if (!has_root) {
+        if (got.count() != 0) return error.FlattenEmptyTreeMapNonEmpty;
+        return;
+    }
+
+    // Build the oracle map.
+    var expected = std.AutoHashMap(*const structtree.StructElement, ExpectedAttrs).init(aa);
+    try walkExpected(tree.root.?, .{ .alt = null, .actual = null, .lang = null, .role = null }, &expected, aa);
+
+    // Invariant: SUT map and oracle map cover the same set of pointers.
+    if (got.count() != expected.count()) return error.FlattenMapCountMismatch;
+
+    var it = expected.iterator();
+    while (it.next()) |e| {
+        const sut = got.get(e.key_ptr.*) orelse return error.FlattenMissingElementInMap;
+        const exp = e.value_ptr.*;
+        if (!optStrEql(sut.alt_text, exp.alt)) return error.FlattenAltMismatch;
+        if (!optStrEql(sut.actual_text, exp.actual)) return error.FlattenActualMismatch;
+        if (!optStrEql(sut.lang, exp.lang)) return error.FlattenLangMismatch;
+        if (!optStrEql(sut.resolved_role, exp.role)) return error.FlattenRoleMismatch;
+    }
+}
+
+fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// T2: drive `flattenInPlace()` twice on a random tree; assert idempotency
+/// and own-value preservation. Snapshot every element's four attrs after
+/// the first call and compare to the same fields after the second.
+///
+/// Negative-space invariants (iter-10 P2 lesson):
+///   - Elements that originally had alt_text != null must keep the
+///     SAME slice pointer (no overwrite, no copy).
+///   - flattenInPlace is total: never returns an error on shallow trees.
+fn fuzzAttrFlattenerInPlaceIdempotent(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+    _ = allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var elements: std.ArrayList(*structtree.StructElement) = .empty;
+
+    const max_depth = rng.intRangeAtMost(u32, 0, 12);
+    const root = try buildRandomStructTree(aa, rng, &elements, 0, max_depth);
+
+    // Snapshot owners — every element whose alt_text/actual_text was
+    // SET before flattening. Their slot must remain the SAME slice
+    // pointer after flattening (own-value-wins).
+    const Owners = struct {
+        ptr: *structtree.StructElement,
+        own_alt: ?[]const u8,
+        own_actual: ?[]const u8,
+    };
+    var owners: std.ArrayList(Owners) = .empty;
+    for (elements.items) |e| {
+        try owners.append(aa, .{ .ptr = e, .own_alt = e.alt_text, .own_actual = e.actual_text });
+    }
+
+    var tree: structtree.StructTree = .{
+        .root = root,
+        .elements = &.{},
+        .allocator = aa,
+    };
+
+    try attr_flattener.flattenInPlace(&tree);
+
+    // Snapshot post-1st-call.
+    const Snap = struct {
+        alt: ?[]const u8,
+        actual: ?[]const u8,
+        lang: ?[]const u8,
+        role: ?[]const u8,
+    };
+    var snap: std.ArrayList(Snap) = .empty;
+    for (elements.items) |e| {
+        try snap.append(aa, .{ .alt = e.alt_text, .actual = e.actual_text, .lang = e.lang, .role = e.resolved_role });
+    }
+
+    // Own-value preservation: for every element whose own_alt was
+    // non-null pre-flatten, the post-flatten slice must be the SAME
+    // pointer (.ptr + .len), not a copy.
+    for (owners.items, 0..) |o, idx| {
+        if (o.own_alt) |orig| {
+            const post = elements.items[idx].alt_text orelse return error.FlattenInPlaceLostOwnAlt;
+            if (post.ptr != orig.ptr or post.len != orig.len) return error.FlattenInPlaceOverwroteOwnAlt;
+        }
+        if (o.own_actual) |orig| {
+            const post = elements.items[idx].actual_text orelse return error.FlattenInPlaceLostOwnActual;
+            if (post.ptr != orig.ptr or post.len != orig.len) return error.FlattenInPlaceOverwroteOwnActual;
+        }
+    }
+
+    // Second call → idempotent.
+    try attr_flattener.flattenInPlace(&tree);
+    for (elements.items, 0..) |e, idx| {
+        const s = snap.items[idx];
+        if (!optStrEql(e.alt_text, s.alt)) return error.FlattenInPlaceNotIdempotentAlt;
+        if (!optStrEql(e.actual_text, s.actual)) return error.FlattenInPlaceNotIdempotentActual;
+        if (!optStrEql(e.lang, s.lang)) return error.FlattenInPlaceNotIdempotentLang;
+        if (!optStrEql(e.resolved_role, s.role)) return error.FlattenInPlaceNotIdempotentRole;
+    }
+}
+
+/// T3: depth-bound assertion. Builds a chain of length N where N is
+/// drawn from `MAX_FLATTEN_DEPTH - 4 ..= MAX_FLATTEN_DEPTH + 4`.
+///
+/// Per attr_flattener.zig:67 the bound is checked as `depth >= MAX`,
+/// i.e. depth 0..MAX-1 succeeds, depth MAX (chain length MAX+1) fails.
+/// Both `flatten` and `flattenInPlace` share the same gate.
+///
+/// Invariants:
+///   - chain length ≤ MAX_FLATTEN_DEPTH → both calls succeed
+///   - chain length ≥ MAX_FLATTEN_DEPTH + 1 → both return error.StructTreeTooDeep
+///   - the boundary is consistent across the two surfaces (Finding-class
+///     check: if they disagreed it would be an asymmetry to document)
+fn fuzzAttrFlattenerDepthBound(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const MAX = attr_flattener.MAX_FLATTEN_DEPTH;
+    // Window: MAX-4 ..= MAX+4. Chain length N = depth + 1 (root at
+    // depth 0, leaf at depth N-1).
+    const N: u32 = MAX - 4 + rng.intRangeAtMost(u32, 0, 8);
+
+    const chain = try aa.alloc(structtree.StructElement, N);
+    const slots = try aa.alloc(structtree.StructChild, N);
+
+    var i: usize = N;
+    while (i > 0) {
+        i -= 1;
+        chain[i] = .{
+            .struct_type = "P",
+            .children = if (i == N - 1) &.{} else slots[i .. i + 1],
+        };
+        if (i < N - 1) slots[i] = .{ .element = &chain[i + 1] };
+    }
+
+    var tree: structtree.StructTree = .{
+        .root = &chain[0],
+        .elements = &.{},
+        .allocator = aa,
+    };
+
+    // Threshold: depth `MAX` means N == MAX+1 chain elements (the
+    // leaf is at depth MAX, where `depth >= MAX` trips). Anything
+    // shorter must succeed.
+    const expect_too_deep = N >= MAX + 1;
+
+    if (attr_flattener.flatten(&tree, allocator)) |*ok| {
+        var m = ok.*;
+        m.deinit();
+        if (expect_too_deep) return error.FlattenAcceptedOverDeepChain;
+    } else |err| {
+        if (!expect_too_deep) return error.FlattenRejectedShallowChain;
+        if (err != error.StructTreeTooDeep) return err;
+    }
+
+    if (attr_flattener.flattenInPlace(&tree)) {
+        if (expect_too_deep) return error.FlattenInPlaceAcceptedOverDeepChain;
+    } else |err| {
+        if (!expect_too_deep) return error.FlattenInPlaceRejectedShallowChain;
+        if (err != error.StructTreeTooDeep) return err;
     }
 }
 
