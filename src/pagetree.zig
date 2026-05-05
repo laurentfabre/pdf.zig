@@ -74,8 +74,22 @@ pub fn resolveRef(
                 return Object{ .null = {} };
             };
 
-            try resolved_cache.put(ref.num, indirect.obj);
-            return indirect.obj;
+            // PR-W9 [feat]: transparently decrypt strings + streams.
+            // The hook walks the parsed object tree; on OOM we
+            // bubble, on any other failure we fall back to the
+            // raw object (lets corrupt /Encrypt dicts produce a
+            // soft-degraded extract rather than abort the parse).
+            var obj = indirect.obj;
+            if (xref.decrypt_fn) |dec| {
+                if (xref.decrypt_ctx) |ctx| {
+                    dec(ctx, &obj, indirect.num, indirect.gen, allocator) catch |err| {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        // Domain failures fall through with the raw obj.
+                    };
+                }
+            }
+            try resolved_cache.put(ref.num, obj);
+            return obj;
         },
         .compressed => {
             // Object is inside an object stream
@@ -105,7 +119,20 @@ fn resolveCompressedObject(
         return Object{ .null = {} };
     };
 
-    const stream = switch (indirect.obj) {
+    // PR-W9 [feat]: decrypt the ObjStm wrapper. The inner objects
+    // (extracted below from the decompressed body) are NOT
+    // individually encrypted per PDF §7.6.2 — only the wrapping
+    // ObjStm is.
+    var indirect_obj = indirect.obj;
+    if (xref.decrypt_fn) |dec| {
+        if (xref.decrypt_ctx) |ctx| {
+            dec(ctx, &indirect_obj, indirect.num, indirect.gen, allocator) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+            };
+        }
+    }
+
+    const stream = switch (indirect_obj) {
         .stream => |s| s,
         else => return Object{ .null = {} },
     };

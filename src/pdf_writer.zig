@@ -55,6 +55,60 @@ pub const Writer = struct {
     /// indirect-object emission.
     in_object: bool,
 
+    /// PR-W9 [feat]: when set, every stream / string body written
+    /// inside an indirect object whose number != `enc.encrypt_dict_obj_num`
+    /// is encrypted with the algorithm in `enc`. Type-erased to avoid an
+    /// import cycle with `encrypt_writer.zig` (which imports this file).
+    encryption: ?*const anyopaque = null,
+    encrypt_vtable: ?*const EncryptVTable = null,
+    /// Object number of the indirect object currently being emitted,
+    /// or 0 if not inside one. Tracked per-call by `beginObject` /
+    /// `endObject` so the encryption layer can derive a per-object key.
+    current_obj_num: u32 = 0,
+    current_obj_gen: u16 = 0,
+
+    /// PR-W9 [feat]: vtable for the encryption hook. Lets pdf_writer
+    /// stay decoupled from encrypt_writer (which itself imports
+    /// pdf_writer for the dict-emit helper).
+    pub const EncryptVTable = struct {
+        encryptString: *const fn (
+            ctx: *const anyopaque,
+            obj_num: u32,
+            gen: u16,
+            plaintext: []const u8,
+            allocator: std.mem.Allocator,
+        ) anyerror![]u8,
+        encryptStream: *const fn (
+            ctx: *const anyopaque,
+            obj_num: u32,
+            gen: u16,
+            plaintext: []const u8,
+            allocator: std.mem.Allocator,
+        ) anyerror![]u8,
+        /// Object number of the /Encrypt indirect itself — must NOT
+        /// be encrypted (PDF spec).
+        encryptDictObjNum: *const fn (ctx: *const anyopaque) u32,
+    };
+
+    /// PR-W9 [feat]: install an encryption layer. Caller retains
+    /// ownership of `ctx` and the vtable; both must outlive the
+    /// Writer. Pass `null` to disable.
+    pub fn setEncryption(
+        self: *Writer,
+        ctx: ?*const anyopaque,
+        vtable: ?*const EncryptVTable,
+    ) void {
+        self.encryption = ctx;
+        self.encrypt_vtable = vtable;
+    }
+
+    fn shouldEncrypt(self: *const Writer) bool {
+        if (self.encryption == null or self.encrypt_vtable == null) return false;
+        if (self.current_obj_num == 0) return false;
+        const dict_num = self.encrypt_vtable.?.encryptDictObjNum(self.encryption.?);
+        return self.current_obj_num != dict_num;
+    }
+
     pub const ObjectInfo = struct {
         /// Byte offset of the leading `N G obj` token. 0 = unallocated/free.
         offset: u64,
@@ -146,12 +200,18 @@ pub const Writer = struct {
         };
         try self.buf.writer.print("{d} {d} obj\n", .{ num, generation });
         self.in_object = true;
+        // PR-W9 [feat]: track the active indirect for per-object key
+        // derivation in the encryption hook.
+        self.current_obj_num = num;
+        self.current_obj_gen = generation;
     }
 
     pub fn endObject(self: *Writer) Error!void {
         if (!self.in_object) return error.UnbalancedObject;
         try self.buf.writer.writeAll("\nendobj\n");
         self.in_object = false;
+        self.current_obj_num = 0;
+        self.current_obj_gen = 0;
     }
 
     // --- Low-level token emitters (these don't add separator whitespace;
@@ -175,8 +235,28 @@ pub const Writer = struct {
     }
 
     /// Emit `(literal-string)`, escaping `(`, `)`, `\`, and non-printable
-    /// bytes via `\nnn` octal (§7.3.4.2).
+    /// bytes via `\nnn` octal (§7.3.4.2). When encryption is active, `s`
+    /// is first encrypted; the resulting bytes are then escaped.
     pub fn writeStringLiteral(self: *Writer, s: []const u8) Error!void {
+        if (self.shouldEncrypt()) {
+            const vt = self.encrypt_vtable.?;
+            const cipher = vt.encryptString(
+                self.encryption.?,
+                self.current_obj_num,
+                self.current_obj_gen,
+                s,
+                self.allocator,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.WriteFailed,
+            };
+            defer self.allocator.free(cipher);
+            return self.writeStringLiteralRaw(cipher);
+        }
+        return self.writeStringLiteralRaw(s);
+    }
+
+    fn writeStringLiteralRaw(self: *Writer, s: []const u8) Error!void {
         try self.buf.writer.writeByte('(');
         for (s) |b| {
             switch (b) {
@@ -200,8 +280,28 @@ pub const Writer = struct {
         try self.buf.writer.writeByte(')');
     }
 
-    /// Emit `<deadbeef>` lowercase hex string (§7.3.4.3).
+    /// Emit `<deadbeef>` lowercase hex string (§7.3.4.3). When encryption
+    /// is active, the body is encrypted before hex-encoding.
     pub fn writeStringHex(self: *Writer, bytes: []const u8) Error!void {
+        if (self.shouldEncrypt()) {
+            const vt = self.encrypt_vtable.?;
+            const cipher = vt.encryptString(
+                self.encryption.?,
+                self.current_obj_num,
+                self.current_obj_gen,
+                bytes,
+                self.allocator,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.WriteFailed,
+            };
+            defer self.allocator.free(cipher);
+            return self.writeStringHexRaw(cipher);
+        }
+        return self.writeStringHexRaw(bytes);
+    }
+
+    fn writeStringHexRaw(self: *Writer, bytes: []const u8) Error!void {
         try self.buf.writer.writeByte('<');
         for (bytes) |b| {
             try self.buf.writer.print("{x:0>2}", .{b});
@@ -241,6 +341,32 @@ pub const Writer = struct {
         extra_dict: []const u8,
     ) Error!void {
         if (!self.in_object) return error.UnbalancedObject;
+        // PR-W9 [feat]: encryption sits between `body` and the wire so
+        // the `/Length` we emit is the *encrypted* length, not the
+        // plaintext length. The stream dict's other entries (filter,
+        // params) describe the plaintext; PDF readers apply the
+        // decryption layer first, then the filter chain.
+        if (self.shouldEncrypt()) {
+            const vt = self.encrypt_vtable.?;
+            const cipher = vt.encryptStream(
+                self.encryption.?,
+                self.current_obj_num,
+                self.current_obj_gen,
+                body,
+                self.allocator,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.WriteFailed,
+            };
+            defer self.allocator.free(cipher);
+            try self.buf.writer.print(
+                "<< /Length {d}{s} >>\nstream\n",
+                .{ cipher.len, extra_dict },
+            );
+            try self.buf.writer.writeAll(cipher);
+            try self.buf.writer.writeAll("\nendstream");
+            return;
+        }
         try self.buf.writer.print(
             "<< /Length {d}{s} >>\nstream\n",
             .{ body.len, extra_dict },
@@ -323,6 +449,37 @@ pub const Writer = struct {
             );
         }
         return xref_offset;
+    }
+
+    /// PR-W9 [feat]: trailer with optional `/Encrypt N 0 R` ref and
+    /// `/ID [<...> <...>]` array bytes. The Tier-1 `writeTrailer`
+    /// delegates to this with both extras left null.
+    pub fn writeTrailerEx(
+        self: *Writer,
+        xref_offset: u64,
+        root_obj: u32,
+        info_obj: ?u32,
+        encrypt_obj: ?u32,
+        id_bytes: ?[]const u8,
+    ) Error!void {
+        if (self.in_object) return error.UnbalancedObject;
+        try self.assertEmittedRef(root_obj);
+        if (info_obj) |inum| try self.assertEmittedRef(inum);
+        if (encrypt_obj) |enum_| try self.assertEmittedRef(enum_);
+        try self.buf.writer.print(
+            "trailer\n<< /Size {d} /Root {d} 0 R",
+            .{ self.objects.items.len, root_obj },
+        );
+        if (info_obj) |inum| try self.buf.writer.print(" /Info {d} 0 R", .{inum});
+        if (encrypt_obj) |enum_| try self.buf.writer.print(" /Encrypt {d} 0 R", .{enum_});
+        if (id_bytes) |id| {
+            try self.buf.writer.writeAll(" /ID ");
+            try self.buf.writer.writeAll(id);
+        }
+        try self.buf.writer.print(
+            " >>\nstartxref\n{d}\n%%EOF\n",
+            .{xref_offset},
+        );
     }
 
     /// Emit `trailer << /Size N /Root R >> startxref OFF %%EOF`.

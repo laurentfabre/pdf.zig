@@ -32,6 +32,8 @@ pub const structtree = @import("structtree.zig");
 pub const markdown = @import("markdown.zig");
 pub const bidi = @import("bidi.zig");
 pub const outline = @import("outline.zig");
+pub const encrypt_writer = @import("encrypt_writer.zig");
+pub const crypto = @import("crypto.zig");
 pub const tables = @import("tables.zig");
 pub const lattice = @import("lattice.zig");
 pub const stream_table = @import("stream_table.zig");
@@ -144,6 +146,11 @@ pub const Document = struct {
     cached_reading_order: ?std.AutoHashMap(usize, std.ArrayList(structtree.MarkedContentRef)) = null,
     reading_order_parsed: bool = false,
 
+    /// PR-W9 [feat]: when set, every stream/string parsed via the
+    /// xref-table hook is decrypted using this context's per-object
+    /// key derivation. Owned by the Document; freed in `close`.
+    encryption: ?encrypt_writer.EncryptionContext = null,
+
     /// Open a PDF file (not available on WASM)
     pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Document {
         return openWithConfig(allocator, io, path, ErrorConfig.default());
@@ -197,6 +204,9 @@ pub const Document = struct {
     /// Does NOT touch `data` ownership (caller's contract) or
     /// `cached_reading_order` (set lazily after open succeeds).
     fn deinitPartial(self: *Document) void {
+        // PR-W9: free the encryption context (with file_key wipe)
+        // before tearing down the arena.
+        if (self.encryption) |*ctx| ctx.deinit();
         self.parsing_arena.deinit();
         self.xref_table.deinit();
         self.object_cache.deinit();
@@ -290,7 +300,44 @@ pub const Document = struct {
         return openFromMemoryUnsafe(allocator, data, config);
     }
 
+    /// PR-W9 [feat]: open an encrypted PDF, authenticating with
+    /// `password` (which may be the user OR the owner password).
+    /// Returns `error.InvalidPassword` on auth failure (constant-time
+    /// compare against the stored /U value).
+    pub fn openFromMemoryWithPassword(
+        allocator: std.mem.Allocator,
+        data: []const u8,
+        password: []const u8,
+        config: ErrorConfig,
+    ) !*Document {
+        const doc = try allocator.create(Document);
+        errdefer allocator.destroy(doc);
+
+        doc.* = .{
+            .data = data,
+            .owns_data = false,
+            .data_is_allocated = false,
+            .xref_table = XRefTable.init(allocator),
+            .pages = .empty,
+            .object_cache = std.AutoHashMap(u32, Object).init(allocator),
+            .allocator = allocator,
+            .parsing_arena = std.heap.ArenaAllocator.init(allocator),
+            .error_config = config,
+            .errors = .empty,
+            .font_cache = std.StringHashMap(encoding.FontEncoding).init(allocator),
+            .font_obj_cache = std.AutoHashMap(u32, encoding.FontEncoding).init(allocator),
+        };
+        errdefer doc.deinitPartial();
+
+        try doc.parseDocumentWithPassword(password);
+        return doc;
+    }
+
     fn parseDocument(self: *Document) !void {
+        return self.parseDocumentWithPassword(null);
+    }
+
+    fn parseDocumentWithPassword(self: *Document, password: ?[]const u8) !void {
         const arena = self.parsing_arena.allocator();
 
         // Verify header
@@ -319,17 +366,28 @@ pub const Document = struct {
             }
         };
 
-        // Check for encryption
+        // PR-W9 [feat]: encryption — derive the file key, install the
+        // decryption hook, and walk the page tree as usual. If the
+        // caller didn't supply a password, behave like before (record
+        // an error or hard-fail per ErrorConfig).
         if (self.xref_table.trailer.get("Encrypt") != null) {
-            if (!self.error_config.continue_on_parse_error) {
-                return error.EncryptedPdf;
+            if (password) |pw| {
+                self.installDecryption(pw) catch |err| {
+                    // InvalidPassword propagates unconditionally — the
+                    // caller wanted authentication and didn't get it.
+                    if (err == error.InvalidPassword) return error.InvalidPassword;
+                    return err;
+                };
+            } else {
+                if (!self.error_config.continue_on_parse_error) {
+                    return error.EncryptedPdf;
+                }
+                try self.errors.append(self.allocator, .{
+                    .kind = .encrypted,
+                    .offset = 0,
+                    .message = "PDF is encrypted; pass a password via openFromMemoryWithPassword",
+                });
             }
-            try self.errors.append(self.allocator, .{
-                .kind = .encrypted,
-                .offset = 0,
-                .message = "PDF is encrypted; text extraction will produce incorrect results",
-            });
-            // Still parse pages so page_count works, but extraction will be unreliable
         }
 
         // Build page tree (uses arena for all allocations)
@@ -350,6 +408,124 @@ pub const Document = struct {
         for (pages_slice) |page| {
             try self.pages.append(self.allocator, page);
         }
+    }
+
+    /// PR-W9 [feat]: parse the trailer's /Encrypt dict + /ID array,
+    /// authenticate `password`, derive the file key, and install the
+    /// xref-table decryption hook. Tries the user password first,
+    /// falls back to the owner password.
+    fn installDecryption(self: *Document, password: []const u8) !void {
+        const arena = self.parsing_arena.allocator();
+
+        // Resolve /Encrypt — may be an indirect ref. We resolve
+        // *manually* without the decrypt hook (which isn't installed
+        // yet) — encrypt dicts must NOT themselves be encrypted.
+        const enc_obj_raw = self.xref_table.trailer.get("Encrypt") orelse return;
+        const enc_obj = switch (enc_obj_raw) {
+            .reference => |r| pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return error.InvalidEncryptDict;
+            },
+            else => enc_obj_raw,
+        };
+        const enc_dict = switch (enc_obj) {
+            .dict => |d| d,
+            else => return error.InvalidEncryptDict,
+        };
+
+        // /Filter must be /Standard.
+        const filter = enc_dict.getName("Filter") orelse return error.InvalidEncryptDict;
+        if (!std.mem.eql(u8, filter, "Standard")) return error.UnsupportedEncryption;
+
+        const v_raw = enc_dict.getInt("V") orelse return error.InvalidEncryptDict;
+        const r_raw = enc_dict.getInt("R") orelse return error.InvalidEncryptDict;
+        const algorithm: encrypt_writer.Algorithm = blk: {
+            if (v_raw == 2 and r_raw == 3) break :blk .rc4_v2_r3_128;
+            if (v_raw == 4 and r_raw == 4) break :blk .aes_v4_r4_128;
+            return error.UnsupportedEncryption;
+        };
+
+        const o_str = enc_dict.getString("O") orelse return error.InvalidEncryptDict;
+        const u_str = enc_dict.getString("U") orelse return error.InvalidEncryptDict;
+        if (o_str.len < 32 or u_str.len < 32) return error.InvalidEncryptDict;
+        var o_value: [32]u8 = undefined;
+        var u_value: [32]u8 = undefined;
+        @memcpy(&o_value, o_str[0..32]);
+        @memcpy(&u_value, u_str[0..32]);
+
+        const p_raw = enc_dict.getInt("P") orelse return error.InvalidEncryptDict;
+        const perms_u32: u32 = @bitCast(@as(i32, @truncate(p_raw)));
+        const permissions: encrypt_writer.Permissions = @bitCast(perms_u32);
+
+        // /ID — required for key derivation. The first array entry
+        // is the original file ID.
+        const id_arr = self.xref_table.trailer.getArray("ID") orelse return error.InvalidEncryptDict;
+        if (id_arr.len < 1) return error.InvalidEncryptDict;
+        const id_first = switch (id_arr[0]) {
+            .string => |s| s,
+            .hex_string => |s| s,
+            else => return error.InvalidEncryptDict,
+        };
+        if (id_first.len < 16) return error.InvalidEncryptDict;
+        var file_id: [16]u8 = undefined;
+        @memcpy(&file_id, id_first[0..16]);
+
+        // Try user password first, then owner password.
+        const file_key = encrypt_writer.EncryptionContext.authenticateUser(
+            self.allocator,
+            algorithm,
+            password,
+            o_value,
+            u_value,
+            permissions,
+            file_id,
+        ) catch |err| switch (err) {
+            error.InvalidPassword => encrypt_writer.EncryptionContext.authenticateOwner(
+                self.allocator,
+                algorithm,
+                password,
+                o_value,
+                u_value,
+                permissions,
+                file_id,
+            ) catch |err2| switch (err2) {
+                error.InvalidPassword => return error.InvalidPassword,
+                else => return err2,
+            },
+            else => return err,
+        };
+
+        // We now own `file_key`. Install it into a fresh
+        // EncryptionContext and wire the xref-table hook. The
+        // `random` field is unused on the reader side (we never
+        // generate IVs — we read them from the ciphertext) but the
+        // struct requires one. A deterministic stub is fine here.
+        const StubRandom = struct {
+            fn fill(_: *anyopaque, _: []u8) void {}
+        };
+        const random: std.Random = .{ .ptr = undefined, .fillFn = StubRandom.fill };
+        self.encryption = .{
+            .allocator = self.allocator,
+            .algorithm = algorithm,
+            .file_id = file_id,
+            .file_key = file_key,
+            .o_value = o_value,
+            .u_value = u_value,
+            .permissions = permissions,
+            .encrypt_dict_obj_num = switch (enc_obj_raw) {
+                .reference => |r| r.num,
+                else => 0,
+            },
+            .random = random,
+        };
+        self.xref_table.decrypt_ctx = @as(*const anyopaque, @ptrCast(&self.encryption.?));
+        self.xref_table.decrypt_fn = encrypt_writer.decryptObjectTrampoline;
+
+        // Drop any cached objects that were resolved BEFORE the hook
+        // was installed (e.g. the /Encrypt dict itself). They're
+        // plaintext — we don't want their cached form blocking a
+        // later decrypted re-resolution.
+        self.object_cache.clearRetainingCapacity();
     }
 
     /// Lazy-load fonts for a specific page (called on first extraction)
@@ -465,6 +641,12 @@ pub const Document = struct {
             }
             cache.deinit();
         }
+
+        // PR-W9: deinit the encryption context BEFORE the arena, so
+        // its file_key buffer is wiped + freed via the document's
+        // primary allocator (the context allocates from `self.allocator`,
+        // not the parsing arena).
+        if (self.encryption) |*ctx| ctx.deinit();
 
         // Free the arena which contains all parsed objects
         self.parsing_arena.deinit();

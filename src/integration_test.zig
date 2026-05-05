@@ -2266,3 +2266,178 @@ test "PR-W7 embedded font emits exactly five indirect-object slots" {
     // regression where a builtin path overlaps the embedded path.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/Subtype /Type1") == null);
 }
+
+// PR-W9 [feat]: encryption (RC4-128 V2/R3 + AES-128 V4/R4)
+// ===========================================================================
+
+fn buildEncryptedTestPdf(
+    allocator: std.mem.Allocator,
+    algorithm: zpdf.encrypt_writer.Algorithm,
+    user_password: []const u8,
+    owner_password: []const u8,
+    text: []const u8,
+) ![]u8 {
+    var doc = zpdf.pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(100, 700, .helvetica, 12, text);
+
+    // Deterministic PRNG for stable test output. AES IVs are still
+    // distinct across stream emissions because the PRNG state advances.
+    var prng = std.Random.DefaultPrng.init(0x5eed_5eed_5eed_5eed);
+    try doc.encrypt(.{
+        .user_password = user_password,
+        .owner_password = owner_password,
+        .permissions = .{},
+        .algorithm = algorithm,
+        .random = prng.random(),
+    });
+    return doc.write();
+}
+
+test "PR-W9: RC4-128 V2/R3 encrypt + decrypt round-trips" {
+    const allocator = std.testing.allocator;
+    const text = "Encrypted plaintext";
+    const bytes = try buildEncryptedTestPdf(
+        allocator,
+        .rc4_v2_r3_128,
+        "u",
+        "o",
+        text,
+    );
+    defer allocator.free(bytes);
+
+    // The /Encrypt dict must appear plaintext in the file.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Filter /Standard") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/V 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/R 3") != null);
+    // The plaintext must NOT appear unencrypted in the file.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, text) == null);
+
+    var doc = try zpdf.Document.openFromMemoryWithPassword(
+        allocator,
+        bytes,
+        "u",
+        zpdf.ErrorConfig.permissive(),
+    );
+    defer doc.close();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try doc.extractText(0, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), text) != null);
+}
+
+test "PR-W9: AES-128 V4/R4 encrypt + decrypt round-trips" {
+    const allocator = std.testing.allocator;
+    const text = "Encrypted plaintext";
+    const bytes = try buildEncryptedTestPdf(
+        allocator,
+        .aes_v4_r4_128,
+        "u",
+        "o",
+        text,
+    );
+    defer allocator.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/V 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/R 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/CFM /AESV2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, text) == null);
+
+    var doc = try zpdf.Document.openFromMemoryWithPassword(
+        allocator,
+        bytes,
+        "u",
+        zpdf.ErrorConfig.permissive(),
+    );
+    defer doc.close();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try doc.extractText(0, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), text) != null);
+}
+
+test "PR-W9: wrong password rejected with InvalidPassword" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildEncryptedTestPdf(
+        allocator,
+        .aes_v4_r4_128,
+        "good_user",
+        "owner_secret",
+        "secret content",
+    );
+    defer allocator.free(bytes);
+
+    try std.testing.expectError(error.InvalidPassword, zpdf.Document.openFromMemoryWithPassword(
+        allocator,
+        bytes,
+        "wrong_password",
+        zpdf.ErrorConfig.permissive(),
+    ));
+}
+
+test "PR-W9: owner password unlocks the document" {
+    const allocator = std.testing.allocator;
+    const text = "owner-can-read";
+    const bytes = try buildEncryptedTestPdf(
+        allocator,
+        .rc4_v2_r3_128,
+        "u",
+        "o",
+        text,
+    );
+    defer allocator.free(bytes);
+
+    var doc = try zpdf.Document.openFromMemoryWithPassword(
+        allocator,
+        bytes,
+        "o",
+        zpdf.ErrorConfig.permissive(),
+    );
+    defer doc.close();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try doc.extractText(0, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), text) != null);
+}
+
+test "PR-W9: /Encrypt indirect object body is not itself encrypted" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildEncryptedTestPdf(
+        allocator,
+        .aes_v4_r4_128,
+        "u",
+        "o",
+        "Encrypted plaintext",
+    );
+    defer allocator.free(bytes);
+
+    // The PDF spec REQUIRES the /Encrypt dict itself to be plaintext,
+    // since the reader needs to parse it before knowing how to
+    // decrypt anything else. We assert that by finding readable
+    // /Filter /Standard markers in the raw bytes.
+    const filter_idx = std.mem.indexOf(u8, bytes, "/Filter /Standard") orelse return error.TestFailed;
+    const o_idx = std.mem.indexOf(u8, bytes, "/O <") orelse return error.TestFailed;
+    const u_idx = std.mem.indexOf(u8, bytes, "/U <") orelse return error.TestFailed;
+    try std.testing.expect(filter_idx > 0);
+    try std.testing.expect(o_idx > filter_idx);
+    try std.testing.expect(u_idx > filter_idx);
+}
+
+test "PR-W9: /ID array appears in trailer" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildEncryptedTestPdf(
+        allocator,
+        .rc4_v2_r3_128,
+        "",
+        "",
+        "id-trailer-test",
+    );
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/ID [<") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "> <") != null);
+}
