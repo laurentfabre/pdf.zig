@@ -6623,31 +6623,18 @@ fn fuzzEncryptAuthUserRoundtrip(rng: std.Random, allocator: std.mem.Allocator, s
         perms,
         file_id,
     );
+    // Codex review of 4ca22db [P2]: wrong-password authentication MUST
+    // return error.InvalidPassword. A real 16-byte /U collision after
+    // MD5 + 50 rounds is effectively impossible (~1/2^128); accepting
+    // the success branch here lets a regressed authenticateUser silently
+    // authorise bad passwords without the fuzz target catching it. Make
+    // the success branch a hard invariant violation.
     if (wrong_result) |wrong_key| {
-        // Edge case: a 1-byte flip on a short pw could (with negligible
-        // probability after MD5+50 rounds) still recompute /U. If that
-        // happens, the recovered key MUST still byte-equal ctx.file_key
-        // — collisions in /U don't change the file_key derivation under
-        // the SAME password input, but they would here under a DIFFERENT
-        // password input, so this branch indicates either a near-zero
-        // collision (acceptable) or a real bug (file_key mismatch).
         defer {
             std.crypto.secureZero(u8, wrong_key);
             allocator.free(wrong_key);
         }
-        // Tolerate the cryptographic collision but flag a key mismatch:
-        // if computeFileKey is correct, the wrong password derives a
-        // different file_key. The recovered key SHOULD differ from the
-        // original ctx.file_key.
-        if (std.mem.eql(u8, wrong_key, ctx.file_key)) {
-            // Genuine collision (1/2^128 territory) — let it pass.
-        } else {
-            // The /U comparison passed but the file_keys differ — this
-            // is a defect in either computeUValueR3 or the /U compare,
-            // BUT: also reachable via the constant-time-compare-on-
-            // first-16-bytes-only design (§7.6.4.7 step b, 16/32 bytes
-            // of /U are arbitrary). Treat as info, not a bug.
-        }
+        return error.EncryptAuthAcceptedWrongPassword;
     } else |err| {
         if (err != encrypt_writer.Error.InvalidPassword) return err;
     }
