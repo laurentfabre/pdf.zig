@@ -80,6 +80,11 @@ pub const ExtractArgs = struct {
     /// non-zero if any error finding is emitted. Off by default —
     /// adversarial PDFs would otherwise refuse to open.
     validate_pdfua: bool = false,
+    /// PR-23d [feat]: when true, emit a single `kind:"a11y_tree"`
+    /// document-level record carrying the linearized accessibility
+    /// tree (full struct tree + reading_order). Off by default —
+    /// large records, only useful for a11y / chunking pipelines.
+    a11y_tree: bool = false,
 };
 
 pub const InfoArgs = struct {
@@ -210,6 +215,8 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             out.struct_tree = true;
         } else if (std.mem.eql(u8, a, "--validate-pdfua")) {
             out.validate_pdfua = true;
+        } else if (std.mem.eql(u8, a, "--a11y-tree")) {
+            out.a11y_tree = true;
         } else if (std.mem.eql(u8, a, "--scan-threshold")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -482,6 +489,25 @@ pub fn runExtract(allocator: std.mem.Allocator, io: std.Io, args: ExtractArgs) !
                 } else {
                     env.emitStructTreeEmpty() catch |e| return mapWriteErr(e);
                 }
+            }
+            // PR-23d [feat]: emit the linearized a11y tree (single
+            // record, doc-level) when --a11y-tree is set. The emitter
+            // itself handles the empty-tree case (`"root":null,
+            // "reading_order":[]`); we just need to hand it a tree
+            // value. On parse failure we synthesize an empty tree on
+            // the document's parsing arena so the record is still
+            // emitted — matches the --struct-tree posture.
+            if (args.a11y_tree) {
+                var tree = doc.getStructTree() catch zpdf.structtree.StructTree{
+                    .root = null,
+                    .elements = &.{},
+                    .allocator = allocator,
+                };
+                // NOTE: getStructTree returns a tree on the document's
+                // parsing arena — caller must NOT deinit it (see
+                // root.zig docstring). The synthesized empty tree
+                // above has no allocations to free.
+                zpdf.a11y_emitter.emit(&env, doc, &tree, allocator, .{}) catch |e| return mapWriteErr(e);
             }
             try writer.flush();
         },
@@ -1285,6 +1311,7 @@ fn writeHelp(io: std.Io) !void {
         \\  --images-dir DIR            output directory for --images=path (default: cwd)
         \\  --struct-tree               emit kind:"struct_tree" with full PDF/UA structure tree (off by default; large)
         \\  --validate-pdfua            run PDF/UA-1 validators; emit kind:"validation" findings, exit non-zero on any error
+        \\  --a11y-tree                 emit kind:"a11y_tree" with linearized accessibility tree + reading_order (off by default; large)
         \\
         \\New options:
         \\  -o, --output-file FILE      output PDF path (required)
@@ -1637,6 +1664,14 @@ test "PR-22e: --validate-pdfua flag is accepted and defaults off" {
 
     const cmd_on = try parseArgs(&.{ "extract", "--validate-pdfua", "foo.pdf" });
     try std.testing.expect(cmd_on.extract.validate_pdfua);
+}
+
+test "PR-23d: --a11y-tree flag is accepted and defaults off" {
+    const cmd_off = try parseArgs(&.{ "extract", "foo.pdf" });
+    try std.testing.expect(!cmd_off.extract.a11y_tree);
+
+    const cmd_on = try parseArgs(&.{ "extract", "--a11y-tree", "foo.pdf" });
+    try std.testing.expect(cmd_on.extract.a11y_tree);
 }
 
 test "PR-22e: pdfuaFindingForError maps the three errors to stable rules" {
