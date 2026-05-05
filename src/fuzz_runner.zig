@@ -2961,6 +2961,15 @@ fn fuzzBidiFormatCharacterStorm(
 ///   - getGlyphName(gid) for `gid < charsets.len` agrees with
 ///     getString(charsets[gid]) (both null or byte-equal).
 fn cffSweepInvariants(cp: *cff.CffParser) anyerror!void {
+    // Codex review of 899525c [P2]: `charstrings_index` is left
+    // `undefined` on parser-success paths that lack a CharStrings
+    // entry in the Top DICT (e.g., synthetic T3 fonts with an empty
+    // or non-matching Top DICT). Reading `.count` on an undefined
+    // field is UB and makes this invariant non-deterministic.
+    // src/cff.zig:89 already gates the parse step on
+    // `charstrings_offset > 0`; mirror that here so the harness
+    // only walks the index when it has been populated.
+    if (cp.charstrings_offset == 0) return;
     if (cp.charsets.len > cp.charstrings_index.count) {
         return error.CffCharsetsExceedCharstrings;
     }
