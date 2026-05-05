@@ -119,6 +119,13 @@ pub fn build(b: *std.Build) void {
     const qpdf_emit_root = b.createModule(.{ .root_source_file = b.path("audit/qpdf_emit_fixtures.zig"), .target = target, .optimize = optimize });
     qpdf_emit_root.addImport("testpdf", b.createModule(.{ .root_source_file = b.path("src/testpdf.zig"), .target = target, .optimize = optimize }));
     const qpdf_emit = b.addExecutable(.{ .name = "qpdf-emit-fixtures", .root_module = qpdf_emit_root });
+    // Expose the emitter as a named step so `audit/qpdf_check.py` can
+    // invoke `zig build qpdf-emit-fixtures` in CI before running qpdf.
+    // Locally, `zig build qpdf-check` covers both via `addArtifactArg`,
+    // but CI's pre-step needs the binary installed to `zig-out/bin/`
+    // explicitly.
+    const install_qpdf_emit = b.addInstallArtifact(qpdf_emit, .{});
+    b.step("qpdf-emit-fixtures", "Build the qpdf-emit-fixtures binary into zig-out/bin/").dependOn(&install_qpdf_emit.step);
     const run_qpdf_check = b.addSystemCommand(&.{ "python3", "audit/qpdf_check.py", "--emitter" });
     run_qpdf_check.addArtifactArg(qpdf_emit);
     if (b.args) |args| run_qpdf_check.addArgs(args);
