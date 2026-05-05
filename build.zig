@@ -270,6 +270,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_pdf_document_unit_tests = b.addRunArtifact(pdf_document_unit_tests);
 
+    // PR-W10c [feat]: structure-tree writer unit tests.
+    const struct_writer_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/struct_writer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_struct_writer_unit_tests = b.addRunArtifact(struct_writer_unit_tests);
+
     const markdown_to_pdf_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/markdown_to_pdf.zig"),
@@ -364,6 +374,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_stream_unit_tests.step);
     test_step.dependOn(&run_pdf_writer_unit_tests.step);
     test_step.dependOn(&run_pdf_document_unit_tests.step);
+    test_step.dependOn(&run_struct_writer_unit_tests.step);
     test_step.dependOn(&run_markdown_to_pdf_unit_tests.step);
     test_step.dependOn(&run_truetype_unit_tests.step);
     test_step.dependOn(&run_cmap_writer_unit_tests.step);

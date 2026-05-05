@@ -45,6 +45,14 @@ const image_writer = @import("image_writer.zig");
 const jpeg_meta = @import("jpeg_meta.zig");
 const encrypt_writer = @import("encrypt_writer.zig");
 const xmp_writer = @import("xmp_writer.zig");
+const struct_writer = @import("struct_writer.zig");
+
+// PR-W10c [feat]: re-export tagged-tree types so callers can write
+// `pdf_document.TaggedElement` / `.TaggedChild` without reaching
+// into struct_writer.zig directly.
+pub const TaggedElement = struct_writer.TaggedElement;
+pub const TaggedChild = struct_writer.TaggedChild;
+pub const StructTreeBuilder = struct_writer.StructTreeBuilder;
 
 // PR-W10b [feat]: embedded sRGB v2 IEC61966-2.1 ICC profile, baked into
 // the binary at compile time via `@embedFile`. Used as the
@@ -704,6 +712,12 @@ pub const DocumentBuilder = struct {
     /// `error.MarkedContentOverflow` past that.
     next_mcid: u32 = 0,
 
+    /// PR-W10c [feat]: optional structure-tree builder. Null means
+    /// "no /StructTreeRoot is emitted" (back-compat default — every
+    /// pre-W10c test stays byte-equivalent). Populated via
+    /// `setStructTree`; consumed in `write()`.
+    struct_tree: ?struct_writer.StructTreeBuilder = null,
+
     const AuxObject = struct {
         obj_num: u32,
         /// `null` means "reserved but unfilled" — caller must call
@@ -722,6 +736,10 @@ pub const DocumentBuilder = struct {
         UnmatchedEndTag,
         PageDetached,
         MarkedContentOverflow,
+        // PR-W10c: struct-tree writer.
+        StructTreeTooDeep,
+        StructTreeAlreadySet,
+        StructTreeNotSet,
     };
 
     pub fn init(allocator: std.mem.Allocator) DocumentBuilder {
@@ -763,6 +781,10 @@ pub const DocumentBuilder = struct {
         if (self.encryption) |*ctx| ctx.deinit();
         // PR-WX1: free the duped /Lang BCP-47 tag if `setLang` ran.
         if (self.lang_bcp47) |s| self.allocator.free(s);
+        // PR-W10c: free the struct-tree builder's internal pre-pass
+        // node list. The user-supplied TaggedElement tree itself is
+        // borrowed and freed by the caller.
+        if (self.struct_tree) |*st| st.deinit();
         self.writer.deinit();
     }
 
@@ -1019,6 +1041,24 @@ pub const DocumentBuilder = struct {
         self.mark_info_marked = true;
     }
 
+    /// PR-W10c [feat]: install a tagged-tree root that `write()` will
+    /// emit as `/StructTreeRoot` + a forest of `/StructElem` indirect
+    /// objects. The caller owns `root` and its descendants — no bytes
+    /// are duped — so the tree must outlive `write()`. Validates the
+    /// recursion bound (`MAX_DEPTH = 64`) up front; if `error.StructTreeTooDeep`
+    /// is returned, no document state has changed and the call is
+    /// safe to retry on a different tree. Single-use: calling twice
+    /// returns `error.StructTreeAlreadySet`.
+    pub fn setStructTree(self: *DocumentBuilder, root: *struct_writer.TaggedElement) !void {
+        if (self.written) return error.DocumentAlreadyWritten;
+        if (self.struct_tree == null) {
+            self.struct_tree = struct_writer.StructTreeBuilder.init(self.allocator);
+        }
+        // setRoot itself rejects re-entry, so a second call surfaces
+        // as error.StructTreeAlreadySet from the inner builder.
+        try self.struct_tree.?.setRoot(root);
+    }
+
     /// PR-WX1 [refactor]: hand out a fresh MCID. Bounded by `u30`
     /// (≈1 billion) to keep TigerStyle wrap-around assertions
     /// meaningful — past that, callers get
@@ -1077,6 +1117,16 @@ pub const DocumentBuilder = struct {
             self.output_intents_obj = try w.allocObjectNum();
         }
 
+        // PR-W10c: reserve the /StructTreeRoot indirect-object number
+        // BEFORE the catalog body is written so we can splice
+        // `/StructTreeRoot N 0 R` into the catalog dict. The bodies
+        // themselves are emitted in phase 3f.5, below, after aux
+        // objects; reservation here keeps the writer flow predictable
+        // and aligns with the W10a/W10b pattern above.
+        if (self.struct_tree) |*st| {
+            self.struct_tree_root_obj = try st.reserve(w);
+        }
+
         // PR-W11: reserve one indirect-object number per registered
         // resource BEFORE any leaf /Page references them. Pages emit
         // `/Font << /F0 N 0 R … >>` referencing these numbers, so the
@@ -1118,6 +1168,13 @@ pub const DocumentBuilder = struct {
         if (self.output_intents_obj) |oi_num| {
             try w.writeRaw(" /OutputIntents ");
             try w.writeRef(oi_num, 0);
+        }
+        // PR-W10c: catalog reference to the structure tree. Anchored
+        // last in the W10a/W10b/W10c chronological chain so the dict
+        // ordering matches the reservation ordering above.
+        if (self.struct_tree_root_obj) |root_obj| {
+            try w.writeRaw(" /StructTreeRoot ");
+            try w.writeRef(root_obj, 0);
         }
         try w.writeRaw(" >>");
         try w.endObject();
@@ -1225,6 +1282,15 @@ pub const DocumentBuilder = struct {
             try w.beginObject(aux.obj_num, 0);
             try w.writeRaw(aux.payload orelse "<< >>");
             try w.endObject();
+        }
+
+        // PR-W10c [feat]: 3f.5 — /StructTreeRoot + /StructElem bodies.
+        // Emitted after aux objects so any auxiliary that references a
+        // struct element (today: none, but future-compatible) can rely
+        // on its number being already-allocated. The catalog already
+        // points at `struct_tree_root_obj` from phase 3a.
+        if (self.struct_tree) |*st| {
+            _ = try st.emit(w, page_obj_nums);
         }
 
         // 3g. /Info dict (optional).
@@ -2840,4 +2906,176 @@ test "PR-W10b: every PdfALevel variant emits OutputIntents" {
         try std.testing.expect(std.mem.indexOf(u8, bytes, "/GTS_PDFA2") != null);
         try std.testing.expect(std.mem.indexOf(u8, bytes, "/DestOutputProfile") != null);
     }
+}
+
+// =====================================================================
+// PR-W10c [feat] tests: structure-tree writer integration
+// =====================================================================
+
+test "PR-W10c: no-op when struct_tree is null - byte-equivalent" {
+    const allocator = std.testing.allocator;
+
+    // Reference: minimal one-page doc with a tag, no struct_tree set.
+    var ref = DocumentBuilder.init(allocator);
+    defer ref.deinit();
+    const page_ref = try ref.addPage(.{ 0, 0, 612, 792 });
+    _ = try page_ref.beginTag("H1", null);
+    try page_ref.drawText(72, 720, .helvetica, 12, "x");
+    try page_ref.endTag();
+    const ref_bytes = try ref.write();
+    defer allocator.free(ref_bytes);
+
+    // Same content, struct_tree default-null — must be byte-equivalent.
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    _ = try page.beginTag("H1", null);
+    try page.drawText(72, 720, .helvetica, 12, "x");
+    try page.endTag();
+    try std.testing.expectEqual(@as(?u32, null), doc.struct_tree_root_obj);
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expectEqualSlices(u8, ref_bytes, bytes);
+}
+
+test "PR-W10c: round-trip - built tree matches parsed tree" {
+    const zpdf = @import("root.zig");
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    try doc.markAsTagged();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    const mcid_h1 = try page.beginTag("H1", null);
+    try page.drawText(72, 720, .helvetica, 18, "Hello Tagged");
+    try page.endTag();
+
+    // Build:  Document -> H1 -> [MCID 0]
+    var h1_kids: [1]TaggedChild = .{.{ .mcid = .{ .page_idx = 0, .mcid = mcid_h1 } }};
+    var h1_elem: TaggedElement = .{ .tag = "H1", .children = h1_kids[0..] };
+    var doc_kids: [1]TaggedChild = .{.{ .element = &h1_elem }};
+    var doc_elem: TaggedElement = .{ .tag = "Document", .children = doc_kids[0..] };
+
+    try doc.setStructTree(&doc_elem);
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // Re-open the bytes and walk the tree via the PR-21 reader.
+    var parsed = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer parsed.close();
+
+    try std.testing.expect(parsed.hasStructureTree());
+    const tree = try parsed.getStructTree();
+    // Note: tree is allocated on parsed's parsing_arena - do NOT
+    // call tree.deinit().
+
+    try std.testing.expect(tree.root != null);
+    const root = tree.root.?;
+    try std.testing.expectEqualStrings("Document", root.struct_type);
+    try std.testing.expectEqual(@as(usize, 1), root.children.len);
+
+    // Root has one child element (H1).
+    switch (root.children[0]) {
+        .element => |e| {
+            try std.testing.expectEqualStrings("H1", e.struct_type);
+            try std.testing.expectEqual(@as(usize, 1), e.children.len);
+            // H1 has one MCID child matching what beginTag returned.
+            switch (e.children[0]) {
+                .mcid => |m| try std.testing.expectEqual(@as(i32, @intCast(mcid_h1)), m.mcid),
+                .element => try std.testing.expect(false),
+            }
+        },
+        .mcid => try std.testing.expect(false),
+    }
+}
+
+test "PR-W10c: depth 64 emits OK; depth 65 rejected" {
+    const allocator = std.testing.allocator;
+
+    // Variant A: depth-64 chain (indices 0..63).
+    {
+        var elems: [64]TaggedElement = undefined;
+        var kids: [64][1]TaggedChild = undefined;
+        for (0..64) |i| elems[i] = .{ .tag = "Sect" };
+        var i: usize = 0;
+        while (i < 63) : (i += 1) {
+            kids[i] = .{TaggedChild{ .element = &elems[i + 1] }};
+            elems[i].children = kids[i][0..];
+        }
+
+        var doc = DocumentBuilder.init(allocator);
+        defer doc.deinit();
+        _ = try doc.addPage(.{ 0, 0, 612, 792 });
+        try doc.setStructTree(&elems[0]);
+        const bytes = try doc.write();
+        defer allocator.free(bytes);
+        try std.testing.expect(doc.struct_tree_root_obj != null);
+    }
+
+    // Variant B: depth-65 chain rejected at setStructTree.
+    {
+        var elems: [65]TaggedElement = undefined;
+        var kids: [65][1]TaggedChild = undefined;
+        for (0..65) |i| elems[i] = .{ .tag = "Sect" };
+        var i: usize = 0;
+        while (i < 64) : (i += 1) {
+            kids[i] = .{TaggedChild{ .element = &elems[i + 1] }};
+            elems[i].children = kids[i][0..];
+        }
+
+        var doc = DocumentBuilder.init(allocator);
+        defer doc.deinit();
+        _ = try doc.addPage(.{ 0, 0, 612, 792 });
+        try std.testing.expectError(error.StructTreeTooDeep, doc.setStructTree(&elems[0]));
+    }
+}
+
+test "PR-W10c: setStructTree rejects after write" {
+    const allocator = std.testing.allocator;
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    _ = try doc.addPage(.{ 0, 0, 612, 792 });
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var leaf: TaggedElement = .{ .tag = "P" };
+    try std.testing.expectError(error.DocumentAlreadyWritten, doc.setStructTree(&leaf));
+}
+
+test "PR-W10c: FailingAllocator sweep on doc-level emit - no leaks" {
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+
+        var doc = DocumentBuilder.init(allocator);
+        defer doc.deinit();
+
+        const result = w10cAllocSweepFlow(&doc);
+        if (result) |bytes| {
+            allocator.free(bytes);
+        } else |err| {
+            // OOM and the writer's WriteFailed are both legitimate
+            // failure-modes for an early-failure path. Bytes-back-to-
+            // FailingAllocator scopes any leak detection.
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+        }
+    }
+}
+
+fn w10cAllocSweepFlow(doc: *DocumentBuilder) ![]u8 {
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    const mcid = try page.beginTag("P", null);
+    try page.drawText(72, 720, .helvetica, 12, "x");
+    try page.endTag();
+
+    var p_kids: [1]TaggedChild = .{.{ .mcid = .{ .page_idx = 0, .mcid = mcid } }};
+    var p_elem: TaggedElement = .{ .tag = "P", .children = p_kids[0..] };
+    var doc_kids: [1]TaggedChild = .{.{ .element = &p_elem }};
+    var doc_elem: TaggedElement = .{ .tag = "Document", .children = doc_kids[0..] };
+    try doc.setStructTree(&doc_elem);
+    return doc.write();
 }
