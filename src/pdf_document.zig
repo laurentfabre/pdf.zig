@@ -168,6 +168,17 @@ pub const PageBuilder = struct {
     /// PR-W8: per-page image handles referenced by `drawImage`. Same
     /// dedup-on-insert shape as `font_handles`.
     image_handles: std.ArrayList(ImageHandle),
+    /// PR-WX1 [refactor]: stack of open BDC tag names so `endTag` can
+    /// validate ordering. Each entry is a duped slice owned by the
+    /// page (allocator = self.allocator); freed in `deinit` and on
+    /// successful `endTag`. Tag-mismatch is unrecoverable and the
+    /// page is left in a poisoned state — callers must `deinit`.
+    open_tag_stack: std.ArrayList([]u8),
+    /// PR-WX1 [refactor]: back-pointer to the owning DocumentBuilder.
+    /// Borrowed; not owned. Used by `beginTag` to allocate a
+    /// document-wide monotonic MCID. Stays null until the page is
+    /// attached via `DocumentBuilder.addPage`.
+    document: ?*DocumentBuilder = null,
     /// Document-wide resource registry. Borrowed from the owning
     /// `DocumentBuilder`; not owned. Pages MUST NOT outlive the
     /// document.
@@ -196,6 +207,7 @@ pub const PageBuilder = struct {
             .extras_raw = .empty,
             .font_handles = .empty,
             .image_handles = .empty,
+            .open_tag_stack = .empty,
             .registry = registry,
             .allocator = allocator,
         };
@@ -207,6 +219,11 @@ pub const PageBuilder = struct {
         self.extras_raw.deinit(self.allocator);
         self.font_handles.deinit(self.allocator);
         self.image_handles.deinit(self.allocator);
+        // PR-WX1: free duped tag names left on the stack (e.g. after
+        // an alloc failure mid-`beginTag` or a caller that forgot to
+        // `endTag` before write).
+        for (self.open_tag_stack.items) |t| self.allocator.free(t);
+        self.open_tag_stack.deinit(self.allocator);
     }
 
     /// Append `handle` to this page's font set if not already present.
@@ -446,7 +463,95 @@ pub const PageBuilder = struct {
 
         try self.content.appendSlice(self.allocator, scratch_aw.written());
     }
+
+    /// PR-WX1 [refactor]: open a marked-content tagged block. Writes
+    /// `/{tag} <</MCID N>> BDC` into the content stream and returns
+    /// the MCID assigned by the document.
+    ///
+    /// Wave-3.2 W10c will consume `alt` to populate the matching
+    /// struct-tree leaf. Today, when `alt` is non-null and the
+    /// document is tagged, it is silently dropped. (See doc comment
+    /// on `DocumentBuilder.next_mcid` for the global-monotonic
+    /// numbering rationale.)
+    ///
+    /// Errors:
+    /// - `error.InvalidTagName` if `tag` contains characters outside
+    ///   `[A-Za-z0-9_-]`. Strictly tighter than ISO 32000-1 §7.3.5
+    ///   name-tokens — we use the conservative subset that survives
+    ///   every reader and avoids the # escape rule entirely.
+    /// - `error.PageDetached` if the page was constructed without a
+    ///   document back-pointer (test-only path; production callers
+    ///   always go through `DocumentBuilder.addPage`).
+    /// - `error.MarkedContentOverflow` if the document MCID counter
+    ///   would wrap past `u30` (≈1 billion tags — far beyond any
+    ///   real document).
+    pub fn beginTag(self: *PageBuilder, tag: []const u8, alt: ?[]const u8) !u32 {
+        // TODO(W10c): when alt is non-null and self.document.?.mark_info_marked
+        // is true, capture (tag, alt, mcid) into the in-progress struct tree.
+        _ = alt;
+
+        if (!isValidTagName(tag)) return error.InvalidTagName;
+        const doc = self.document orelse return error.PageDetached;
+
+        const mcid = try doc.allocMcid();
+
+        // Push the tag onto the open-tag stack BEFORE mutating the
+        // content stream — if the dupe + append fails, we've emitted
+        // nothing and the page is still consistent.
+        const owned_tag = try self.allocator.dupe(u8, tag);
+        errdefer self.allocator.free(owned_tag);
+        try self.open_tag_stack.append(self.allocator, owned_tag);
+        errdefer _ = self.open_tag_stack.pop();
+
+        var scratch_aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer scratch_aw.deinit();
+        const ws = &scratch_aw.writer;
+
+        try ws.writeAll("/");
+        try ws.writeAll(tag);
+        try ws.writeAll(" <</MCID ");
+        try ws.print("{d}", .{mcid});
+        try ws.writeAll(">> BDC\n");
+
+        try self.content.appendSlice(self.allocator, scratch_aw.written());
+
+        return mcid;
+    }
+
+    /// PR-WX1 [refactor]: close the most recently opened tag with
+    /// `EMC`. Returns `error.UnmatchedEndTag` if the stack is empty
+    /// (over-closed). Mismatched nesting is impossible because we
+    /// don't take a tag-name argument — the caller is forced to
+    /// close in LIFO order.
+    pub fn endTag(self: *PageBuilder) !void {
+        if (self.open_tag_stack.items.len == 0) return error.UnmatchedEndTag;
+
+        try self.content.appendSlice(self.allocator, "EMC\n");
+
+        // Only free + pop after the content append succeeds — otherwise
+        // the stream is half-mutated and the next `endTag` would emit
+        // a duplicate EMC.
+        const popped = self.open_tag_stack.pop().?;
+        self.allocator.free(popped);
+    }
 };
+
+/// PR-WX1 [refactor]: tighter than ISO 32000-1 §7.3.5 name-token
+/// rules — we accept ASCII letters, digits, `_`, `-` only. Empty is
+/// rejected. This subset survives every reader without the `#XX`
+/// escape rule and matches the common PDF/UA tag vocabulary
+/// (H1–H6, P, Span, Figure, Table, etc.).
+fn isValidTagName(tag: []const u8) bool {
+    if (tag.len == 0) return false;
+    for (tag) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
 
 /// Tiny mirror of `pdf_writer.Writer.writeReal`: emit a finite f64
 /// in the spec's restricted form (no exponent, trailing zeros
@@ -462,6 +567,19 @@ fn writeRealTo(writer: anytype, n: f64) !void {
     }
     try writer.writeAll(s[0..end]);
 }
+
+/// PR-WX1 [refactor]: PDF/A conformance level passed to
+/// `DocumentBuilder.markAsPdfA`. Today the value is stored only —
+/// W10a (XMP) + W10b (OutputIntents) consume it at emission time.
+///
+/// Subset semantics:
+/// - `b1` / `b2` / `b3`: visual-only (no struct tree required).
+/// - `u1` / `u2` / `u3`: PDF/UA-1 (tagged + struct tree required).
+/// - `a1` / `a2` / `a3`: full accessibility (tagged + Unicode-mapped).
+///
+/// All non-`b` levels imply `markAsTagged()` because PDF/A-2a+ and
+/// every PDF/UA level require `/MarkInfo /Marked true`.
+pub const PdfALevel = enum { b1, b2, b3, u1, u2, u3, a1, a2, a3 };
 
 pub const DocumentBuilder = struct {
     allocator: std.mem.Allocator,
@@ -517,6 +635,42 @@ pub const DocumentBuilder = struct {
     /// bytes generated by `encrypt(...)`.
     file_id: ?[16]u8 = null,
 
+    /// PR-WX1 [refactor]: PDF/UA + PDF/A catalog flags. Tier-1 emits
+    /// nothing for these — `write()` ignores them entirely. Wave 3.2
+    /// W10a populates `xmp_metadata_obj`; W10b populates
+    /// `output_intents_obj`; W10c populates `struct_tree_root_obj`.
+    /// All four are reserved by the implementer of the matching
+    /// W10x PR — WX1 only stores the user-facing intent.
+    mark_info_marked: bool = false,
+    /// PR-WX1: BCP-47 language tag for the document /Lang entry,
+    /// e.g. "en-US". Owned (duped from caller bytes); freed by
+    /// `deinit`. Setter is `setLang`.
+    lang_bcp47: ?[]u8 = null,
+    /// PR-WX1: when set, drives W10a's XMP emission and W10b's
+    /// output-intent ICC selection. Setter is `markAsPdfA`.
+    pdfa_level: ?PdfALevel = null,
+    /// PR-WX1: indirect-object number of the /Metadata stream.
+    /// Populated by W10a. Today: always null.
+    xmp_metadata_obj: ?u32 = null,
+    /// PR-WX1: indirect-object number of the /OutputIntents array.
+    /// Populated by W10b. Today: always null.
+    output_intents_obj: ?u32 = null,
+    /// PR-WX1: indirect-object number of the /StructTreeRoot.
+    /// Populated by W10c. Today: always null.
+    struct_tree_root_obj: ?u32 = null,
+    /// PR-WX1: monotonic per-document MCID counter. Bumped by
+    /// `allocMcid` (called from `PageBuilder.beginTag`).
+    ///
+    /// PDF/UA expects MCIDs to be unique within a single page's
+    /// /Contents stream, but in practice every reader we've audited
+    /// (poppler, pdf.js, qpdf, our own PR-21 reader) accepts a
+    /// global-monotonic counter. Going global lets the reader-side
+    /// MCID resolver (PR-23a) collect leaves into a flat list
+    /// without page-aware re-keying. Capped at u30 to keep `assert`s
+    /// honest under fuzzing — `allocMcid` returns
+    /// `error.MarkedContentOverflow` past that.
+    next_mcid: u32 = 0,
+
     const AuxObject = struct {
         obj_num: u32,
         /// `null` means "reserved but unfilled" — caller must call
@@ -526,7 +680,16 @@ pub const DocumentBuilder = struct {
         payload: ?[]u8,
     };
 
-    pub const Error = pdf_writer.Writer.Error || error{ NoPages, DocumentAlreadyWritten, UnknownAuxObject };
+    pub const Error = pdf_writer.Writer.Error || error{
+        NoPages,
+        DocumentAlreadyWritten,
+        UnknownAuxObject,
+        // PR-WX1: page tagging + catalog flag setters.
+        InvalidTagName,
+        UnmatchedEndTag,
+        PageDetached,
+        MarkedContentOverflow,
+    };
 
     pub fn init(allocator: std.mem.Allocator) DocumentBuilder {
         return .{
@@ -565,6 +728,8 @@ pub const DocumentBuilder = struct {
         self.embedded_font_bytes.deinit(self.allocator);
         // PR-W9: zeroes + frees the file_key buffer.
         if (self.encryption) |*ctx| ctx.deinit();
+        // PR-WX1: free the duped /Lang BCP-47 tag if `setLang` ran.
+        if (self.lang_bcp47) |s| self.allocator.free(s);
         self.writer.deinit();
     }
 
@@ -627,6 +792,8 @@ pub const DocumentBuilder = struct {
         page.* = PageBuilder.init(self.allocator, &self.registry, media_box);
         page.obj_num = page_num;
         page.content_obj_num = content_num;
+        // PR-WX1: back-pointer for `beginTag` MCID allocation.
+        page.document = self;
         try self.pages.append(self.allocator, page);
         return page;
     }
@@ -784,6 +951,52 @@ pub const DocumentBuilder = struct {
         if (self.written) return error.DocumentAlreadyWritten;
         self.catalog_extras_raw.clearRetainingCapacity();
         try self.catalog_extras_raw.appendSlice(self.allocator, raw);
+    }
+
+    /// PR-WX1 [refactor]: declare this document as tagged. Idempotent.
+    /// Stores `mark_info_marked = true`; emission lives in W10c.
+    /// Returns `error.DocumentAlreadyWritten` after `write()`.
+    pub fn markAsTagged(self: *DocumentBuilder) !void {
+        if (self.written) return error.DocumentAlreadyWritten;
+        self.mark_info_marked = true;
+    }
+
+    /// PR-WX1 [refactor]: set the document /Lang entry. `bcp47` is
+    /// duped — caller may free immediately. Calling twice replaces
+    /// the previous value (the old slice is freed). No format
+    /// validation today; W10a will tighten this when XMP escapes
+    /// the value.
+    pub fn setLang(self: *DocumentBuilder, bcp47: []const u8) !void {
+        if (self.written) return error.DocumentAlreadyWritten;
+        const new_owned = try self.allocator.dupe(u8, bcp47);
+        errdefer self.allocator.free(new_owned);
+        if (self.lang_bcp47) |old| self.allocator.free(old);
+        self.lang_bcp47 = new_owned;
+    }
+
+    /// PR-WX1 [refactor]: declare PDF/A conformance. Stores `level`
+    /// and implicitly calls `markAsTagged()` because every PDF/A
+    /// level above /R 1 (and every PDF/UA level) requires
+    /// `/MarkInfo /Marked true`. The b1/b2/b3 visual subset also
+    /// gets the flag — strictly tighter than the spec but
+    /// harmless: a tagged b-level PDF still validates.
+    pub fn markAsPdfA(self: *DocumentBuilder, level: PdfALevel) !void {
+        if (self.written) return error.DocumentAlreadyWritten;
+        self.pdfa_level = level;
+        self.mark_info_marked = true;
+    }
+
+    /// PR-WX1 [refactor]: hand out a fresh MCID. Bounded by `u30`
+    /// (≈1 billion) to keep TigerStyle wrap-around assertions
+    /// meaningful — past that, callers get
+    /// `error.MarkedContentOverflow` instead of an opaque counter
+    /// reset. Real-world tagged PDFs rarely exceed 10⁵ MCIDs.
+    fn allocMcid(self: *DocumentBuilder) !u32 {
+        const MCID_MAX: u32 = (1 << 30) - 1;
+        if (self.next_mcid > MCID_MAX) return error.MarkedContentOverflow;
+        const id = self.next_mcid;
+        self.next_mcid += 1;
+        return id;
     }
 
     /// Assemble the document and return owned bytes. Caller frees with
