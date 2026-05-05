@@ -94,7 +94,7 @@ the raw-bytes boundary and only deeper-API or stateful fuzzing remains.
 
 | # | Module | Surface | Current coverage | Loop iter |
 |---:|---|---|---|---:|
-| 1 | `decompress.zig` | FlateDecode / RunLengthDecode / ASCIIHex / ASCII85 streams | iter-1 done — 2 default + 1 aggressive-gate; ASCII85 u32 overflow surfaced (Finding 005) | ✅ iter 1 |
+| 1 | `decompress.zig` | FlateDecode / RunLengthDecode / ASCIIHex / ASCII85 streams | iter-1 done — 2 default + 1 aggressive-gate; ASCII85 u32 overflow surfaced (Finding 005). iter-5 done — 3 default-gate differentials (RLE, AsciiHex, multi-filter chain); flate-vs-stdlib pivot documented (decompress.zig:135 wraps stdlib). | ✅ iter 1, 5 |
 | 2 | `parser.zig` | tokenizer, name-tree, dict, stream-len | iter-2 done — 3 default-gate targets reaching `parseObject`, `parseIndirectObject`, and `initAt` directly; no findings | ✅ iter 2 |
 | 3 | `interpreter.zig` | content-stream operators (q/Q, cm, Tj, BDC/EMC, Do…) | iter-3 done — 2 default-gate targets (lexer + BDC/EMC nesting via DocumentBuilder); 3rd target dropped due to Finding 006 (ContentInterpreter bit-rot) | ✅ iter 3 |
 | 4 | `bidi.zig` | UAX #9 Level-1 resolution | none | |
@@ -128,6 +128,7 @@ the raw-bytes boundary and only deeper-API or stateful fuzzing remains.
 | 2 | 2026-05-05 | parser.zig (Parser.parseObject / parseIndirectObject / initAt) | parser_object_pdfish · parser_indirect_object_random · parser_init_at_offset_random | none — all three targets clean at 100k iters in ReleaseSafe | parser targets at 100k iters: pdfish 155 ms, indirect 16 ms, initAt 4 ms (full bench rerun pending) | #76 |
 | 3 | 2026-05-05 | interpreter.zig (content-stream operators) | interpreter_random_ops · interpreter_bdc_emc_nesting | **YES — Finding 006**: `ContentInterpreter(Writer)` is 0.16-stale (managed-ArrayList API at interpreter.zig:103 + 172). Compile-time only; no user-reachable runtime impact (the type is public surface but unused — extractContentStream drives ContentLexer directly). | iter-3 targets at 100k: random_ops 6.0 s, bdc_emc 17.0 s | #76 |
 | 4 | 2026-05-05 | pdf_writer / DocumentBuilder ↔ Document round-trip (tier 3) | writer_drawtext_roundtrip · writer_multipage_count · writer_text_escape_roundtrip | none — all 3 default-gate targets clean at 100k iters in ReleaseSafe | iter-4 targets at 100k: drawtext_roundtrip 12.2 s · multipage_count 53.6 s · text_escape_roundtrip 8.3 s | #76 |
+| 5 | 2026-05-05 | decompress.zig differential (tier 5) — encoder/decoder round-trip on RLE / ASCIIHex / multi-filter chain. **Pivoted away from flate-vs-stdlib**: src/decompress.zig:135 wraps `std.compress.flate.Decompress` directly, so a flate differential is tautological. Reference encoders are inline in fuzz_runner.zig (encodeRunLengthLiteral · encodeRunLengthMixed · encodeAsciiHex). Multi-filter chain target uses `/Filter [ASCIIHexDecode RunLengthDecode]` to exercise the inter-stage ownership transfer in `decompressStream`. | decompress_runlength_diff · decompress_ascii_hex_diff · decompress_filter_chain_diff | none — all 3 default-gate targets clean at 100k iters in ReleaseSafe (initial encoder bug in repeat-mode RLE was caught by the differential property and fixed before commit; details in PR body) | iter-5 targets at 100k: runlength_diff 1.5 s · ascii_hex_diff 2.0 s · filter_chain_diff 1.5 s | #76 |
 
 ## Rules the loop must obey
 

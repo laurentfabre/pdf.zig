@@ -129,6 +129,15 @@ const TARGETS = [_]Target{
     .{ .name = "writer_drawtext_roundtrip", .run = fuzzWriterDrawTextRoundtrip },
     .{ .name = "writer_multipage_count", .run = fuzzWriterMultipageCount },
     .{ .name = "writer_text_escape_roundtrip", .run = fuzzWriterTextEscapeRoundtrip },
+    // Iter-5 (audit/fuzz_loop_state.md tier 5 — differential fuzz). The
+    // natural flate-vs-stdlib differential is a tautology because
+    // src/decompress.zig:135 wraps `std.compress.flate.Decompress`
+    // directly. We pivot to encoder/decoder differentials on the three
+    // independent legacy decoders. See the `decompress.zig differential`
+    // section below for the full design rationale.
+    .{ .name = "decompress_runlength_diff", .run = fuzzDecompressRunLengthDiff },
+    .{ .name = "decompress_ascii_hex_diff", .run = fuzzDecompressAsciiHexDiff },
+    .{ .name = "decompress_filter_chain_diff", .run = fuzzDecompressFilterChainDiff },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -1238,6 +1247,283 @@ fn encodeAscii85(allocator: std.mem.Allocator, data: []const u8) error{OutOfMemo
     return out.toOwnedSlice(allocator);
 }
 
+// ============================================================================
+// Targets — decompress.zig differential (iter-5, tier-5)
+// ============================================================================
+//
+// Differential design notes (audit/fuzz_loop_state.md §"Complexity ladder"
+// tier 5).
+//
+// We pivot away from FlateDecode-vs-stdlib because src/decompress.zig:135
+// already wraps `std.compress.flate.Decompress` directly — running a
+// "differential" between our wrapper and the same stdlib it calls is a
+// tautology. Instead we exercise the three legacy decoders (RunLength,
+// ASCIIHex, multi-filter chain) against an independent reference encoder
+// implemented inline below. The differential property is:
+//
+//   decompressStream(filter, encode_ref(plain)) == plain  (byte-equal)
+//
+// On any disagreement we have a real bug in either the reference encoder
+// or the production decoder; the encoders are intentionally minimal /
+// straight-line so review can pin which side is at fault.
+//
+// We do NOT include ASCII85 here — iter-1 already covered it round-trip
+// (reproducer-only because of Finding 005 u32 overflow). Adding another
+// ASCII85 path would either re-trip Finding 005 (forcing reproducer-only
+// gating) or duplicate iter-1 work.
+
+/// Reference RunLength encoder. Emits PDF spec-compliant byte stream:
+///   - literal run: length byte 0..127 means "next length+1 bytes are
+///     literal data"
+///   - repeat run: length byte 129..255 means "repeat the next byte
+///     257-length times"
+///   - 128 is the EOD marker (always emitted at the end)
+///
+/// Strategy: emit literal-only runs of up to 128 bytes. This is suboptimal
+/// for compression but trivially correct, and exercises the literal-copy
+/// path in the production decoder (decompress.zig:592-597). Repeat runs
+/// are exercised via an alternate biased path triggered ~50% of iters.
+fn encodeRunLengthLiteral(allocator: std.mem.Allocator, data: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < data.len) {
+        const remaining = data.len - i;
+        const run_len = @min(remaining, 128);
+        try out.append(allocator, @as(u8, @intCast(run_len - 1))); // length byte: run_len - 1
+        try out.appendSlice(allocator, data[i..][0..run_len]);
+        i += run_len;
+    }
+    try out.append(allocator, 128); // EOD
+    return out.toOwnedSlice(allocator);
+}
+
+/// Reference RunLength encoder using repeat runs. PDF spec: a length byte
+/// of 129..255 means "repeat the next byte (257-length) times" → repeat
+/// counts of 128..2 (the spec cannot express a single-byte "repeat once").
+///
+/// Strategy: encode every contiguous run of ≥2 identical bytes as a
+/// repeat packet (clamped to 128 per packet), and every other byte as a
+/// 1-byte literal packet. This is a real PDF RLE encoder, exercises the
+/// repeat path in decompress.zig:599-604, and the differential property
+/// `decode(encode(x)) == x` holds for any plaintext.
+fn encodeRunLengthMixed(allocator: std.mem.Allocator, data: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < data.len) {
+        // Count run of identical bytes starting at i.
+        var run: usize = 1;
+        while (i + run < data.len and data[i + run] == data[i] and run < 128) {
+            run += 1;
+        }
+
+        if (run >= 2) {
+            // Repeat packet: length byte = 257 - run, then the byte.
+            try out.append(allocator, @as(u8, @intCast(257 - run)));
+            try out.append(allocator, data[i]);
+            i += run;
+        } else {
+            // Literal packet of exactly 1 byte: length=0 → "next 1 byte".
+            try out.append(allocator, 0);
+            try out.append(allocator, data[i]);
+            i += 1;
+        }
+    }
+    try out.append(allocator, 128); // EOD
+    return out.toOwnedSlice(allocator);
+}
+
+/// RunLength differential: encode random plaintext with our reference
+/// encoder, decode through `decompressStream(RunLengthDecode)`, assert
+/// byte-equality.
+///
+/// Invariants:
+///   - decode(encode(x)) == x  (the differential property)
+///   - decompressStream returns Ok on every well-formed encode (any
+///     error is a finding)
+///   - no panic, no leak
+///
+/// Why this catches bugs the iter-1 `decompress_runlength_random` misses:
+/// random bytes rarely form a long literal run that exhausts the 128-byte
+/// max-literal-chunk boundary. The reference encoder emits exactly that
+/// boundary on inputs ≥128 bytes, exercising the chunk-rollover branch.
+fn fuzzDecompressRunLengthDiff(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const filter = parser.Object{ .name = "RunLengthDecode" };
+
+    // Plaintext capped at scratch.len/2 so the encoded form (worst case
+    // 2× input for the repeat encoder, plus EOD byte) fits in scratch
+    // budget for downstream consumers. We allocate the encoded buffer
+    // off the heap so this is just a logical bound.
+    const plain_len = rng.intRangeAtMost(usize, 0, scratch.len / 2);
+    rng.bytes(scratch[0..plain_len]);
+    const plain = scratch[0..plain_len];
+
+    // Pick encoder mode each iter so both decoder paths get exercised:
+    //   - literal-only: emits length-128 chunks → exercises literal-copy
+    //     branch (decompress.zig:592-597), incl. the chunk-rollover edge.
+    //   - mixed: emits repeat packets where the plaintext has runs of
+    //     ≥2 identical bytes → exercises the repeat branch (599-604).
+    //
+    // For mixed mode to actually hit repeat packets often, bias the
+    // plaintext so runs are likely. We do this by replacing ~50% of
+    // bytes with a copy of the previous byte. Without this, random
+    // bytes produce ≥2-byte runs only ~1/256 of the time and the
+    // repeat branch is barely exercised.
+    const use_mixed = rng.boolean();
+    if (use_mixed and plain_len > 1) {
+        for (1..plain_len) |idx| {
+            if (rng.boolean()) scratch[idx] = scratch[idx - 1];
+        }
+    }
+
+    const encoded = if (use_mixed)
+        try encodeRunLengthMixed(allocator, plain)
+    else
+        try encodeRunLengthLiteral(allocator, plain);
+    defer allocator.free(encoded);
+
+    const decoded = decompress.decompressStream(allocator, encoded, filter, null) catch |err| {
+        // Any error on a well-formed encode is a real bug. Don't
+        // swallow it — propagate so the harness flags it.
+        return err;
+    };
+    defer allocator.free(decoded);
+
+    if (!std.mem.eql(u8, decoded, plain)) return error.RunLengthDiffMismatch;
+}
+
+/// Reference ASCIIHex encoder. Two hex chars per input byte, terminated
+/// by `>`. Whitespace can be inserted to exercise the skip-whitespace
+/// branch (decompress.zig:429); we do this every iter on a randomized
+/// 30% of byte boundaries.
+fn encodeAsciiHex(allocator: std.mem.Allocator, data: []const u8, rng: std.Random, insert_whitespace: bool) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    const hex_chars = "0123456789ABCDEF";
+    const ws_pool = " \t\n\r";
+
+    for (data) |b| {
+        if (insert_whitespace and rng.intRangeAtMost(u8, 0, 9) < 3) {
+            const ws = ws_pool[rng.intRangeAtMost(usize, 0, ws_pool.len - 1)];
+            try out.append(allocator, ws);
+        }
+        try out.append(allocator, hex_chars[b >> 4]);
+        try out.append(allocator, hex_chars[b & 0x0F]);
+    }
+    try out.append(allocator, '>');
+    return out.toOwnedSlice(allocator);
+}
+
+/// ASCIIHex differential: encode random plaintext to two-hex-chars-per-
+/// byte, decode through `decompressStream(ASCIIHexDecode)`, assert
+/// byte-equality.
+///
+/// Invariants:
+///   - decode(encode(x)) == x  (the differential property)
+///   - whitespace-insertion mode also satisfies the property (covers
+///     the skip-whitespace branch independently)
+///   - no panic, no leak
+///
+/// Why this catches bugs the iter-1 `decompress_ascii_hex_random` misses:
+/// random bytes contain only ~1/4 valid hex digits; the iter-1 target
+/// rarely produces a long run of valid nibbles that exercises the
+/// alternate `high`/`low` accumulation path. This target generates 100%
+/// valid hex content and asserts a strict equality property rather than
+/// a loose output-length bound.
+fn fuzzDecompressAsciiHexDiff(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const filter = parser.Object{ .name = "ASCIIHexDecode" };
+
+    // Plaintext encoded form is 2× + ~30% whitespace + 1; cap at
+    // scratch.len/3 to give plenty of headroom even with skewed RNG.
+    const plain_len = rng.intRangeAtMost(usize, 0, scratch.len / 3);
+    rng.bytes(scratch[0..plain_len]);
+    const plain = scratch[0..plain_len];
+
+    const insert_ws = rng.boolean();
+    const encoded = try encodeAsciiHex(allocator, plain, rng, insert_ws);
+    defer allocator.free(encoded);
+
+    const decoded = decompress.decompressStream(allocator, encoded, filter, null) catch |err| {
+        return err;
+    };
+    defer allocator.free(decoded);
+
+    if (!std.mem.eql(u8, decoded, plain)) return error.AsciiHexDiffMismatch;
+}
+
+/// Multi-filter chain differential: encode plaintext through
+/// RunLength → ASCIIHex (so the on-wire bytes are ASCII-hex of a
+/// run-length-encoded payload), decode through
+/// `/Filter [ASCIIHexDecode RunLengthDecode]`, assert byte-equality.
+///
+/// The PDF spec defines /Filter array order as the order in which the
+/// decoders should be applied to the stream. Our `decompressStream`
+/// (decompress.zig:54-66) iterates `filters` in array order. So if the
+/// encoder emits `hex(rle(plain))`, the decoder array must be
+/// `[ASCIIHexDecode, RunLengthDecode]` — first un-hex, then un-rle.
+///
+/// Invariants:
+///   - decode_chain(encode_chain(x)) == x
+///   - the multi-filter loop in decompressStream correctly threads
+///     each stage's output as the next stage's input (no off-by-one
+///     in the `current = result` assignment)
+///   - intermediate ownership transfer (the `defer if (owned)…` path
+///     in decompressStream:52) doesn't leak
+///
+/// What this catches that single-filter targets cannot: the inter-stage
+/// buffer ownership in `decompressStream`. The `owned` slot is freed,
+/// reassigned, and finally null-ed before return — a regression in any
+/// of those steps would leak under the test allocator OR double-free
+/// under GPA safety. Both are caught at iter granularity here.
+fn fuzzDecompressFilterChainDiff(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // Plaintext: run-length encoded form is ≤2× input; ASCIIHex on top
+    // is another 2× plus EOD; so encoded form ≤ 4×+slack of plain. Cap
+    // plain at scratch.len/5 to keep the encoded form < scratch.len.
+    const plain_len = rng.intRangeAtMost(usize, 0, scratch.len / 5);
+    rng.bytes(scratch[0..plain_len]);
+    const plain = scratch[0..plain_len];
+
+    // Stage 1: RLE (alternate literal vs mixed per iter; both modes
+    // are byte-identical round-trips, see encodeRunLengthMixed comment).
+    const use_mixed = rng.boolean();
+    if (use_mixed and plain_len > 1) {
+        for (1..plain_len) |idx| {
+            if (rng.boolean()) scratch[idx] = scratch[idx - 1];
+        }
+    }
+    const stage1 = if (use_mixed)
+        try encodeRunLengthMixed(allocator, plain)
+    else
+        try encodeRunLengthLiteral(allocator, plain);
+    defer allocator.free(stage1);
+
+    // Stage 2: ASCIIHex on top.
+    const stage2 = try encodeAsciiHex(allocator, stage1, rng, false);
+    defer allocator.free(stage2);
+
+    // Build the filter array. Object.array is `[]Object` (mutable slice),
+    // so allocate from `allocator` and free after.
+    var filter_arr = try allocator.alloc(parser.Object, 2);
+    defer allocator.free(filter_arr);
+    filter_arr[0] = .{ .name = "ASCIIHexDecode" };
+    filter_arr[1] = .{ .name = "RunLengthDecode" };
+    const filter = parser.Object{ .array = filter_arr };
+
+    const decoded = decompress.decompressStream(allocator, stage2, filter, null) catch |err| {
+        return err;
+    };
+    defer allocator.free(decoded);
+
+    if (!std.mem.eql(u8, decoded, plain)) return error.FilterChainDiffMismatch;
+}
 
 // ============================================================================
 // Targets — parser.zig (defense-in-depth, iter 2)
