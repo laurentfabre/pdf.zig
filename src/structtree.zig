@@ -157,6 +157,14 @@ pub fn emitElementJson(elem: *const StructElement, writer: *std.Io.Writer, depth
     if (elem.page_ref) |pr| {
         try writer.print(",\"page_obj\":{d}", .{pr.num});
     }
+    // PR-22b: emit `/RoleMap`-resolved standard structure type when the
+    // alias chain resolved (else null = field omitted). Placement
+    // (after page_obj, before mcid_refs) keeps the byte-identical SX1
+    // golden valid for any element that has no /RoleMap entry.
+    if (elem.resolved_role) |role| {
+        try writer.writeAll(",\"resolved_role\":");
+        try stream.writeJsonString(writer, role);
+    }
 
     // Direct-child MCIDs first.
     try writer.writeAll(",\"mcid_refs\":[");
@@ -199,24 +207,153 @@ const MAX_STRUCT_DEPTH: u32 = 256;
 // cleanly with 22b, 22d, 22e, and 23a in parallel.
 // =====================================================================
 
-/// PR-SX1 stub. PR-22b will fill in: parse `/RoleMap` from
-/// `StructTreeRoot`, walk the tree, set `resolved_role` on each
-/// `StructElement` whose `struct_type` is in the map. The opaque
-/// `resolve_ctx` lets the caller supply a (data, xref, cache, alloc)
-/// tuple without dragging concrete types into this file.
+/// PR-22b: ISO 32000-1 §14.8.4 standard structure types. Custom roles
+/// in `/RoleMap` must ultimately resolve to a member of this set; a
+/// chain that ends elsewhere returns `error.RoleMapResolvesToNonStandard`.
+const STANDARD_STRUCTURE_TYPES = [_][]const u8{
+    "Document", "Part",      "Art",     "Sect",     "Div",
+    "BlockQuote", "Caption", "TOC",     "TOCI",     "Index",
+    "NonStruct", "Private",  "H",       "H1",       "H2",
+    "H3",        "H4",       "H5",      "H6",       "P",
+    "L",         "LI",       "LBody",   "Lbl",      "Span",
+    "Quote",     "Note",     "Reference", "BibEntry", "Code",
+    "Link",      "Annot",    "Ruby",    "Warichu",  "Figure",
+    "Formula",   "Form",     "Table",   "TR",       "TH",
+    "TD",        "THead",    "TBody",   "TFoot",    "Artifact",
+};
+
+/// PR-22b: max chain length when following `A → B → C → ...`. A
+/// well-formed RoleMap shouldn't need more than one hop in practice; 8
+/// gives slack for layered author tooling without admitting a cycle.
+const MAX_ROLEMAP_CHAIN: u8 = 8;
+
+fn isStandardStructureType(name: []const u8) bool {
+    for (STANDARD_STRUCTURE_TYPES) |std_name| {
+        if (std.mem.eql(u8, std_name, name)) return true;
+    }
+    return false;
+}
+
+/// PR-22b: parse `/RoleMap` from the StructTreeRoot dict (the SX1 stub
+/// names the parameter `catalog`; semantically it's the dict that may
+/// carry `/RoleMap`). For each entry, follow the alias chain — bounded
+/// by `MAX_ROLEMAP_CHAIN`, with self- and cycle-detection — until a
+/// standard PDF/UA structure type is reached. Then walk `tree.elements`
+/// and set `resolved_role` on every element whose `struct_type` is a
+/// key in the map.
 ///
-/// Today: returns successfully without changing the tree.
+/// Errors:
+/// - `error.RoleMapCycle` — chain repeats or exceeds `MAX_ROLEMAP_CHAIN`.
+/// - `error.RoleMapResolvesToNonStandard` — chain terminates outside the
+///   ISO 32000-1 §14.8.4 standard-types set.
+///
+/// Soft-fails (returns successfully, no resolution) when:
+/// - `/RoleMap` is absent.
+/// - `/RoleMap` is present but not a dict (or resolves via ref to a
+///   non-dict).
+///
+/// `resolve_fn` is invoked to dereference `/RoleMap` itself when it is
+/// stored as an indirect reference. Map values are typically inline
+/// names; if a value happens to be a `.reference`, `resolve_fn` is also
+/// used to look it up.
 pub fn parseRoleMap(
     tree: *StructTree,
     catalog: ObjectDict,
     resolve_fn: ResolveFn,
     resolve_ctx: *anyopaque,
 ) !void {
-    _ = tree;
-    _ = catalog;
-    _ = resolve_fn;
-    _ = resolve_ctx;
-    // PR-22b: parse /RoleMap, populate resolved_role.
+    // Look up /RoleMap. May be inline dict or indirect ref.
+    const rolemap_obj = catalog.get("RoleMap") orelse return;
+    const rolemap_dict = switch (rolemap_obj) {
+        .dict => |d| d,
+        .reference => |r| blk: {
+            const resolved = resolve_fn(resolve_ctx, r) catch return;
+            break :blk switch (resolved) {
+                .dict => |d| d,
+                else => return,
+            };
+        },
+        else => return,
+    };
+
+    // Bounded read: empty map = nothing to do.
+    if (rolemap_dict.entries.len == 0) return;
+
+    // Walk every element; for each one whose struct_type matches a
+    // /RoleMap key, follow the chain to a standard type. Each lookup
+    // is independent so a non-matching element costs at most one
+    // string compare per entry.
+    for (tree.elements) |elem| {
+        const direct = rolemap_dict.get(elem.struct_type) orelse continue;
+        const resolved_name = try followRoleMapChain(
+            rolemap_dict,
+            elem.struct_type,
+            direct,
+            resolve_fn,
+            resolve_ctx,
+        );
+        elem.resolved_role = resolved_name;
+    }
+}
+
+/// PR-22b: follow `start` through `/RoleMap` until a standard type is
+/// reached. `origin` is the element's own `struct_type`, used to
+/// detect immediate self-cycles (`/A /A`). Caller has already verified
+/// `origin` is a key in `rolemap`.
+fn followRoleMapChain(
+    rolemap: ObjectDict,
+    origin: []const u8,
+    start: Object,
+    resolve_fn: ResolveFn,
+    resolve_ctx: *anyopaque,
+) ![]const u8 {
+    // Resolve the first step's name (may be an indirect ref).
+    var current_name = try roleMapValueName(start, resolve_fn, resolve_ctx) orelse
+        return error.RoleMapResolvesToNonStandard;
+
+    // Self-cycle: /A /A.
+    if (std.mem.eql(u8, current_name, origin)) return error.RoleMapCycle;
+
+    var hops: u8 = 0;
+    while (hops < MAX_ROLEMAP_CHAIN) : (hops += 1) {
+        // Terminal: current_name is a standard type — done.
+        if (isStandardStructureType(current_name)) return current_name;
+
+        // Otherwise follow another hop. If current_name isn't even a
+        // key, the chain terminates outside the standard set.
+        const next_obj = rolemap.get(current_name) orelse
+            return error.RoleMapResolvesToNonStandard;
+        const next_name = try roleMapValueName(next_obj, resolve_fn, resolve_ctx) orelse
+            return error.RoleMapResolvesToNonStandard;
+
+        // Cycle: chain returns to origin.
+        if (std.mem.eql(u8, next_name, origin)) return error.RoleMapCycle;
+        // Cycle: chain returns to the immediately-previous step.
+        if (std.mem.eql(u8, next_name, current_name)) return error.RoleMapCycle;
+
+        current_name = next_name;
+    }
+    return error.RoleMapCycle;
+}
+
+/// PR-22b: extract the name out of a /RoleMap value, following one
+/// indirect reference if needed. Returns null for any non-name shape.
+fn roleMapValueName(
+    val: Object,
+    resolve_fn: ResolveFn,
+    resolve_ctx: *anyopaque,
+) !?[]const u8 {
+    return switch (val) {
+        .name => |n| n,
+        .reference => |r| blk: {
+            const resolved = resolve_fn(resolve_ctx, r) catch return null;
+            break :blk switch (resolved) {
+                .name => |n| n,
+                else => null,
+            };
+        },
+        else => null,
+    };
 }
 
 /// PR-SX1 stub. PR-22d will fill in: walk `tree`, propagate `/Lang`
@@ -353,13 +490,50 @@ pub fn parseStructTree(
     const root_elem = try parseStructElement(allocator, data, xref, cache, root_kids, &elements);
 
     const elements_slice = try elements.toOwnedSlice(allocator);
+    errdefer {
+        for (elements_slice) |elem| {
+            allocator.free(elem.children);
+            allocator.destroy(elem);
+        }
+        allocator.free(elements_slice);
+    }
 
-    return StructTree{
+    var tree = StructTree{
         .root = root_elem,
         .elements = elements_slice,
         .allocator = allocator,
     };
+
+    // PR-22b: resolve `/RoleMap` aliases (StructTreeRoot dict carries
+    // /RoleMap per ISO 32000-1 §14.7.4). Errors propagate so a malformed
+    // /RoleMap is observable at the call site rather than silently
+    // dropped (consistent with offensive-programming defaults inside
+    // the parser's trust boundary).
+    var ctx = ResolveCtx{
+        .allocator = allocator,
+        .data = data,
+        .xref = xref,
+        .cache = cache,
+    };
+    try parseRoleMap(&tree, struct_tree_dict, ResolveCtx.resolve, @ptrCast(&ctx));
+
+    return tree;
 }
+
+/// PR-22b: glue that adapts `(allocator, data, xref, cache)` to the
+/// opaque-context shape the wave-3.2 stubs use. Lets `parseRoleMap`
+/// dereference indirect refs without re-importing parser internals.
+const ResolveCtx = struct {
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    xref: *const XRefTable,
+    cache: *std.AutoHashMap(u32, Object),
+
+    fn resolve(opaque_ctx: *anyopaque, ref: ObjRef) anyerror!Object {
+        const self: *ResolveCtx = @ptrCast(@alignCast(opaque_ctx));
+        return pagetree.resolveRef(self.allocator, self.data, self.xref, ref, self.cache);
+    }
+};
 
 fn emptyTree(allocator: std.mem.Allocator) StructTree {
     return StructTree{
@@ -681,4 +855,247 @@ test "PR-SX1: wave-3.2 stub APIs are callable no-ops" {
     // resolveMcidText: today returns null — no allocation, no leak.
     const text = try resolveMcidText(@ptrCast(&ctx_storage), 0, 42, allocator);
     try std.testing.expect(text == null);
+}
+
+// =====================================================================
+// PR-22b tests
+// ---------------------------------------------------------------------
+// Direct-on-API tests: build a `StructTree` with a single element and
+// a synthetic `/RoleMap` dict, call `parseRoleMap`, observe
+// `resolved_role`. No PDF round-trip needed — that's covered upstream
+// by `parseStructTree` propagating into the wave-3.2 emitter goldens.
+// =====================================================================
+
+/// PR-22b: shared dummy resolver. /RoleMap fixtures here use only
+/// inline names, so the resolver is never actually called; pre-staged
+/// for future tests that exercise indirect-ref values.
+fn pr22bDummyResolve(ctx: *anyopaque, ref: ObjRef) anyerror!Object {
+    _ = ctx;
+    _ = ref;
+    return Object{ .null = {} };
+}
+
+/// PR-22b: build a single-element tree owned by `allocator`. Caller
+/// must `deinit` it. The element's `struct_type` slice is borrowed —
+/// it must outlive the returned tree (use a string literal).
+fn pr22bMakeTreeOneElement(
+    allocator: std.mem.Allocator,
+    struct_type: []const u8,
+) !StructTree {
+    const elem = try allocator.create(StructElement);
+    errdefer allocator.destroy(elem);
+    elem.* = .{
+        .struct_type = struct_type,
+        .children = &.{},
+    };
+
+    const elements = try allocator.alloc(*StructElement, 1);
+    elements[0] = elem;
+
+    return StructTree{
+        .root = elem,
+        .elements = elements,
+        .allocator = allocator,
+    };
+}
+
+test "PR-22b: direct CustomP → P resolves to standard type" {
+    const allocator = std.testing.allocator;
+    var tree = try pr22bMakeTreeOneElement(allocator, "CustomP");
+    defer tree.deinit();
+
+    // /RoleMap << /CustomP /P >>
+    var entries = [_]ObjectDict.Entry{
+        .{ .key = "CustomP", .value = .{ .name = "P" } },
+    };
+    const rolemap_dict: ObjectDict = .{ .entries = &entries };
+    var catalog_entries = [_]ObjectDict.Entry{
+        .{ .key = "RoleMap", .value = .{ .dict = rolemap_dict } },
+    };
+    const catalog: ObjectDict = .{ .entries = &catalog_entries };
+
+    var ctx: u8 = 0;
+    try parseRoleMap(&tree, catalog, pr22bDummyResolve, @ptrCast(&ctx));
+
+    try std.testing.expect(tree.elements[0].resolved_role != null);
+    try std.testing.expectEqualStrings("P", tree.elements[0].resolved_role.?);
+}
+
+test "PR-22b: chained A → B → P resolves to terminal standard type" {
+    const allocator = std.testing.allocator;
+    var tree = try pr22bMakeTreeOneElement(allocator, "A");
+    defer tree.deinit();
+
+    // /RoleMap << /A /B  /B /P >>
+    var entries = [_]ObjectDict.Entry{
+        .{ .key = "A", .value = .{ .name = "B" } },
+        .{ .key = "B", .value = .{ .name = "P" } },
+    };
+    const rolemap_dict: ObjectDict = .{ .entries = &entries };
+    var catalog_entries = [_]ObjectDict.Entry{
+        .{ .key = "RoleMap", .value = .{ .dict = rolemap_dict } },
+    };
+    const catalog: ObjectDict = .{ .entries = &catalog_entries };
+
+    var ctx: u8 = 0;
+    try parseRoleMap(&tree, catalog, pr22bDummyResolve, @ptrCast(&ctx));
+
+    try std.testing.expectEqualStrings("P", tree.elements[0].resolved_role.?);
+}
+
+test "PR-22b: cycle A → B → A returns RoleMapCycle" {
+    const allocator = std.testing.allocator;
+    var tree = try pr22bMakeTreeOneElement(allocator, "A");
+    defer tree.deinit();
+
+    var entries = [_]ObjectDict.Entry{
+        .{ .key = "A", .value = .{ .name = "B" } },
+        .{ .key = "B", .value = .{ .name = "A" } },
+    };
+    const rolemap_dict: ObjectDict = .{ .entries = &entries };
+    var catalog_entries = [_]ObjectDict.Entry{
+        .{ .key = "RoleMap", .value = .{ .dict = rolemap_dict } },
+    };
+    const catalog: ObjectDict = .{ .entries = &catalog_entries };
+
+    var ctx: u8 = 0;
+    const result = parseRoleMap(&tree, catalog, pr22bDummyResolve, @ptrCast(&ctx));
+    try std.testing.expectError(error.RoleMapCycle, result);
+}
+
+test "PR-22b: self-cycle A → A returns RoleMapCycle" {
+    const allocator = std.testing.allocator;
+    var tree = try pr22bMakeTreeOneElement(allocator, "A");
+    defer tree.deinit();
+
+    var entries = [_]ObjectDict.Entry{
+        .{ .key = "A", .value = .{ .name = "A" } },
+    };
+    const rolemap_dict: ObjectDict = .{ .entries = &entries };
+    var catalog_entries = [_]ObjectDict.Entry{
+        .{ .key = "RoleMap", .value = .{ .dict = rolemap_dict } },
+    };
+    const catalog: ObjectDict = .{ .entries = &catalog_entries };
+
+    var ctx: u8 = 0;
+    const result = parseRoleMap(&tree, catalog, pr22bDummyResolve, @ptrCast(&ctx));
+    try std.testing.expectError(error.RoleMapCycle, result);
+}
+
+test "PR-22b: non-standard terminal returns RoleMapResolvesToNonStandard" {
+    const allocator = std.testing.allocator;
+    var tree = try pr22bMakeTreeOneElement(allocator, "A");
+    defer tree.deinit();
+
+    // /A maps to a name that is neither standard nor a further key.
+    var entries = [_]ObjectDict.Entry{
+        .{ .key = "A", .value = .{ .name = "SomethingMadeUp" } },
+    };
+    const rolemap_dict: ObjectDict = .{ .entries = &entries };
+    var catalog_entries = [_]ObjectDict.Entry{
+        .{ .key = "RoleMap", .value = .{ .dict = rolemap_dict } },
+    };
+    const catalog: ObjectDict = .{ .entries = &catalog_entries };
+
+    var ctx: u8 = 0;
+    const result = parseRoleMap(&tree, catalog, pr22bDummyResolve, @ptrCast(&ctx));
+    try std.testing.expectError(error.RoleMapResolvesToNonStandard, result);
+}
+
+test "PR-22b: element with no RoleMap entry leaves resolved_role null" {
+    const allocator = std.testing.allocator;
+    var tree = try pr22bMakeTreeOneElement(allocator, "P");
+    defer tree.deinit();
+
+    // /RoleMap maps an unrelated key. The element's struct_type "P" is
+    // not a key, so resolved_role must remain null.
+    var entries = [_]ObjectDict.Entry{
+        .{ .key = "CustomP", .value = .{ .name = "P" } },
+    };
+    const rolemap_dict: ObjectDict = .{ .entries = &entries };
+    var catalog_entries = [_]ObjectDict.Entry{
+        .{ .key = "RoleMap", .value = .{ .dict = rolemap_dict } },
+    };
+    const catalog: ObjectDict = .{ .entries = &catalog_entries };
+
+    var ctx: u8 = 0;
+    try parseRoleMap(&tree, catalog, pr22bDummyResolve, @ptrCast(&ctx));
+    try std.testing.expect(tree.elements[0].resolved_role == null);
+}
+
+test "PR-22b: missing RoleMap is a no-op" {
+    const allocator = std.testing.allocator;
+    var tree = try pr22bMakeTreeOneElement(allocator, "P");
+    defer tree.deinit();
+
+    const empty_catalog: ObjectDict = .{ .entries = &.{} };
+    var ctx: u8 = 0;
+    try parseRoleMap(&tree, empty_catalog, pr22bDummyResolve, @ptrCast(&ctx));
+    try std.testing.expect(tree.elements[0].resolved_role == null);
+}
+
+test "PR-22b: chain longer than MAX_ROLEMAP_CHAIN returns RoleMapCycle" {
+    const allocator = std.testing.allocator;
+    var tree = try pr22bMakeTreeOneElement(allocator, "K0");
+    defer tree.deinit();
+
+    // K0 → K1 → ... → K9 (10 hops, all to non-standard names so no
+    // early terminal hit). MAX_ROLEMAP_CHAIN is 8 → must trip cycle.
+    var entries = [_]ObjectDict.Entry{
+        .{ .key = "K0", .value = .{ .name = "K1" } },
+        .{ .key = "K1", .value = .{ .name = "K2" } },
+        .{ .key = "K2", .value = .{ .name = "K3" } },
+        .{ .key = "K3", .value = .{ .name = "K4" } },
+        .{ .key = "K4", .value = .{ .name = "K5" } },
+        .{ .key = "K5", .value = .{ .name = "K6" } },
+        .{ .key = "K6", .value = .{ .name = "K7" } },
+        .{ .key = "K7", .value = .{ .name = "K8" } },
+        .{ .key = "K8", .value = .{ .name = "K9" } },
+        .{ .key = "K9", .value = .{ .name = "K10" } },
+    };
+    const rolemap_dict: ObjectDict = .{ .entries = &entries };
+    var catalog_entries = [_]ObjectDict.Entry{
+        .{ .key = "RoleMap", .value = .{ .dict = rolemap_dict } },
+    };
+    const catalog: ObjectDict = .{ .entries = &catalog_entries };
+
+    var ctx: u8 = 0;
+    const result = parseRoleMap(&tree, catalog, pr22bDummyResolve, @ptrCast(&ctx));
+    try std.testing.expectError(error.RoleMapCycle, result);
+}
+
+test "PR-22b: emitElementJson includes resolved_role when populated" {
+    // Round-trip on the emitter: a populated `resolved_role` must
+    // appear between `page_obj` and `mcid_refs`. Pairs the
+    // SX1-byte-identical golden by exercising the new branch.
+    const allocator = std.testing.allocator;
+    const elem: StructElement = .{
+        .struct_type = "CustomP",
+        .resolved_role = "P",
+        .children = &.{},
+    };
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try emitElementJson(&elem, &aw.writer, 0);
+
+    const expected =
+        "{\"type\":\"CustomP\",\"resolved_role\":\"P\",\"mcid_refs\":[],\"children\":[]}";
+    try std.testing.expectEqualStrings(expected, aw.written());
+}
+
+test "PR-22b: emitElementJson omits resolved_role when null" {
+    // Negative-space: a null `resolved_role` must NOT serialize. Guards
+    // the SX1 byte-identical golden against accidental drift.
+    const allocator = std.testing.allocator;
+    const elem: StructElement = .{
+        .struct_type = "P",
+        .children = &.{},
+    };
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try emitElementJson(&elem, &aw.writer, 0);
+
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "resolved_role") == null);
 }
