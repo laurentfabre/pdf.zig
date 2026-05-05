@@ -100,12 +100,12 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 | **markdown_render_tagged** | **118.6 s** | **v1.6 PR-W10d — renderTagged → reopen-via-parser round-trip** |
 | **truetype_parse_random** | **7.4 s** | **v1.6 PR-W7 — TTF parser robustness on adversarial bytes** |
 | **jpeg_meta_random** | **7.3 s** | **v1.6 PR-W8 — JPEG SOF/SOI parser robustness** |
-| **decompress_ascii_hex_random** | **98.9 s** | **iter-1 — `/Filter ASCIIHexDecode` random-bytes** |
-| **decompress_runlength_random** | **111.3 s** | **iter-1 — `/Filter RunLengthDecode` biased-bytes** |
-| **parser_object_pdfish** | TBD (1M not yet rerun; 155 ms / 100k) | **iter-2 — biased COS-syntax bytes through `Parser.parseObject`** |
-| **parser_indirect_object_random** | TBD (1M not yet rerun; 16 ms / 100k) | **iter-2 — synthetic `N M obj … endobj` frames + `/Length` boundary cases through `Parser.parseIndirectObject`** |
-| **parser_init_at_offset_random** | TBD (1M not yet rerun; 4 ms / 100k) | **iter-2 — random byte-offsets into seed-pool PDFs through `Parser.initAt`** |
-| **Total** | **2826.8 s (47 min 7 s) at 1M (pre-iter-2) — 25/25 clean, base seed `0x19df72ef96f`; iter-2 1M rerun pending** | |
+| **decompress_ascii_hex_random** | **105.2 s** | **iter-1 — `/Filter ASCIIHexDecode` random-bytes** |
+| **decompress_runlength_random** | **115.2 s** | **iter-1 — `/Filter RunLengthDecode` biased-bytes** |
+| **parser_object_pdfish** | **8.2 s** ⚠️ | **iter-2 — biased COS-syntax bytes; 1M ran on pre-fb2bdca harness (biased-degrades-to-random; rerun pending)** |
+| **parser_indirect_object_random** | **1.5 s** | **iter-2 — synthetic `N M obj … endobj` frames + `/Length` boundary cases through `Parser.parseIndirectObject`** |
+| **parser_init_at_offset_random** | **0.3 s** | **iter-2 — random byte-offsets into seed-pool PDFs through `Parser.initAt`** |
+| **Total** | **2925.7 s (48 min 46 s) at 1M (post-iter-2 pre-Codex-fix) — 28/28 clean, base seed `0x19df7687339`; rerun pending after iter-3 lands** | |
 
 The aggressive-gated `decompress_ascii85_roundtrip` is `reproducer_only` and skipped from the default + aggressive sweeps; deterministically reproduces Finding 005 below.
 
