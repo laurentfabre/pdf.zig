@@ -105,9 +105,15 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 | **parser_object_pdfish** | **8.2 s** ⚠️ | **iter-2 — biased COS-syntax bytes; 1M ran on pre-fb2bdca harness (biased-degrades-to-random; rerun pending)** |
 | **parser_indirect_object_random** | **1.5 s** | **iter-2 — synthetic `N M obj … endobj` frames + `/Length` boundary cases through `Parser.parseIndirectObject`** |
 | **parser_init_at_offset_random** | **0.3 s** | **iter-2 — random byte-offsets into seed-pool PDFs through `Parser.initAt`** |
-| **interpreter_random_ops** | TBD (1M not yet rerun; 6.0 s / 100k) | **iter-3 — biased COS-operator bytes through `ContentLexer.next()`** |
-| **interpreter_bdc_emc_nesting** | TBD (1M not yet rerun; 17.0 s / 100k) | **iter-3 — synthesised PDFs with hostile BDC/EMC nesting through `Document.extractMarkdown`** |
-| **Total** | **2925.7 s at 1M (post-iter-2 pre-Codex-fix); iter-3 1M rerun pending** | |
+| **interpreter_random_ops** | **57.1 s** | **iter-3 — biased COS-operator bytes through `ContentLexer.next()`** |
+| **interpreter_bdc_emc_nesting** | **161.6 s** | **iter-3 — synthesised PDFs with hostile BDC/EMC nesting through `Document.extractMarkdown`** |
+| writer_drawtext_roundtrip | TBD (1M not yet rerun; 12.2 s / 100k) | iter-4 — DocumentBuilder ↔ Document text round-trip |
+| writer_multipage_count | TBD (1M not yet rerun; 53.6 s / 100k) | iter-4 — multipage page-tree round-trip |
+| writer_text_escape_roundtrip | TBD (1M not yet rerun; 8.3 s / 100k) | iter-4 — PDF metachar escape round-trip via raw extractText |
+| decompress_runlength_diff | TBD (1M not yet rerun; 1.5 s / 100k) | iter-5 — RLE encode/decode differential |
+| decompress_ascii_hex_diff | TBD (1M not yet rerun; 2.0 s / 100k) | iter-5 — ASCIIHex encode/decode differential |
+| decompress_filter_chain_diff | TBD (1M not yet rerun; 1.5 s / 100k) | iter-5 — filter chain ownership transfer |
+| **Total** | **3146.7 s (52 min 27 s) at 1M (post-iter-3 + Codex-fix) — 30/30 clean, base seed `0x19df7a94d4a`; iter-4 & iter-5 1M rerun pending** | |
 
 The aggressive-gated `decompress_ascii85_roundtrip` is `reproducer_only` and skipped from the default + aggressive sweeps; deterministically reproduces Finding 005 below.
 
