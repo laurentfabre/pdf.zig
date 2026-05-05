@@ -257,6 +257,22 @@ const SafeFilters = [_][]const u8{
 fn fuzzDecompressFilterChain(_: void, smith: *std.testing.Smith) anyerror!void {
     @disableInstrumentation();
 
+    // Codex review of d6c2abe [P2]: Smith consumes corpus bytes in
+    // call order. `valueRangeAtMost` + each `index(…)` reads 8 bytes
+    // up front; `smith.slice` then sees what's left. Our seed-corpus
+    // entries (decompress_corpus) prefix only the slice-length, so if
+    // we call the filter-selection helpers FIRST they eat the payload
+    // bytes and the targeted ASCIIHex/RunLength/LZW seeds never reach
+    // `decompressStream`. Solution: claim the payload via `smith.slice`
+    // BEFORE the filter-selection calls. The corpus entries' payload
+    // body is now the first thing `Smith.in` yields.
+    //
+    // Up to 4 KiB of fuzzer-driven payload bytes. The decoder's
+    // input-byte handling — escape sequences, code-table state,
+    // truncation — is what the coverage signal will steer.
+    var payload_buf: [4096]u8 = undefined;
+    const payload_len = smith.slice(&payload_buf);
+
     // Pick 1-3 filters. The fuzzer learns which sequences hit new
     // basic blocks in `applyFilter` + the per-decoder dispatch.
     //
@@ -271,12 +287,6 @@ fn fuzzDecompressFilterChain(_: void, smith: *std.testing.Smith) anyerror!void {
         filter_storage[i] = .{ .name = SafeFilters[idx] };
     }
     const filter_array: parser.Object = .{ .array = filter_storage[0..n_filters] };
-
-    // Up to 4 KiB of fuzzer-driven payload bytes. The decoder's
-    // input-byte handling — escape sequences, code-table state,
-    // truncation — is what the coverage signal will steer.
-    var payload_buf: [4096]u8 = undefined;
-    const payload_len = smith.slice(&payload_buf);
 
     const result = decompress.decompressStream(
         std.testing.allocator,
