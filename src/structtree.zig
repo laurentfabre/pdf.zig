@@ -507,28 +507,25 @@ pub fn validateAll(tree: *const StructTree) !void {
     // PR-22f+: validateHeadingOrder, validateTabOrder, validateTableSummary…
 }
 
-/// PR-SX1 stub. PR-23a will fill in: given a `Document` and a
-/// `MarkedContentRef`, return the text bytes the MCID brackets in the
-/// page's content stream. Caller owns the returned slice (allocated
-/// from `allocator`); a returned `null` means the MCID was not found.
+/// PR-23a [feat]: given a `Document` (passed as `*anyopaque` to keep
+/// the dep one-way) and a page index + MCID, return the text bytes
+/// the MCID brackets in the page's content stream. Caller owns the
+/// returned slice (allocated from `allocator`); `null` means the MCID
+/// was not found on this page (or `mcid == -1`, the BMC sentinel).
 ///
-/// `doc` is `*anyopaque` so this file stays decoupled from `root.zig`
-/// — PR-23a will resolve it back to `*Document` at call time.
-///
-/// Today: returns null.
+/// Thin delegate to `mcid_resolver.resolveOne` — kept here because
+/// PR-SX1 staged this signature in the `structtree` namespace and
+/// downstream callers (PR-23c a11y_emitter) will reach for
+/// `structtree.resolveMcidText` on muscle memory. The function-level
+/// `@import` defers cycle resolution past `structtree`'s decl phase.
 pub fn resolveMcidText(
     doc: *anyopaque,
     page_idx: usize,
     mcid: i32,
     allocator: std.mem.Allocator,
 ) !?[]const u8 {
-    _ = doc;
-    _ = page_idx;
-    _ = mcid;
-    _ = allocator;
-    return null;
-    // PR-23a: walk page content stream, collect text bytes between
-    // BDC/EMC for matching mcid.
+    const mcid_resolver = @import("mcid_resolver.zig");
+    return mcid_resolver.resolveOne(doc, page_idx, mcid, allocator);
 }
 
 fn collectMcidsInOrder(
@@ -1044,8 +1041,11 @@ test "PR-SX1: wave-3.2 stub APIs are callable no-ops" {
     // validateAltText: empty tree must validate clean.
     try validateAltText(&tree);
 
-    // resolveMcidText: today returns null — no allocation, no leak.
-    const text = try resolveMcidText(@ptrCast(&ctx_storage), 0, 42, allocator);
+    // PR-23a: resolveMcidText now delegates to mcid_resolver. The
+    // BMC sentinel (mcid == -1) short-circuits before any cast or
+    // content-stream walk, so this stays safe to call with a dummy
+    // context — exercising the negative path the BMC path guarantees.
+    const text = try resolveMcidText(@ptrCast(&ctx_storage), 0, -1, allocator);
     try std.testing.expect(text == null);
 }
 

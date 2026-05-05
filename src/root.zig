@@ -29,6 +29,7 @@ pub const pdf_writer = @import("pdf_writer.zig");
 pub const pdf_document = @import("pdf_document.zig");
 pub const markdown_to_pdf = @import("markdown_to_pdf.zig");
 pub const structtree = @import("structtree.zig");
+pub const mcid_resolver = @import("mcid_resolver.zig");
 pub const markdown = @import("markdown.zig");
 pub const bidi = @import("bidi.zig");
 pub const outline = @import("outline.zig");
@@ -854,6 +855,76 @@ pub const Document = struct {
     pub fn getStructTree(self: *Document) !structtree.StructTree {
         const arena = self.parsing_arena.allocator();
         return structtree.parseStructTree(arena, self.data, &self.xref_table, &self.object_cache);
+    }
+
+    /// PR-23a: build a MarkedContentExtractor populated with the content
+    /// of `page_idx` so callers can resolve MCID → text without
+    /// re-implementing the lexer-driven content-stream walk. The
+    /// returned pointer is heap-allocated on `allocator`; caller MUST
+    /// `extractor.deinit(); allocator.destroy(extractor);` when done.
+    ///
+    /// Mirrors the lazy-build pattern in `McidLookupCtx.ensurePage`
+    /// but is public, single-shot, and caller-owned. Errors on
+    /// `page_idx` out of range; soft-fails (returns an empty
+    /// extractor) on content-stream domain errors so partial MCIDs
+    /// remain usable.
+    pub fn buildMarkedContentExtractor(
+        self: *Document,
+        page_idx: usize,
+        allocator: std.mem.Allocator,
+    ) !*structtree.MarkedContentExtractor {
+        if (page_idx >= self.pages.items.len) return error.PageNotFound;
+
+        const extractor = try allocator.create(structtree.MarkedContentExtractor);
+        errdefer allocator.destroy(extractor);
+        extractor.* = structtree.MarkedContentExtractor.init(allocator);
+        errdefer extractor.deinit();
+
+        // PR-23a [defensive]: scratch allocations (decompressed
+        // content, lexer state, transient MCID buffers inside the
+        // extractor before they're rebound below) all live in a
+        // per-call arena that we deinit at end-of-scope. This is the
+        // same pattern McidLookupCtx uses, but its arena is owned by
+        // getTables; here it's owned by us.
+        //
+        // `parse_allocator` stays the document's long-lived
+        // parsing_arena (resolveRef writes into the shared object
+        // cache and those entries must outlive this function).
+        var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+        defer scratch_arena.deinit();
+        const scratch = scratch_arena.allocator();
+
+        const content = pagetree.getPageContents(
+            self.parsing_arena.allocator(),
+            scratch,
+            self.data,
+            &self.xref_table,
+            self.pages.items[page_idx],
+            &self.object_cache,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return extractor;
+        };
+
+        // The MarkedContentExtractor itself uses `allocator` (the
+        // caller's), which is what we want — its `content_by_mcid`
+        // buffers must outlive this function. Only the lexer's
+        // transient state and decompressed content live in scratch.
+        var nw: NullWriter = .{};
+        extractContentStream(
+            content,
+            .{ .structured = extractor },
+            &self.font_cache,
+            page_idx,
+            scratch,
+            &nw,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            // Domain errors leave the extractor partially populated;
+            // any MCIDs already resolved are still useful.
+        };
+
+        return extractor;
     }
 
     /// Check if the document has a structure tree (is tagged)

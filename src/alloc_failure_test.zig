@@ -94,6 +94,32 @@ test "checkAllAllocationFailures — Document.metadata (Finding 003 RESOLVED)" {
     );
 }
 
+// PR-23a: MCID resolver allocation-failure sweep. Validates the
+// errdefer chain on resolveOne (extractor.create + extractor init +
+// scratch arena + content-stream walk + final allocator.dupe).
+fn openAndResolveMcid(allocator: std.mem.Allocator, pdf_bytes: []const u8) !void {
+    const doc = try zpdf.Document.openFromMemory(
+        allocator,
+        pdf_bytes,
+        zpdf.ErrorConfig.default(),
+    );
+    defer doc.close();
+    if (doc.pageCount() == 0) return;
+    const text = (try zpdf.mcid_resolver.resolveOne(@ptrCast(doc), 0, 0, allocator)) orelse return;
+    allocator.free(text);
+}
+
+test "checkAllAllocationFailures — mcid_resolver.resolveOne (PR-23a)" {
+    const seed = try testpdf.generateTaggedTablePdf(std.testing.allocator);
+    defer std.testing.allocator.free(seed);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        openAndResolveMcid,
+        .{seed},
+    );
+}
+
 test "tokenizer.heuristicCount is allocation-free" {
     // The heuristic backend allocates nothing — verify the call path stays
     // that way by counting allocations through a tracking allocator.
