@@ -30,6 +30,7 @@ pub const pdf_document = @import("pdf_document.zig");
 pub const markdown_to_pdf = @import("markdown_to_pdf.zig");
 pub const structtree = @import("structtree.zig");
 pub const mcid_resolver = @import("mcid_resolver.zig");
+pub const a11y_emitter = @import("a11y_emitter.zig");
 pub const markdown = @import("markdown.zig");
 pub const bidi = @import("bidi.zig");
 pub const outline = @import("outline.zig");

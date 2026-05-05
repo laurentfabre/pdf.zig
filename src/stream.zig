@@ -58,6 +58,12 @@ pub const RecordKind = enum {
     /// short identifier (e.g. `alt_required_on_figure`). The CLI
     /// exits non-zero if any record carries `severity:"error"`.
     validation,
+    /// PR-23c [feat]: per-document accessibility tree. Single record
+    /// carrying the full /StructTreeRoot walk with inheritance flattened
+    /// (PR-23b), MCID → text resolved (PR-23a), plus a top-level
+    /// `reading_order` linearization. Off by default — opt in via
+    /// `--a11y-tree` (PR-23d).
+    a11y_tree,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -77,6 +83,7 @@ pub const RecordKind = enum {
             .struct_tree => "struct_tree",
             .warning => "warning",
             .validation => "validation",
+            .a11y_tree => "a11y_tree",
         };
     }
 };
@@ -453,6 +460,22 @@ pub const Envelope = struct {
         try self.beginStructTreeRecord();
         try self.writer.writeAll("null");
         try self.endStructTreeRecord();
+    }
+
+    /// PR-23c [feat]: open a `kind:"a11y_tree"` record. The caller
+    /// is responsible for writing the body (the `"root":<tree>` JSON
+    /// + the optional `,"reading_order":[…]` array); this helper writes
+    /// the canonical envelope keys + the leading `,"root":` separator
+    /// and closes the record on `endA11yTreeRecord`. Layered the same
+    /// way as `beginStructTreeRecord` so `stream.zig` doesn't need to
+    /// know about `structtree` / `a11y_emitter` types.
+    pub fn beginA11yTreeRecord(self: *Envelope) !void {
+        try self.beginRecord(.a11y_tree);
+        try self.writer.writeAll(",\"root\":");
+    }
+
+    pub fn endA11yTreeRecord(self: *Envelope) !void {
+        try self.endRecord();
     }
 
     /// PR-19 [feat]: emit `kind:"image"` for one image. The caller
@@ -1103,6 +1126,21 @@ test "PR-21: emitStructTreeEmpty produces null root" {
     const written = aw.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"struct_tree\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"root\":null") != null);
+}
+
+test "PR-23c: beginA11yTreeRecord opens with kind + leading root key" {
+    var buf: [2048]u8 = undefined;
+    var aw = std.Io.Writer.fixed(&buf);
+    var env = Envelope.initWithId(&aw, "x.pdf", FIXED_DOC_ID);
+    try env.beginA11yTreeRecord();
+    try env.writer.writeAll("null,\"reading_order\":[]");
+    try env.endA11yTreeRecord();
+    const written = aw.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"kind\":\"a11y_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"root\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"reading_order\":[]") != null);
+    // Envelope must end with `}\n` like every other record.
+    try std.testing.expect(std.mem.endsWith(u8, written, "}\n"));
 }
 
 test "PR-21: beginStructTreeRecord + write body + end emits well-formed JSON" {
