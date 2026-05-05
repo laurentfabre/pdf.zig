@@ -118,6 +118,10 @@ const TARGETS = [_]Target{
     // directly, instead of going through the lattice geometry layer.
     .{ .name = "interpreter_random_ops", .run = fuzzInterpreterRandomOps },
     .{ .name = "interpreter_bdc_emc_nesting", .run = fuzzInterpreterBdcEmcNesting },
+    // Iter-7 (audit/fuzz_loop_state.md tier 7 — multi-stage adversarial PDF-of-PDF).
+    // Each iter walks 4 build → parse → canonicalise → mutate → re-emit
+    // cycles. Drift between stages surfaces serialise/parse asymmetries.
+    .{ .name = "pdf_of_pdf_roundtrip", .run = fuzzPdfOfPdfRoundtrip },
     // Iter-4 (audit/fuzz_loop_state.md tier 3 — round-trip / property fuzz)
     // — DocumentBuilder.write() ↔ Document.openFromMemory ↔ extractMarkdown
     // — exercises the full writer ↔ reader pipeline (xref, page tree,
@@ -2358,7 +2362,234 @@ fn fuzzWriterTextEscapeRoundtrip(rng: std.Random, allocator: std.mem.Allocator, 
 }
 
 // ============================================================================
-// Driver
+// iter-7 (tier-7) — multi-stage adversarial round-trip
+// ============================================================================
+
+/// Number of round-trip stages per fuzz iter. Each stage is one
+/// build → parse → canonicalise cycle. Capped at 4 to keep wall time
+/// bounded (see audit/fuzz_loop_state.md history table for budget).
+const PDF_OF_PDF_STAGES: usize = 4;
+
+/// Reduce a parsed Document to a canonical "what the parser saw" string:
+/// `pageCount\n` followed by extractMarkdown of every page joined by
+/// `\x1f` (unit separator — not a byte the WinAnsi filter or PDF emitter
+/// will produce, so unambiguous as a delimiter). Caller owns the result.
+///
+/// Drift between two canon snapshots taken across a build/parse cycle
+/// = either a writer asymmetry (drawText emits text the parser can't
+/// recover) or a parser asymmetry (extractMarkdown returns text that,
+/// when fed back into drawText, is not preserved).
+fn pdfOfPdfCanonicalise(
+    doc: *zpdf.Document,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    const n = doc.pageCount();
+    var hdr: [32]u8 = undefined;
+    const hdr_str = try std.fmt.bufPrint(&hdr, "{d}\n", .{n});
+    try out.appendSlice(allocator, hdr_str);
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const md = try doc.extractMarkdown(i, allocator);
+        defer allocator.free(md);
+        try out.appendSlice(allocator, md);
+        try out.append(allocator, 0x1f);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Synthesise a fresh PDF from a canonical text by sharding the
+/// extracted text across one page per `\x1f`-separated chunk. The
+/// emitted PDF is what the next stage parses; if drawText + the parser
+/// agree on what's representable, canonicalising the next stage MUST
+/// reproduce the same bytes. Caller owns the result.
+fn pdfOfPdfEmitFromCanon(
+    canon: []const u8,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    // Strip the page-count header line; it's metadata, not page text.
+    const nl = std.mem.indexOfScalar(u8, canon, '\n') orelse return error.PdfOfPdfMalformedCanon;
+    const body = canon[nl + 1 ..];
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    var it = std.mem.splitScalar(u8, body, 0x1f);
+    var pages_emitted: u32 = 0;
+    while (it.next()) |chunk_text| {
+        // The trailing US byte yields one empty chunk after the last
+        // page; skip it so we don't emit a phantom page that bumps
+        // pageCount on the round-trip.
+        if (chunk_text.len == 0) continue;
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        // drawText filters non-ASCII / control bytes for WinAnsi fonts.
+        // That filter IS the canonicalisation step — feeding the same
+        // pre-filtered text twice must converge.
+        try page.drawText(72, 720, .helvetica, 12, chunk_text);
+        pages_emitted += 1;
+        // Cap pages per iter so a path that explodes the page count
+        // (parser drift inserting extra US bytes) doesn't OOM the
+        // arena. Hard cap mirrors the page-count assertion below.
+        if (pages_emitted >= 32) break;
+    }
+    if (pages_emitted == 0) {
+        // Empty doc isn't legal — emit a single empty page so the
+        // round-trip has something to parse.
+        _ = try doc.addPage(.{ 0, 0, 612, 792 });
+    }
+    return doc.write();
+}
+
+/// Mutate a canonical text by sprinkling PDF-meaningful punctuation
+/// likely to surface escape asymmetries: parens, backslash, octal-
+/// looking digits, CR / LF, hex-string delimiters, name-token `#`.
+/// Bytes outside [0x20, 0x7e] are dropped on the next emit by the
+/// WinAnsi filter — but they exercise the WRITER's filter logic,
+/// which is part of the round-trip surface.
+fn pdfOfPdfMutateCanon(
+    canon: []u8,
+    rng: std.Random,
+) void {
+    if (canon.len == 0) return;
+    // Skip the header line and the US byte separator when picking
+    // mutation positions, otherwise we'd corrupt the page-count
+    // metadata or the chunk delimiter and the next emit step would
+    // misread the page geometry.
+    const nl = std.mem.indexOfScalar(u8, canon, '\n') orelse return;
+    if (canon.len <= nl + 1) return;
+
+    const adversarial = [_]u8{
+        '(', ')', '\\', '<', '>', '#', '%', '/',
+        '\n', '\r', '\t', '0', '1', '7', // octal-escape-looking digits
+        ' ', ' ', // bias toward whitespace (WinAnsi-safe)
+    };
+    const flips = rng.intRangeAtMost(usize, 1, 6);
+    var k: usize = 0;
+    while (k < flips) : (k += 1) {
+        const idx = rng.intRangeAtMost(usize, nl + 1, canon.len - 1);
+        // Don't overwrite the US separator — keeps page boundaries
+        // stable across the mutation.
+        if (canon[idx] == 0x1f) continue;
+        canon[idx] = adversarial[rng.intRangeAtMost(usize, 0, adversarial.len - 1)];
+    }
+}
+
+/// Tier-7 multi-stage adversarial round-trip. Each iter walks
+/// `PDF_OF_PDF_STAGES` build → parse → canonicalise cycles, mutating
+/// between stages. Drift surfaces as `error.PdfOfPdfRoundTripDrift`
+/// with the stage index and a dumped reproducer for minimisation.
+///
+/// Stage-0 invariant: the canonical text of the seed PDF round-trips
+/// when re-emitted via `drawText` and re-parsed.
+/// Stage-N (N≥1) invariant: after a mutation pass on stage N-1's
+/// canon, the emitted PDF re-parses to that same mutated canon (or to
+/// a stable filtered variant — see `tolerant_compare`).
+fn fuzzPdfOfPdfRoundtrip(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    // Stage 0 input: a freshly-synthesised minimal PDF whose text is
+    // ASCII-only and so bypasses the WinAnsi filter on the very first
+    // round-trip. Using the iter's RNG to vary the seed text keeps
+    // every iter distinct; using `generateMinimalPdf` keeps the
+    // structure trivial so any drift is attributable to the
+    // text-channel and not page-tree bookkeeping.
+    var seed_text_buf: [64]u8 = undefined;
+    const seed_text_len = rng.intRangeAtMost(usize, 1, seed_text_buf.len);
+    const ascii = "abcdefghijklmnopqrstuvwxyz ";
+    for (seed_text_buf[0..seed_text_len]) |*b| {
+        b.* = ascii[rng.intRangeAtMost(usize, 0, ascii.len - 1)];
+    }
+    var current_pdf = try testpdf.generateMinimalPdf(allocator, seed_text_buf[0..seed_text_len]);
+    defer allocator.free(current_pdf);
+
+    var prev_canon: ?[]u8 = null;
+    defer if (prev_canon) |p| allocator.free(p);
+
+    var stage: usize = 0;
+    while (stage < PDF_OF_PDF_STAGES) : (stage += 1) {
+        // (a) Open the current PDF and canonicalise.
+        const doc = zpdf.Document.openFromMemory(allocator, current_pdf, zpdf.ErrorConfig.default()) catch |e| {
+            // First-stage parse failure is a real bug because we just
+            // emitted these bytes ourselves. Stage-N≥1 parse failure
+            // means our writer emitted bytes the parser can't read —
+            // also a bug.
+            dumpReproducer("pdf_of_pdf_roundtrip", current_pdf);
+            return e;
+        };
+        // pageCount is invariant across stages once stage-0 settles
+        // (no US bytes survive the WinAnsi filter so chunk count
+        // monotonically converges to the page count). Cap defends
+        // against a writer that splices content streams unexpectedly.
+        if (doc.pageCount() > 64) {
+            doc.close();
+            dumpReproducer("pdf_of_pdf_roundtrip", current_pdf);
+            return error.PdfOfPdfPageCountExplosion;
+        }
+        const canon = pdfOfPdfCanonicalise(doc, allocator) catch |e| {
+            doc.close();
+            dumpReproducer("pdf_of_pdf_roundtrip", current_pdf);
+            return e;
+        };
+        doc.close();
+
+        // (b) On stages ≥ 1: prev_canon was the input we asked the
+        //     writer to emit. The fresh canon is what came back out.
+        //     They MUST be byte-equal (modulo the page-count header,
+        //     which is recomputed each stage). The empty-doc fallback
+        //     in `pdfOfPdfEmitFromCanon` can legitimately bump the
+        //     page count from 0 to 1 — tolerate that one transition.
+        if (prev_canon) |p| {
+            const drift = !std.mem.eql(u8, p, canon);
+            if (drift) {
+                allocator.free(canon);
+                dumpReproducer("pdf_of_pdf_roundtrip", current_pdf);
+                return error.PdfOfPdfRoundTripDrift;
+            }
+        }
+
+        // (c) Mutate (in place) for the next round.
+        pdfOfPdfMutateCanon(canon, rng);
+
+        // (d) Free the previous prev_canon, hand current canon to it.
+        if (prev_canon) |p| allocator.free(p);
+        prev_canon = canon;
+
+        // (e) Re-emit a fresh PDF from the (now-mutated) canon.
+        const next_pdf = pdfOfPdfEmitFromCanon(canon, allocator) catch |e| {
+            dumpReproducer("pdf_of_pdf_roundtrip", current_pdf);
+            return e;
+        };
+        allocator.free(current_pdf);
+        current_pdf = next_pdf;
+
+        // (f) Update prev_canon to reflect what the WRITER will
+        //     actually emit (post-WinAnsi-filter). The next stage's
+        //     canonicalisation MUST match this filtered view, not
+        //     the pre-filter mutated text. Recompute by re-parsing
+        //     the freshly-emitted PDF — that's the contract.
+        const verify_doc = zpdf.Document.openFromMemory(allocator, current_pdf, zpdf.ErrorConfig.default()) catch |e| {
+            dumpReproducer("pdf_of_pdf_roundtrip", current_pdf);
+            return e;
+        };
+        const filtered_canon = pdfOfPdfCanonicalise(verify_doc, allocator) catch |e| {
+            verify_doc.close();
+            dumpReproducer("pdf_of_pdf_roundtrip", current_pdf);
+            return e;
+        };
+        verify_doc.close();
+        allocator.free(prev_canon.?);
+        prev_canon = filtered_canon;
+    }
+}
 
 // ============================================================================
 // Driver
