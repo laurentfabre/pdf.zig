@@ -46,6 +46,38 @@ const jpeg_meta = @import("jpeg_meta.zig");
 const encrypt_writer = @import("encrypt_writer.zig");
 const xmp_writer = @import("xmp_writer.zig");
 
+// PR-W10b [feat]: embedded sRGB v2 IEC61966-2.1 ICC profile, baked into
+// the binary at compile time via `@embedFile`. Used as the
+// /DestOutputProfile when `markAsPdfA()` is called. The bytes are a
+// minimal but standards-conformant 9-tag display profile (desc, cprt,
+// wtpt, rXYZ, gXYZ, bXYZ, rTRC, gTRC, bTRC) generated under
+// `scripts/gen_srgb_icc.py`. Static asset — no allocation, lifetime is
+// the binary itself.
+const SRGB_ICC: []const u8 = @embedFile("assets/srgb.icc");
+
+// PR-W10b: comptime validity gate. A corrupt ICC profile here would
+// poison every PDF/A document we emit (qpdf, Acrobat preflight, and any
+// reader following ISO 15076-1 §7.1 will reject the file). Two checks:
+//   1. ICC v2 magic 'acsp' lives at byte offset 36 (see ICC.1:2010
+//      §7.2.5).
+//   2. Big-endian u32 at offset 0 — the in-profile size field — must
+//      equal the raw byte count, otherwise readers truncate or run off
+//      the end of the tag table.
+comptime {
+    if (SRGB_ICC.len < 128) @compileError("srgb.icc shorter than ICC v2 header (128 B)");
+    if (SRGB_ICC[36] != 'a' or SRGB_ICC[37] != 'c' or SRGB_ICC[38] != 's' or SRGB_ICC[39] != 'p') {
+        @compileError("srgb.icc missing 'acsp' magic at offset 36 — corrupt asset");
+    }
+    const declared: u32 =
+        (@as(u32, SRGB_ICC[0]) << 24) |
+        (@as(u32, SRGB_ICC[1]) << 16) |
+        (@as(u32, SRGB_ICC[2]) << 8) |
+        @as(u32, SRGB_ICC[3]);
+    if (declared != SRGB_ICC.len) {
+        @compileError("srgb.icc declared profile size does not match byte count");
+    }
+}
+
 pub const FontHandle = pdf_resources.FontHandle;
 pub const ImageHandle = pdf_resources.ImageHandle;
 pub const ColorSpaceHandle = pdf_resources.ColorSpaceHandle;
@@ -1033,12 +1065,16 @@ pub const DocumentBuilder = struct {
 
         const catalog = try w.allocObjectNum();
 
-        // PR-W10a: reserve the /Metadata stream's obj_num before any
-        // page leaf or shared resource so the catalog can reference
-        // it via `/Metadata N 0 R`. The stream body itself is emitted
-        // later, between W11 resources and aux objects.
+        // PR-W10a: reserve /Metadata stream obj_num.
         if (self.pdfa_level != null and self.xmp_metadata_obj == null) {
             self.xmp_metadata_obj = try w.allocObjectNum();
+        }
+
+        // PR-W10b: reserve sRGB ICC stream + /OutputIntents array obj_nums.
+        var srgb_icc_obj: ?u32 = null;
+        if (self.pdfa_level != null and self.output_intents_obj == null) {
+            srgb_icc_obj = try w.allocObjectNum();
+            self.output_intents_obj = try w.allocObjectNum();
         }
 
         // PR-W11: reserve one indirect-object number per registered
@@ -1075,6 +1111,13 @@ pub const DocumentBuilder = struct {
         if (self.catalog_extras_raw.items.len > 0) {
             try w.writeRaw(" ");
             try w.writeRaw(self.catalog_extras_raw.items);
+        }
+        // PR-W10b: splice /OutputIntents into the catalog. Anchored
+        // here so PR-W10a's /Metadata splice (when it ships) lives on
+        // the line above this one — same indent, same style.
+        if (self.output_intents_obj) |oi_num| {
+            try w.writeRaw(" /OutputIntents ");
+            try w.writeRef(oi_num, 0);
         }
         try w.writeRaw(" >>");
         try w.endObject();
@@ -1150,13 +1193,26 @@ pub const DocumentBuilder = struct {
         // PR-W8: image XObjects.
         try self.registry.emitImageObjects(w);
 
-        // PR-W10a: emit the XMP /Metadata stream when the caller has
-        // opted in via `markAsPdfA(level)`. The obj_num was reserved
-        // earlier in this function so the catalog could already
-        // reference it via `/Metadata N 0 R`. Emitted AFTER shared
-        // resources and BEFORE aux objects.
+        // PR-W10a: emit XMP /Metadata stream.
         if (self.xmp_metadata_obj != null) {
             try emitXmpMetadata(self, w);
+        }
+
+        // PR-W10b: emit embedded sRGB ICC stream + /OutputIntents array.
+        if (srgb_icc_obj) |icc_num| {
+            try w.beginObject(icc_num, 0);
+            try w.writeStream(SRGB_ICC, " /N 3");
+            try w.endObject();
+
+            const oi_arr = self.output_intents_obj.?;
+            try w.beginObject(oi_arr, 0);
+            try w.writeRaw("[<< /Type /OutputIntent /S /GTS_PDFA2");
+            try w.writeRaw(" /OutputConditionIdentifier (sRGB IEC61966-2.1)");
+            try w.writeRaw(" /Info (sRGB IEC61966-2.1)");
+            try w.writeRaw(" /DestOutputProfile ");
+            try w.writeRef(icc_num, 0);
+            try w.writeRaw(" >>]");
+            try w.endObject();
         }
 
         // 3f. Auxiliary objects (outline items, annotations, form
@@ -2391,9 +2447,9 @@ test "PR-WX1: catalog setters with NO PDF/A emit byte-equivalent output" {
     const ref_bytes = try ref.write();
     defer allocator.free(ref_bytes);
 
-    // Tagged-only: markAsTagged + setLang, but NO markAsPdfA. PR-W10a
-    // gates its XMP emission on `pdfa_level != null` — so the
-    // remaining tag/lang flags must still be byte-equivalent today.
+    // Tagged-only: markAsTagged + setLang, but NO markAsPdfA. Emission
+    // is gated on `pdfa_level != null` for both W10a (/Metadata) and
+    // W10b (/OutputIntents); without it both stay byte-equivalent.
     var tagged = DocumentBuilder.init(allocator);
     defer tagged.deinit();
     try tagged.markAsTagged();
@@ -2679,4 +2735,109 @@ fn wx1AllocSweepFlow(doc: *DocumentBuilder) ![]u8 {
     try page.drawText(72, 720, .helvetica, 12, "x");
     try page.endTag();
     return doc.write();
+}
+
+// ---------- PR-W10b [feat]: OutputIntents + embedded sRGB ICC ----------
+
+test "PR-W10b: markAsPdfA emits /OutputIntents + /GTS_PDFA2 + ICC stream" {
+    const zpdf = @import("root.zig");
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    try doc.markAsPdfA(.b2);
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "Hello PDF/A");
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // Catalog must reference /OutputIntents.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/OutputIntents ") != null);
+    // OutputIntent dict shape — subtype + ICC ref slot present.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Type /OutputIntent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/S /GTS_PDFA2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/DestOutputProfile ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/OutputConditionIdentifier (sRGB IEC61966-2.1)") != null);
+    // ICC stream dict carries /N 3 (RGB component count).
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/N 3") != null);
+
+    // Reader can still parse the result.
+    var parsed = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer parsed.close();
+}
+
+test "PR-W10b: no markAsPdfA -> no /OutputIntents in output" {
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "x");
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/OutputIntents") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/GTS_PDFA2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/DestOutputProfile") == null);
+}
+
+test "PR-W10b: ICC stream length matches embedded asset byte count" {
+    const allocator = std.testing.allocator;
+
+    var doc = DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    try doc.markAsPdfA(.b2);
+
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(72, 720, .helvetica, 12, "x");
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // The ICC stream is the only object whose dict contains "/N 3";
+    // the /Length printed there must match SRGB_ICC.len.
+    const n3_pos = std.mem.indexOf(u8, bytes, "/N 3").?;
+    // Walk back to the dict opener; /Length sits ahead of /N 3.
+    const dict_start = std.mem.lastIndexOf(u8, bytes[0..n3_pos], "<< /Length ").?;
+    const len_value_start = dict_start + "<< /Length ".len;
+    var len_value_end = len_value_start;
+    while (len_value_end < bytes.len and bytes[len_value_end] >= '0' and bytes[len_value_end] <= '9') : (len_value_end += 1) {}
+    const declared_len = try std.fmt.parseInt(usize, bytes[len_value_start..len_value_end], 10);
+    try std.testing.expectEqual(SRGB_ICC.len, declared_len);
+
+    // First 4 bytes of the ICC payload encode profile size (BE u32).
+    // The asset's self-declared size must equal its byte count — the
+    // comptime guard already checks this, but assert at runtime too
+    // (pair assertion: comptime + runtime catch divergent rebuilds).
+    const declared_icc_size: u32 =
+        (@as(u32, SRGB_ICC[0]) << 24) |
+        (@as(u32, SRGB_ICC[1]) << 16) |
+        (@as(u32, SRGB_ICC[2]) << 8) |
+        @as(u32, SRGB_ICC[3]);
+    try std.testing.expectEqual(@as(u32, @intCast(SRGB_ICC.len)), declared_icc_size);
+
+    // Magic 'acsp' at offset 36 (paired with the comptime guard).
+    try std.testing.expectEqualSlices(u8, "acsp", SRGB_ICC[36..40]);
+}
+
+test "PR-W10b: every PdfALevel variant emits OutputIntents" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{ .b1, .b2, .b3, .u1, .u2, .u3, .a1, .a2, .a3 }) |lvl| {
+        var doc = DocumentBuilder.init(allocator);
+        defer doc.deinit();
+        try doc.markAsPdfA(lvl);
+        const page = try doc.addPage(.{ 0, 0, 612, 792 });
+        try page.drawText(72, 720, .helvetica, 12, "x");
+
+        const bytes = try doc.write();
+        defer allocator.free(bytes);
+
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "/GTS_PDFA2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "/DestOutputProfile") != null);
+    }
 }
