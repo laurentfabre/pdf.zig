@@ -20,6 +20,19 @@ const Object = parser.Object;
 const ObjRef = parser.ObjRef;
 const XRefTable = xref_mod.XRefTable;
 
+/// PR-SX1: minimal type alias for the wave-3.2 RoleMap parser. Today's
+/// stub takes the catalog as a parsed `Object.Dict` and a resolver
+/// callback so PR-22b can walk `/RoleMap` without re-importing parser
+/// internals on top of what `parseStructTree` already imports.
+pub const ObjectDict = parser.Object.Dict;
+
+/// PR-SX1: resolver callback shape for wave-3.2 stubs. The opaque
+/// context is carried through so callers can supply their own
+/// (allocator, data, xref, cache) tuple without leaking concrete types
+/// into this file. PR-22b's body will call `resolve_fn(ctx, ref)` to
+/// dereference `/RoleMap` entries that are themselves indirect.
+pub const ResolveFn = *const fn (ctx: *anyopaque, ref: ObjRef) anyerror!Object;
+
 /// A node in the structure tree
 pub const StructElement = struct {
     /// Structure type (Document, Part, Sect, P, H1, Table, TR, TD, Figure, etc.)
@@ -31,6 +44,27 @@ pub const StructElement = struct {
     children: []const StructChild,
     /// Page reference (if this element is on a specific page)
     page_ref: ?ObjRef = null,
+
+    // -- PR-SX1: nullable extension slots --------------------------------
+    // Pre-staged so wave-3.2 PRs (22b, 22d, 23a) can each fill in one
+    // slot without touching the struct definition. Today they are always
+    // null; `emitElementJson` does NOT serialize them, so the existing
+    // `--struct-tree` JSON output remains byte-identical. Each consumer
+    // PR will add the matching JSON key once the field is populated.
+
+    /// Populated by PR-22d (`/Lang` propagation). BCP-47 tag inherited
+    /// from `StructTreeRoot` → ancestor → leaf. Today: always null.
+    lang: ?[]const u8 = null,
+
+    /// Populated by PR-22b (`/RoleMap` resolution). Standard PDF/UA
+    /// structure type that `struct_type` resolves to via the catalog's
+    /// `/RoleMap`. Today: always null.
+    resolved_role: ?[]const u8 = null,
+
+    /// Populated by PR-23a (MCID → text resolver). The text bytes the
+    /// element's MCID brackets in its page's content stream, owned by
+    /// the same allocator that built the tree. Today: always null.
+    mcid_text: ?[]const u8 = null,
 };
 
 /// Child of a structure element - either another element or a marked content reference
@@ -155,6 +189,81 @@ pub fn emitElementJson(elem: *const StructElement, writer: *std.Io.Writer, depth
 }
 
 const MAX_STRUCT_DEPTH: u32 = 256;
+
+// =====================================================================
+// PR-SX1: wave-3.2 public-API stubs
+// ---------------------------------------------------------------------
+// Each function below is a no-op today; the body comment names the
+// wave-3.2 PR that will fill it in. Signatures are pre-staged to match
+// what the consuming PRs need so SX1's `feat/sx1-...` worktree merges
+// cleanly with 22b, 22d, 22e, and 23a in parallel.
+// =====================================================================
+
+/// PR-SX1 stub. PR-22b will fill in: parse `/RoleMap` from
+/// `StructTreeRoot`, walk the tree, set `resolved_role` on each
+/// `StructElement` whose `struct_type` is in the map. The opaque
+/// `resolve_ctx` lets the caller supply a (data, xref, cache, alloc)
+/// tuple without dragging concrete types into this file.
+///
+/// Today: returns successfully without changing the tree.
+pub fn parseRoleMap(
+    tree: *StructTree,
+    catalog: ObjectDict,
+    resolve_fn: ResolveFn,
+    resolve_ctx: *anyopaque,
+) !void {
+    _ = tree;
+    _ = catalog;
+    _ = resolve_fn;
+    _ = resolve_ctx;
+    // PR-22b: parse /RoleMap, populate resolved_role.
+}
+
+/// PR-SX1 stub. PR-22d will fill in: walk `tree`, propagate `/Lang`
+/// from `StructTreeRoot` → ancestor → leaf so every text-bearing
+/// element carries an explicit `lang`. `root_lang` is the catalog's
+/// `/Lang` (BCP-47), used as the inheritance root.
+///
+/// Today: no-op.
+pub fn propagateLang(tree: *StructTree, root_lang: ?[]const u8) !void {
+    _ = tree;
+    _ = root_lang;
+    // PR-22d: walk tree, populate lang via inheritance.
+}
+
+/// PR-SX1 stub. PR-22e will fill in: scan `tree`, return
+/// `error.MissingAltTextOnFigure` if any `/Figure`, `/Formula`, or
+/// `/Form` element lacks `/Alt` (per PDF/UA-1 §7.3).
+///
+/// Today: returns success.
+pub fn validateAltText(tree: *const StructTree) !void {
+    _ = tree;
+    // PR-22e: walk tree, validate /Alt presence on Figure/Formula/Form.
+}
+
+/// PR-SX1 stub. PR-23a will fill in: given a `Document` and a
+/// `MarkedContentRef`, return the text bytes the MCID brackets in the
+/// page's content stream. Caller owns the returned slice (allocated
+/// from `allocator`); a returned `null` means the MCID was not found.
+///
+/// `doc` is `*anyopaque` so this file stays decoupled from `root.zig`
+/// — PR-23a will resolve it back to `*Document` at call time.
+///
+/// Today: returns null.
+pub fn resolveMcidText(
+    doc: *anyopaque,
+    page_idx: usize,
+    mcid: i32,
+    allocator: std.mem.Allocator,
+) !?[]const u8 {
+    _ = doc;
+    _ = page_idx;
+    _ = mcid;
+    _ = allocator;
+    return null;
+    // PR-23a: walk page content stream, collect text bytes between
+    // BDC/EMC for matching mcid.
+}
 
 fn collectMcidsInOrder(
     elem: *const StructElement,
@@ -515,3 +624,61 @@ pub const MarkedContentExtractor = struct {
         return null;
     }
 };
+
+// =====================================================================
+// PR-SX1 tests
+// ---------------------------------------------------------------------
+// These pin the wave-3.2 contract: new `StructElement` fields default
+// to null, and the four public-API stubs are callable and return their
+// no-op result. A future copy-paste that defaults `lang` to `""`
+// instead of null trips the first assertion below; a regression that
+// changes a stub signature trips the second.
+// =====================================================================
+
+test "PR-SX1: StructElement extension fields default to null" {
+    const elem: StructElement = .{
+        .struct_type = "P",
+        .children = &.{},
+    };
+    // Split asserts so the failing line points at the exact slot.
+    try std.testing.expect(elem.lang == null);
+    try std.testing.expect(elem.resolved_role == null);
+    try std.testing.expect(elem.mcid_text == null);
+    // Sanity: existing nullable fields are also null by default.
+    try std.testing.expect(elem.title == null);
+    try std.testing.expect(elem.alt_text == null);
+    try std.testing.expect(elem.page_ref == null);
+}
+
+test "PR-SX1: wave-3.2 stub APIs are callable no-ops" {
+    const allocator = std.testing.allocator;
+
+    var tree: StructTree = .{
+        .root = null,
+        .elements = &.{},
+        .allocator = allocator,
+    };
+
+    // parseRoleMap: empty catalog dict, dummy resolver — must succeed.
+    const empty_dict: ObjectDict = .{ .entries = &.{} };
+    const dummy_ctx = struct {
+        fn resolve(ctx: *anyopaque, ref: ObjRef) anyerror!Object {
+            _ = ctx;
+            _ = ref;
+            return Object{ .null = {} };
+        }
+    };
+    var ctx_storage: u8 = 0;
+    try parseRoleMap(&tree, empty_dict, dummy_ctx.resolve, @ptrCast(&ctx_storage));
+
+    // propagateLang: null root_lang must be accepted as no-op.
+    try propagateLang(&tree, null);
+    try propagateLang(&tree, "en-US");
+
+    // validateAltText: empty tree must validate clean.
+    try validateAltText(&tree);
+
+    // resolveMcidText: today returns null — no allocation, no leak.
+    const text = try resolveMcidText(@ptrCast(&ctx_storage), 0, 42, allocator);
+    try std.testing.expect(text == null);
+}

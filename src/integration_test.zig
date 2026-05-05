@@ -1902,6 +1902,58 @@ test "PR-21: emitElementJson produces a Table → TR → TD tree" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"mcid_refs\":[5]") != null);
 }
 
+test "PR-SX1: emitElementJson byte-identical with new nullable fields" {
+    // Pre-stage gate: adding `lang`, `resolved_role`, `mcid_text` to
+    // StructElement (all default null) must NOT change the bytes
+    // emitted by `--struct-tree`. Wave-3.2 PRs (22b, 22d, 23a) will
+    // populate these fields and add their JSON keys; this test guards
+    // the SX1 step as a pure no-op for the emitter.
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const tree = try doc.getStructTree();
+    try std.testing.expect(tree.root != null);
+
+    // Defensive: every element in the tree must have all three SX1
+    // slots null today. Wave-3.2 PRs flip these to non-null one at a
+    // time; until then a non-null reading means a copy-paste bug.
+    for (tree.elements) |e| {
+        try std.testing.expect(e.lang == null);
+        try std.testing.expect(e.resolved_role == null);
+        try std.testing.expect(e.mcid_text == null);
+    }
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try zpdf.structtree.emitElementJson(tree.root.?, &aw.writer, 0);
+
+    // Byte-identical golden — captured against `main`@95ebe62 before
+    // the SX1 field additions. Any drift means the JSON emitter has
+    // been touched (intentionally or accidentally).
+    const expected =
+        "{\"type\":\"Table\",\"mcid_refs\":[],\"children\":[" ++
+        "{\"type\":\"TR\",\"mcid_refs\":[],\"children\":[" ++
+        "{\"type\":\"TD\",\"page_obj\":3,\"mcid_refs\":[0],\"children\":[]}," ++
+        "{\"type\":\"TD\",\"page_obj\":3,\"mcid_refs\":[1],\"children\":[]}," ++
+        "{\"type\":\"TD\",\"page_obj\":3,\"mcid_refs\":[2],\"children\":[]}]}," ++
+        "{\"type\":\"TR\",\"mcid_refs\":[],\"children\":[" ++
+        "{\"type\":\"TD\",\"page_obj\":3,\"mcid_refs\":[3],\"children\":[]}," ++
+        "{\"type\":\"TD\",\"page_obj\":3,\"mcid_refs\":[4],\"children\":[]}," ++
+        "{\"type\":\"TD\",\"page_obj\":3,\"mcid_refs\":[5],\"children\":[]}]}]}";
+    try std.testing.expectEqualStrings(expected, aw.written());
+
+    // Negative-space assertion: none of the wave-3.2 keys should
+    // appear in today's output. Catches a future emitter change that
+    // accidentally serializes `"lang":null` etc.
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"lang\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"resolved_role\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"mcid_text\"") == null);
+}
+
 test "PR-20: getPageAnnotations returns empty for page without /Annots" {
     const allocator = std.testing.allocator;
     const bytes = try testpdf.generateMinimalPdf(allocator, "Hello");
