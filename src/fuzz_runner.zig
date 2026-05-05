@@ -35,6 +35,7 @@ const parser = @import("parser.zig");
 const interpreter = @import("interpreter.zig");
 const pdf_document = @import("pdf_document.zig");
 const bidi = @import("bidi.zig");
+const cff = @import("cff.zig");
 
 // ============================================================================
 // Target registry
@@ -129,6 +130,34 @@ const TARGETS = [_]Target{
     .{ .name = "bidi_resolve_random_codepoints", .run = fuzzBidiResolveRandomCodepoints },
     .{ .name = "bidi_reorder_property", .run = fuzzBidiReorderProperty },
     .{ .name = "bidi_format_character_storm", .run = fuzzBidiFormatCharacterStorm },
+    // Iter-9 (audit/fuzz_loop_state.md row 5 — cff.zig). Hand-written
+    // byte-level CFF Type 2 parser used by the font_embedder fallback
+    // path. `CffParser.init(allocator, bytes)` takes attacker bytes
+    // directly. SUT-independent invariants (no panic / no leak; on
+    // success: charsets.len ≤ charstrings_index.count; getString /
+    // getGlyphName return null OR a bounded-length slice).
+    //
+    // All three targets are `reproducer_only` because they each
+    // reproducibly trip an open Finding (008a/008b) at < 10k iters in
+    // ReleaseSafe. Promote back to default-gate once Finding 008 is
+    // fixed. See audit/fuzz_findings.md for repro details.
+    //
+    // Repro (seed=0x1, ReleaseSafe):
+    //   cff_init_random_bytes  → integer overflow @ cff.zig:263
+    //                            (data_size = readOffSize(off_size) - 1
+    //                            underflows when last offset is 0).
+    //                            Trips between 5k-10k iters.
+    //   cff_init_biased_header → same bug as above; major=1 / minor=0
+    //                            biased header reaches Index.parse
+    //                            faster (trips between 100-1000 iters).
+    //   cff_dict_random_topdict→ @intCast trap @ cff.zig:105
+    //                            (charset_offset = @intCast(operand[0])
+    //                            on a negative/oversized operand from
+    //                            DictParser.readNumber).
+    //                            Trips at iter ≤ 50.
+    .{ .name = "cff_init_random_bytes", .run = fuzzCffInitRandomBytes, .reproducer_only = true },
+    .{ .name = "cff_init_biased_header", .run = fuzzCffInitBiasedHeader, .reproducer_only = true },
+    .{ .name = "cff_dict_random_topdict", .run = fuzzCffDictRandomTopDict, .reproducer_only = true },
     // Iter-4 (audit/fuzz_loop_state.md tier 3 — round-trip / property fuzz)
     // — DocumentBuilder.write() ↔ Document.openFromMemory ↔ extractMarkdown
     // — exercises the full writer ↔ reader pipeline (xref, page tree,
@@ -2909,6 +2938,166 @@ fn fuzzBidiFormatCharacterStorm(
         return err;
     };
     if (out2.len != input.len) return error.BidiStormForcedRtlByteLengthChanged;
+}
+
+// ============================================================================
+// Targets — cff.zig (iter-9, row 5 of audit/fuzz_loop_state.md)
+// ============================================================================
+
+/// Walk every glyph + every SID slot of a successfully-parsed CFF font and
+/// assert structural invariants the public surface advertises. Shared
+/// between cff_init_random_bytes and cff_init_biased_header so the same
+/// invariants apply to both reach paths.
+///
+/// SUT-independent invariants:
+///   - `parser.charsets.len ≤ parser.charstrings_index.count`
+///     (parseCharset writes at most `count` slots).
+///   - `getGlyphName(gid)` for `gid < charsets.len` is either `null` or
+///     a slice with bounded length.
+///   - `getString(sid)` is null OR has length ≤ 64 (longest std_string is
+///     "guilsinglright" at 14 bytes; dynamic strings are CFF Top-DICT
+///     sub-slices and capped well under 64 in any realistic font; we use
+///     a generous 1024-byte cap to allow for adversarial dynamic strings).
+///   - getGlyphName(gid) for `gid < charsets.len` agrees with
+///     getString(charsets[gid]) (both null or byte-equal).
+fn cffSweepInvariants(cp: *cff.CffParser) anyerror!void {
+    if (cp.charsets.len > cp.charstrings_index.count) {
+        return error.CffCharsetsExceedCharstrings;
+    }
+
+    // Sweep getGlyphName over the charsets array. Cap at 256 to bound
+    // wall time on adversarial fonts that claim millions of glyphs but
+    // have only a tiny charsets array allocated.
+    const gid_cap: usize = @min(cp.charsets.len, 256);
+    for (0..gid_cap) |gid| {
+        const name_opt = cp.getGlyphName(@intCast(gid));
+        if (name_opt) |name| {
+            if (name.len > 1024) return error.CffGlyphNameTooLong;
+        }
+        // getGlyphName must agree with getString(charsets[gid]).
+        const sid = cp.charsets[gid];
+        const via_sid = cp.getString(sid);
+        if ((name_opt == null) != (via_sid == null)) {
+            return error.CffGlyphNameSidDisagreement;
+        }
+        if (name_opt) |a| if (via_sid) |b| {
+            if (!std.mem.eql(u8, a, b)) return error.CffGlyphNameSidByteMismatch;
+        };
+    }
+
+    // Sweep getString over a window of SIDs covering both std_strings
+    // (0..391) and a band of dynamic SIDs (391..391+min(string_index.count,256)).
+    const dyn_count: usize = @min(cp.string_index.count, 256);
+    const sid_cap: u16 = @intCast(@min(@as(usize, 391) + dyn_count, std.math.maxInt(u16)));
+    var sid: u16 = 0;
+    while (sid < sid_cap) : (sid += 1) {
+        const s_opt = cp.getString(sid);
+        if (s_opt) |s| {
+            if (s.len > 1024) return error.CffStringTooLong;
+        }
+    }
+}
+
+/// T1 — pure random bytes through `CffParser.init`. The full happy path
+/// is exercised only when the random bytes happen to look like a CFF
+/// header (~1 in 256), but the rejected paths still walk the cursor +
+/// header probe. Buffer capped at 4 KiB to keep wall time bounded.
+fn fuzzCffInitRandomBytes(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const len = rng.intRangeAtMost(usize, 0, @min(scratch.len, 4096));
+    rng.bytes(scratch[0..len]);
+
+    var cp = cff.CffParser.init(allocator, scratch[0..len]) catch return;
+    defer cp.deinit();
+
+    try cffSweepInvariants(&cp);
+}
+
+/// T2 — biased CFF header so init() advances past the major-version
+/// gate (line 65: `if (major != 1) return UnsupportedFeature`). Forces
+/// the cursor into the four nested Index parses + Top DICT parser more
+/// often than the 1-in-256 rate of T1. Same SUT-independent invariants.
+fn fuzzCffInitBiasedHeader(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const len = rng.intRangeAtMost(usize, 4, @min(scratch.len, 4096));
+    rng.bytes(scratch[0..len]);
+    // major = 1 (only supported version), minor = 0, hdr_size in {4..16}
+    // to occasionally land past byte 4 (exercises the cursor.pos = hdr_size
+    // jump on line 68), off_size in {1..4} (legal CFF range, used by the
+    // four nested Index.parse calls indirectly via Top DICT operands).
+    scratch[0] = 1;
+    scratch[1] = 0;
+    scratch[2] = rng.intRangeAtMost(u8, 4, 16);
+    scratch[3] = rng.intRangeAtMost(u8, 1, 4);
+
+    var cp = cff.CffParser.init(allocator, scratch[0..len]) catch return;
+    defer cp.deinit();
+
+    try cffSweepInvariants(&cp);
+}
+
+/// Append a u16 BE to `buf` (helper for T3's synthetic CFF construction).
+fn appendU16Be(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u16) !void {
+    var be: [2]u8 = undefined;
+    std.mem.writeInt(u16, &be, v, .big);
+    try buf.appendSlice(allocator, &be);
+}
+
+/// T3 — synthesise a minimal CFF byte stream where the Top DICT INDEX
+/// contains a single entry of *random bytes*. Drives `parseTopDict` →
+/// `DictParser.next` → `readNumber` directly with attacker bytes,
+/// including the real-number nibble decoder (b0 == 30). The Name /
+/// String / Global Subr indices are emitted empty (count=0, two-byte
+/// each) so the cursor reaches Top DICT parsing cleanly.
+///
+/// Random Top DICT body covers:
+///   - all integer encodings (32–246, 247–250, 251–254 single-byte;
+///     28 short-int, 29 long-int)
+///   - real-number nibble decoder (30 ... terminator nibble F)
+///   - operator dispatch (b0 ≤ 21, including the two-byte 12-prefix)
+///   - StackUnderflow/Overflow guard at operand_buf[48]
+///
+/// Invariants: no panic. If init() succeeds, run cffSweepInvariants.
+fn fuzzCffDictRandomTopDict(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(aa);
+
+    // Header: major=1, minor=0, hdr_size=4, off_size=1.
+    try buf.appendSlice(aa, &[_]u8{ 1, 0, 4, 1 });
+
+    // Name INDEX: count=0 (two-byte big-endian zero — Index.parse early
+    // return path).
+    try appendU16Be(&buf, aa, 0);
+
+    // Top DICT INDEX: count=1, off_size=1, offsets=[1, dict_len+1],
+    // followed by `dict_len` random bytes. dict_len = 0..192.
+    const dict_len = rng.intRangeAtMost(usize, 0, 192);
+    if (dict_len + 1 > 255) return; // off_size=1 caps offsets at 255
+    try appendU16Be(&buf, aa, 1); // count
+    try buf.append(aa, 1); // off_size
+    try buf.append(aa, 1); // offsets[0]
+    try buf.append(aa, @intCast(dict_len + 1)); // offsets[1]
+    const dict_start = buf.items.len;
+    try buf.resize(aa, dict_start + dict_len);
+    rng.bytes(buf.items[dict_start..][0..dict_len]);
+
+    // String INDEX: count=0.
+    try appendU16Be(&buf, aa, 0);
+
+    // Global Subr INDEX: count=0.
+    try appendU16Be(&buf, aa, 0);
+
+    var cp = cff.CffParser.init(allocator, buf.items) catch return;
+    defer cp.deinit();
+
+    try cffSweepInvariants(&cp);
 }
 
 // ============================================================================

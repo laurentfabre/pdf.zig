@@ -278,6 +278,138 @@ See `src/fuzz_cov.zig` (the iter-6 harness) and the `fuzz-cov` step block in `bu
 
 ---
 
+## Finding 008 — `cff.zig` Index/DICT panic on adversarial CFF bytes
+
+**Status**: OPEN (issue tracker disabled on the repo; tracked here + in `audit/fuzz_loop_state.md`)
+**Surfaced by**: iter-9 of the autonomous fuzz loop. Three `reproducer_only` targets (`cff_init_random_bytes`, `cff_init_biased_header`, `cff_dict_random_topdict`) deterministically trip in ReleaseSafe within a few hundred to ~10k iters at multiple base seeds (`0x1`, `0x2`, `0xCAFEBABE`, `0xDEADBEEF`).
+**Class**: integer overflow / `@intCast` trap (Debug + ReleaseSafe panic; ReleaseFast UB → silently wrong offsets / OOB reads).
+
+### Site 008a — `Index.parse` last-offset underflow
+
+**Path**: `src/cff.zig:263` — `const data_size = temp_cursor.readOffSize(off_size) - 1;`
+
+The CFF Index format encodes data size as `last_offset - 1` (offsets are 1-based relative to the byte preceding the data array). When attacker bytes set the *last* offset to `0`, the subtraction underflows `usize`. ReleaseSafe traps; ReleaseFast wraps to `usize.max - 0` and the next `cursor.pos += data_size` blows past `cursor.data.len`, opening every subsequent `Index.parse` and `getData` call to OOB reads.
+
+#### Minimal reproducer
+
+```
+// 9-byte CFF that trips Finding 008a:
+//   header   : 01 00 04 01      (major=1 minor=0 hdrSize=4 offSize=1)
+//   Name IDX : 00 01 01 00 00   (count=1 offSize=1 offsets=[0,0])
+const bytes = [_]u8{ 1, 0, 4, 1, 0, 1, 1, 0, 0 };
+var p = try cff.CffParser.init(allocator, &bytes);  // panics here
+defer p.deinit();
+```
+
+```sh
+PDFZIG_FUZZ_ITERS=10000 PDFZIG_FUZZ_SEED=0x1 \
+  PDFZIG_FUZZ_TARGET=cff_init_random_bytes \
+  ~/.zvm/bin/zig build fuzz -Doptimize=ReleaseSafe
+```
+
+#### Stack at the panic
+
+```
+thread <id> panic: integer overflow
+src/cff.zig:273:9       parse           (return Index{...} after the underflow at line 263)
+src/cff.zig:71:42       parse           (self.name_index = try Index.parse(&cursor))
+src/fuzz_runner.zig:... fuzzCffInitRandomBytes
+```
+
+#### Recommended fix
+
+```zig
+// src/cff.zig:263
+const last_off = temp_cursor.readOffSize(off_size);
+if (last_off == 0) return CffError.TruncatedData;
+const data_size = last_off - 1;
+```
+
+Same defensive pattern at `src/cff.zig:291-292` in `Index.getData`:
+
+```zig
+if (start == 0 or end == 0) return &[_]u8{};
+const real_start = self.data_offset + start - 1;
+const real_end = self.data_offset + end - 1;
+```
+
+(getData currently catches the consequence with the `real_start >= full_data.len` check on line 294, but that check fires *after* the `+ start - 1` underflow — so it's load-bearing only in ReleaseFast where the underflow wraps. Make the precondition explicit.)
+
+### Site 008b — `parseTopDict` `@intCast` trap on negative DICT operand
+
+**Path**: `src/cff.zig:105` (and the parallel sites at 108, 111, 115, 116) — `self.charset_offset = @intCast(op.operands[0]);`
+
+`DictParser.readNumber` returns an `i32`. The Top DICT Charset / Encoding / CharStrings / Private offsets are stored as `usize`. When attacker bytes encode a negative number (e.g. via the `251..254` single-byte negative-int range, or a real-number nibble path that rounds to a negative value, or operator `29` long-int with the high bit set), `@intCast(i32 → usize)` traps in ReleaseSafe.
+
+ReleaseFast `@intCast` is UB and reinterprets the negative as a huge `usize`, which then drives `cursor.pos = self.charstrings_offset` (or similar) past `data.len`, opening downstream OOB reads.
+
+#### Minimal reproducer
+
+Build a CFF where the Top DICT body sets operator 15 (Charset) with a negative operand. Easiest: encode operand `-1` via `b0 = 251, b1 = 0` (the `-1*256 - 0 - 108 = -364`-ish range), then operator byte `15`:
+
+```
+// header + empty Name IDX + Top DICT IDX with body "FB 00 0F" + empty String IDX + empty Subr IDX
+//   251 00 → operand -108
+//   0F     → operator 15 (Charset)
+const bytes = [_]u8{ 1, 0, 4, 1, 0, 0, 0, 1, 1, 1, 4, 251, 0, 15, 0, 0, 0, 0 };
+var p = try cff.CffParser.init(allocator, &bytes);  // panics on the @intCast
+defer p.deinit();
+```
+
+```sh
+PDFZIG_FUZZ_ITERS=50 PDFZIG_FUZZ_SEED=0x1 \
+  PDFZIG_FUZZ_TARGET=cff_dict_random_topdict \
+  ~/.zvm/bin/zig build fuzz -Doptimize=ReleaseSafe
+```
+
+#### Stack at the panic
+
+```
+thread <id> panic: integer does not fit in destination type
+src/cff.zig:105:68      parseTopDict    (self.charset_offset = @intCast(op.operands[0]))
+src/cff.zig:85:43       parse           (try self.parseTopDict(top_dict_data))
+src/cff.zig:46:8        init            (try parser.parse())
+```
+
+#### Recommended fix
+
+Range-check then store. All five offset assignments need the same guard:
+
+```zig
+15 => { // Charset
+    if (op.operands.len > 0) {
+        const v = op.operands[0];
+        if (v < 0 or v > std.math.maxInt(u32)) return CffError.InvalidOperand;
+        self.charset_offset = @intCast(v);
+    }
+},
+```
+
+Or factor a helper:
+
+```zig
+fn nonNegativeOffset(v: i32) !usize {
+    if (v < 0) return CffError.InvalidOperand;
+    return @intCast(v);
+}
+```
+
+`InvalidOperand` is already in `CffError`, so no enum change needed.
+
+### User-facing impact
+
+CFF Type 2 fonts are a primary attack vector for PDF readers (CVE-2010-2883 et al. set the precedent). The pdf.zig CLI's primary path is `Document.open(path)` over trusted PDFs, but CFF-fontfile bytes inside an *otherwise-trusted* PDF are still attacker-controlled — a malicious PDF can carry a corrupt CFF FontFile3 stream that traps the reader. Embedding API consumers (C / WASM) hit this on any `openFromMemory` over an attacker-shaped PDF.
+
+**Severity: Medium.** Two distinct ReleaseSafe panics in the CFF parser. ReleaseFast trades the panic for OOB reads (`Index.parse` data_size wraps; `parseTopDict` offset reinterprets to multi-GB) — same severity class as Finding 005.
+
+### Why all three iter-9 targets are `reproducer_only`
+
+`cff_init_random_bytes` and `cff_init_biased_header` both reach `Index.parse` after a few hundred iters once random bytes form a non-zero count + at least one zero offset. `cff_dict_random_topdict` reaches `parseTopDict` on every iter and trips 008b within ~50 iters because random `i32` operands skew negative ~50 % of the time.
+
+There is no constrained-input variant that exercises the parser surface meaningfully *and* dodges both bugs — the bugs sit on the main parse path. So all three targets are gated as `reproducer_only` until Finding 008a + 008b are fixed; the harness shape is then unchanged when promoted back to default-gate.
+
+---
+
 ## Reproducer index
 
 - `audit/fuzz_corpus_crash_001.bin` — the 643-byte mutated PDF that initially caused the false-positive harness segfault. Kept as an interesting input even though the crash was harness-side; it is a useful smoke-test PDF for parser robustness (CLI handles it cleanly: `pdf.zig info audit/fuzz_corpus_crash_001.bin` → `pages: 0`).
