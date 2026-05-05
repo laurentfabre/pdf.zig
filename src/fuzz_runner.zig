@@ -30,6 +30,8 @@ const encrypt_writer = @import("encrypt_writer.zig");
 const markdown_to_pdf = @import("markdown_to_pdf.zig");
 const truetype = @import("truetype.zig");
 const jpeg_meta = @import("jpeg_meta.zig");
+const decompress = @import("decompress.zig");
+const parser = @import("parser.zig");
 
 // ============================================================================
 // Target registry
@@ -77,6 +79,15 @@ const TARGETS = [_]Target{
     .{ .name = "markdown_render_tagged", .run = fuzzMarkdownRenderTagged },
     .{ .name = "truetype_parse_random", .run = fuzzTruetypeParseRandom },
     .{ .name = "jpeg_meta_random", .run = fuzzJpegMetaRandom },
+    // Iter-1 of the autonomous fuzz loop (audit/fuzz_loop_state.md).
+    .{ .name = "decompress_ascii_hex_random", .run = fuzzDecompressAsciiHexRandom },
+    .{ .name = "decompress_runlength_random", .run = fuzzDecompressRunLengthRandom },
+    // Aggressive-gated: reproduces a u32 overflow trap inside `decodeASCII85`
+    // when the round-trip encoder produces a 5-char tuple whose intermediate
+    // accumulator (after the 4th '*85') exceeds 2^32. Minimal byte repro:
+    // `"uuuuu"`. Bug lives in src/decompress.zig:386. See
+    // audit/fuzz_findings.md (decoders section, ASCII85 overflow finding).
+    .{ .name = "decompress_ascii85_roundtrip", .run = fuzzDecompressAscii85Roundtrip, .aggressive = true },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -988,6 +999,202 @@ fn fuzzJpegMetaRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []
     switch (meta.colorspace) {
         .gray, .rgb, .cmyk => {},
     }
+}
+
+
+// ============================================================================
+// Targets — decompress.zig (defense-in-depth)
+// ============================================================================
+//
+// `decompress.decompressStream` is the trust boundary between attacker-
+// controlled PDF stream bytes and the rest of the parser. Any panic, read
+// out-of-bounds, infinite loop, or unbounded allocation here is CVE-grade
+// for a PDF reader. The four legacy decoders (FlateDecode, ASCIIHexDecode,
+// ASCII85Decode, RunLengthDecode) get individual targets so a regression
+// in one is attributable.
+//
+// Flate is intentionally driven only via the existing `pdf_open_mutation`
+// target's stream content — its output is unbounded by design and the
+// upstream decompressor has its own fuzz coverage; isolating it here would
+// duplicate work without adding signal.
+
+/// Drive `decompressStream` with `/Filter ASCIIHexDecode` against random
+/// bytes. Half the inputs get a `>` terminator appended in a randomly
+/// chosen position to exercise the early-exit path; the other half rely
+/// on the natural end-of-buffer.
+///
+/// Invariants:
+///   - no panic, no OOB read (the assertion is *surviving the call*)
+///   - if decode succeeds, output length ≤ ⌈input_len / 2⌉ + 1
+///     (best case: every input byte is a hex nibble; trailing nibble adds 1)
+///   - termination: a finite call returns regardless of `>` placement
+fn fuzzDecompressAsciiHexRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const len = rng.intRangeAtMost(usize, 0, scratch.len);
+    rng.bytes(scratch[0..len]);
+
+    // Bias half the iters toward "lots of hex digits" so we actually hit
+    // the appendNibble path rather than skipping every byte.
+    if (rng.boolean() and len > 0) {
+        const hex_pool = "0123456789ABCDEFabcdef \n\t\r>";
+        const nibblify_count = rng.intRangeAtMost(usize, 0, len);
+        for (0..nibblify_count) |_| {
+            const idx = rng.intRangeAtMost(usize, 0, len - 1);
+            scratch[idx] = hex_pool[rng.intRangeAtMost(usize, 0, hex_pool.len - 1)];
+        }
+    }
+
+    // Sometimes drop a `>` terminator at a random position. The decoder
+    // must stop at it; this checks the early-exit doesn't read past.
+    if (rng.boolean() and len > 0) {
+        scratch[rng.intRangeAtMost(usize, 0, len - 1)] = '>';
+    }
+
+    const filter = parser.Object{ .name = "ASCIIHexDecode" };
+    const out = decompress.decompressStream(allocator, scratch[0..len], filter, null) catch return;
+    defer allocator.free(out);
+
+    // Output length bound: every two non-whitespace nibbles in input
+    // produce at most one output byte. `len/2 + 1` covers the trailing-
+    // odd-nibble case without depending on whitespace counts.
+    if (out.len > len / 2 + 1) return error.AsciiHexOutputAboveBound;
+}
+
+/// Round-trip a random plaintext through a fuzz-internal ASCII85 encoder
+/// and then `decompressStream(filter=ASCII85Decode)`, asserting byte-
+/// perfect equality. Also runs adversarial-bytes mode (no encoder) on
+/// half the iters to exercise the malformed-input path against the
+/// no-panic invariant.
+///
+/// Invariants:
+///   - encoder/decoder round-trip: decode(encode(x)) == x (byte-exact)
+///   - on adversarial input: no panic; output ≤ ⌈input_len * 4/5⌉ + 4
+///     (every 5 input chars decode to ≤ 4 output bytes, plus tuple flush)
+fn fuzzDecompressAscii85Roundtrip(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const filter = parser.Object{ .name = "ASCII85Decode" };
+
+    if (rng.boolean()) {
+        // Round-trip mode: encode random plaintext, then decode it.
+        const plain_len = rng.intRangeAtMost(usize, 0, scratch.len / 2);
+        rng.bytes(scratch[0..plain_len]);
+        const plain = scratch[0..plain_len];
+
+        const encoded = try encodeAscii85(allocator, plain);
+        defer allocator.free(encoded);
+
+        const decoded = decompress.decompressStream(allocator, encoded, filter, null) catch |err| {
+            // Any error on a well-formed encode is a bug.
+            return err;
+        };
+        defer allocator.free(decoded);
+
+        if (!std.mem.eql(u8, decoded, plain)) return error.Ascii85RoundtripMismatch;
+        return;
+    }
+
+    // Adversarial mode: random bytes. The invariant is no panic. Bound
+    // the output (5 input chars → ≤ 4 output bytes; +4 for trailing
+    // tuple flush slack).
+    const len = rng.intRangeAtMost(usize, 0, scratch.len);
+    rng.bytes(scratch[0..len]);
+    const out = decompress.decompressStream(allocator, scratch[0..len], filter, null) catch return;
+    defer allocator.free(out);
+
+    // Each non-skipped, non-`z` ASCII85 char contributes 1/5 of an
+    // output tuple (4 bytes). `z` shorthand is 1 char → 4 bytes. So
+    // worst-case ratio is 4 bytes per 1 input char.
+    const upper = len * 4 + 4;
+    if (out.len > upper) return error.Ascii85OutputAboveBound;
+}
+
+/// Drive `decompressStream` with `/Filter RunLengthDecode` against random
+/// bytes. The decoder treats each pair (length, then 1..128 data bytes
+/// or 1 repeat byte) as a packet; 0x80 is the EOD marker.
+///
+/// Invariants:
+///   - no panic, no OOB read
+///   - output length ≤ 128 * input_len (worst case: a length=129 byte
+///     followed by a single data byte yields 128 output bytes for 2
+///     input bytes — that's a 64× ratio. 128× is a safe upper bound.)
+fn fuzzDecompressRunLengthRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const len = rng.intRangeAtMost(usize, 0, scratch.len);
+    rng.bytes(scratch[0..len]);
+
+    // Bias half the iters toward small length bytes < 128 (literal-copy
+    // mode) and the other half toward > 128 (repeat mode), so both code
+    // paths get exercised heavily. Without bias, the ~32% chance of any
+    // given length byte being < 128 means the literal path is over-
+    // represented.
+    if (rng.boolean() and len > 0) {
+        const bias_repeat = rng.boolean();
+        for (scratch[0..len]) |*b| {
+            if (rng.intRangeAtMost(u8, 0, 9) < 4) {
+                b.* = if (bias_repeat) rng.intRangeAtMost(u8, 129, 255) else rng.intRangeAtMost(u8, 0, 127);
+            }
+        }
+    }
+
+    const filter = parser.Object{ .name = "RunLengthDecode" };
+    const out = decompress.decompressStream(allocator, scratch[0..len], filter, null) catch return;
+    defer allocator.free(out);
+
+    // Output bound: 128× expansion is the analytical worst case for the
+    // length=129 / single-data-byte pattern; we guard with 128× + 1 to
+    // account for any single-iter EOF behaviour.
+    if (out.len > len * 128 + 1) return error.RunLengthOutputAboveBound;
+}
+
+/// Minimal ASCII85 encoder used only by the round-trip fuzz target. Emits
+/// `~>` terminator. Standard PDF base-85 alphabet (`!`..`u`), with `z` for
+/// 4-zero-byte tuples (matches the decoder's recognition of `z`).
+fn encodeAscii85(allocator: std.mem.Allocator, data: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i + 4 <= data.len) : (i += 4) {
+        const tuple: u32 = (@as(u32, data[i]) << 24) |
+            (@as(u32, data[i + 1]) << 16) |
+            (@as(u32, data[i + 2]) << 8) |
+            @as(u32, data[i + 3]);
+        if (tuple == 0) {
+            try out.append(allocator, 'z');
+        } else {
+            var t = tuple;
+            var buf: [5]u8 = undefined;
+            var j: usize = 5;
+            while (j > 0) {
+                j -= 1;
+                buf[j] = @intCast('!' + @as(u8, @intCast(t % 85)));
+                t /= 85;
+            }
+            try out.appendSlice(allocator, &buf);
+        }
+    }
+    // Trailing 1..3 bytes — pad with zeros, encode, then drop padding.
+    const rem = data.len - i;
+    if (rem > 0) {
+        var pad_buf: [4]u8 = .{ 0, 0, 0, 0 };
+        @memcpy(pad_buf[0..rem], data[i..]);
+        const tuple: u32 = (@as(u32, pad_buf[0]) << 24) |
+            (@as(u32, pad_buf[1]) << 16) |
+            (@as(u32, pad_buf[2]) << 8) |
+            @as(u32, pad_buf[3]);
+        var t = tuple;
+        var buf: [5]u8 = undefined;
+        var j: usize = 5;
+        while (j > 0) {
+            j -= 1;
+            buf[j] = @intCast('!' + @as(u8, @intCast(t % 85)));
+            t /= 85;
+        }
+        // Emit (rem + 1) chars of the 5-char encoding.
+        try out.appendSlice(allocator, buf[0 .. rem + 1]);
+    }
+    try out.appendSlice(allocator, "~>");
+    return out.toOwnedSlice(allocator);
 }
 
 // ============================================================================

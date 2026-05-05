@@ -100,7 +100,9 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 | **markdown_render_tagged** | **118.6 s** | **v1.6 PR-W10d — renderTagged → reopen-via-parser round-trip** |
 | **truetype_parse_random** | **7.4 s** | **v1.6 PR-W7 — TTF parser robustness on adversarial bytes** |
 | **jpeg_meta_random** | **7.3 s** | **v1.6 PR-W8 — JPEG SOF/SOI parser robustness** |
-| **Total** | **2616.3 s (43 min 36 s)** | |
+| **decompress_ascii_hex_random** | TBD (1M not yet rerun) | **iter-1 — `/Filter ASCIIHexDecode` random-bytes** |
+| **decompress_runlength_random** | TBD (1M not yet rerun) | **iter-1 — `/Filter RunLengthDecode` biased-bytes** |
+| **Total** | **2616.3 s (43 min 36 s) + iter-1 deltas** | |
 
 Aggressive-mode targets (`PDFZIG_FUZZ_AGGRESSIVE=1`):
 - `pdf_open_mutation` — 50k iters, 1.7 s, clean
@@ -111,6 +113,65 @@ The seven **bold** targets were added during the v1.6 closeout fuzz pass (2026-0
 ### Discoveries during the v1.6 fuzz pass
 
 - **`markdown_render_tagged` v1 false-positive (resolved in-pass).** First draft of the harness counted raw `BDC` / `EMC` substring occurrences in the emitted PDF and asserted parity. PR-W4 (FlateDecode on content streams) makes those substrings appear inside compressed bytes, so 72 / 100k iters tripped a structural-mismatch invariant that was actually noise. Replaced with a stronger `Document.openFromMemory` + `pageCount > 0` round-trip check; the parser is the authoritative validator of the emitted bytes' structure.
+
+---
+
+## Finding 005 — `decodeASCII85` u32 overflow trap on legal-looking 5-char tuples
+
+**Status**: OPEN (issue tracker disabled on the repo; tracked here + in `audit/fuzz_loop_state.md`)
+**Path**: `src/decompress.zig:386` — `tuple = tuple * 85 + (c - '!')`
+**Surfaced by**: fuzz target `decompress_ascii85_roundtrip` (aggressive-gate), iter 1 of the autonomous fuzz loop, `PDFZIG_FUZZ_SEED=0x1` panics within the first 200 iters.
+**Class**: integer overflow (Debug / ReleaseSafe panic; ReleaseFast UB → silently wrong output)
+
+### Reproducer
+
+```zig
+// 5-byte minimal repro:
+const out = try decompress.decompressStream(
+    allocator,
+    "uuuuu",
+    .{ .name = "ASCII85Decode" },
+    null,
+);
+defer allocator.free(out);
+```
+
+Or via the harness:
+
+```sh
+PDFZIG_FUZZ_AGGRESSIVE=1 \
+  PDFZIG_FUZZ_TARGET=decompress_ascii85_roundtrip \
+  PDFZIG_FUZZ_SEED=0x1 \
+  ~/.zvm/bin/zig build fuzz
+```
+
+### Stack at the panic
+
+```
+thread <id> panic: integer overflow
+src/decompress.zig:386:23  decodeASCII85
+src/decompress.zig:88:29   applyFilter
+src/decompress.zig:61:39   decompressStream
+```
+
+### Root cause
+
+After the 4th iteration of `tuple = tuple * 85 + (c - '!')` the accumulator can reach `84 × 85^4 = 4 437 053 040`, exceeding `u32` max (`4 294 967 295`). PDF spec ISO 32000-1 §7.4.3 says *valid* encoded 5-tuples represent values < `2^32`, but the *intermediate* accumulator overflows even when the final value would be in range — and adversarial input doesn't have to be valid.
+
+### Recommended fix
+
+Two options at `src/decompress.zig:386`:
+
+1. **Pre-check.** Before each `tuple = tuple * 85 + …`, verify `tuple <= (std.math.maxInt(u32) - 84) / 85`; otherwise return `error.DecompressFailed`.
+2. **u64 intermediate.** Accumulate into `u64`; on flush (count == 5) check `tuple > std.math.maxInt(u32)` and return `error.DecompressFailed`.
+
+Option 2 is simpler and probably faster (one cmp instead of one cmp + one div per byte). The default-gated `decompress_ascii_hex_random` and `decompress_runlength_random` targets don't reach this surface — only the aggressive-gated round-trip target does — so default-gate fuzz remains clean while the fix is in flight.
+
+### User-facing impact
+
+A malicious PDF with an `/ASCII85Decode` filtered stream containing a 5-tuple whose intermediate accumulator overflows would crash any pdf.zig consumer running in `Debug` or `ReleaseSafe` (panic) and silently produce wrong decoded bytes in `ReleaseFast`. The CLI's primary path is `Document.open(path)` over trusted PDFs; `openFromMemory` over attacker-controlled bytes is reachable through the embedding API and the C / WASM consumers.
+
+**Severity: Medium.** Crash on adversarial input. No OOB read, no RCE.
 
 ---
 
