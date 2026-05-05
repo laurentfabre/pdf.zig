@@ -41,6 +41,7 @@ const image_writer = @import("image_writer.zig");
 const pdf_writer = @import("pdf_writer.zig");
 const attr_flattener = @import("attr_flattener.zig");
 const structtree = @import("structtree.zig");
+const markdown = @import("markdown.zig");
 
 // ============================================================================
 // Target registry
@@ -210,6 +211,27 @@ const TARGETS = [_]Target{
     .{ .name = "attr_flattener_random_tree", .run = fuzzAttrFlattenerRandomTree },
     .{ .name = "attr_flattener_in_place_idempotent", .run = fuzzAttrFlattenerInPlaceIdempotent },
     .{ .name = "attr_flattener_depth_bound", .run = fuzzAttrFlattenerDepthBound },
+    // Iter-12 (audit/fuzz_loop_state.md row 15 — markdown.zig).
+    // Row 15 calls out "the markdown parser itself" but src/markdown.zig
+    // is in fact the *reverse* renderer (PDF TextSpan slices → Markdown
+    // text). Today's only markdown-side coverage is `tokenizer_realistic_md`
+    // which exercises the tokenizer estimator only.
+    //
+    // Two targets:
+    //   - markdown_render_pdf_to_md: randomised `TextSpan` slices into
+    //     `renderPageToMarkdown`. Biases font_size toward heading-trip
+    //     buckets (6/12/18/24 pt) and texts toward bullet / numbered-list
+    //     prefixes so the semantic detection branches are exercised.
+    //     Invariants: no panic; no leak; UTF-8 input → UTF-8 output;
+    //     output ≤ 32 × Σ(input.text.len + 8) (heading "###### " + "\n"
+    //     is the worst per-element overhead).
+    //   - markdown_to_pdf_untagged: pivot per the user's instruction —
+    //     `markdown_render_tagged` covers the `tagged=true` branch;
+    //     this target drives the `tagged=false` half of `renderCore`.
+    //     Same property as the tagged target (PDF magic, EOF, reparse,
+    //     pageCount > 0) but probes the no-StructTreeRoot codepath.
+    .{ .name = "markdown_render_pdf_to_md", .run = fuzzMarkdownRenderPdfToMd },
+    .{ .name = "markdown_to_pdf_untagged", .run = fuzzMarkdownToPdfUntagged },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -3790,6 +3812,197 @@ fn fuzzAttrFlattenerDepthBound(rng: std.Random, allocator: std.mem.Allocator, sc
     } else |err| {
         if (!expect_too_deep) return error.FlattenInPlaceRejectedShallowChain;
         if (err != error.StructTreeTooDeep) return err;
+    }
+}
+
+// ============================================================================
+// Targets — markdown (iter-12, row 15)
+// ============================================================================
+//
+// `src/markdown.zig` is a PDF-spans → Markdown *renderer* (not a parser).
+// Public surface used here:
+//   - `markdown.TextSpan`               — alias for `layout.TextSpan`.
+//   - `markdown.MarkdownOptions`        — semantic-detection toggles.
+//   - `markdown.renderPageToMarkdown`   — single-page entry.
+//
+// The reverse direction (Markdown → PDF) lives in `markdown_to_pdf.zig` and
+// is fuzzed by `markdown_render_tagged` (tagged=true). The untagged target
+// below covers the `tagged=false` branch of `renderCore`.
+
+/// Construct a randomised `TextSpan` slice and feed it through
+/// `markdown.renderPageToMarkdown`. SUT-independent invariants only:
+///   - no panic / no leak.
+///   - UTF-8 input → UTF-8 output (we keep the input UTF-8-valid so that
+///     a violation of this property is a *renderer* bug, not the input
+///     accidentally being garbage already).
+///   - finite coordinates (NaN/inf y/x are out of scope here; guarded
+///     by `layout.safeRowFromY` already; iter-9 P4 says don't probe
+///     fields that may be undefined).
+///   - heuristic upper bound on output size: each element prepends at
+///     most 7 bytes ("###### ") and appends 1 newline, so for N spans
+///     the output is at most 8 × (N + Σ text.len) plus a slack.
+fn fuzzMarkdownRenderPdfToMd(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    _ = scratch;
+
+    // Cap span count well under any structural budget. The renderer
+    // sorts and dupes; 64 spans at avg 16 bytes of text is plenty to
+    // exercise the line-flush + paragraph-gap branches without blowing
+    // the scratch budget.
+    const span_count = rng.intRangeAtMost(usize, 0, 64);
+
+    // Bias text choices toward markers the semantic detection cares
+    // about: bullets, numbered prefixes, plain words. The renderer
+    // checks `startsWith` against these so they have to land at byte 0.
+    // (iter-2 P2 recap: biased input must reach the SUT from byte 0.)
+    const text_pool = [_][]const u8{
+        "Hello",
+        "world",
+        "Title",
+        "Section",
+        "Body text continues here.",
+        "\u{2022}", // bullet
+        "\u{25CF}",
+        "\u{25A0}",
+        "-",
+        "*",
+        "1.",
+        "2)",
+        "(i)",
+        "a.",
+        "Z:",
+        "", // empty span — exercises the empty-text branch
+        "code",
+        " leading-space",
+        "\t",
+        "long word that should not wrap because wrap_column = 0",
+    };
+
+    // Heading detection trips at ratio ≥ h3_ratio (1.3). Biasing font_size
+    // toward {6, 9, 12, 14, 18, 24, 36} drives heading branches at
+    // body=12pt (the most common bucket).
+    const font_size_pool = [_]f64{ 6, 9, 10, 11, 12, 14, 18, 24, 36, 48 };
+
+    var spans: std.ArrayList(markdown.TextSpan) = .empty;
+    defer spans.deinit(allocator);
+    try spans.ensureTotalCapacity(allocator, span_count);
+
+    // Layout uses 1-pt resolution on a Letter page. Keep coords inside
+    // [0, 1000] × [0, 1000] so the rough bbox is plausible and the
+    // sort/lossyCast paths don't blow up.
+    var i: usize = 0;
+    while (i < span_count) : (i += 1) {
+        const text = text_pool[rng.intRangeAtMost(usize, 0, text_pool.len - 1)];
+        const fs = font_size_pool[rng.intRangeAtMost(usize, 0, font_size_pool.len - 1)];
+        // Indented spans: ~1/4 of the time, push x0 past 36 / 72 pt to
+        // light up the indentation-level branch in `indentLevel`.
+        const indent_bucket = rng.intRangeAtMost(u8, 0, 7); // 0..7 → 0,36,72,...
+        const x0: f64 = @as(f64, @floatFromInt(indent_bucket)) * 36.0 + rng.float(f64) * 4.0;
+        // Y descends in 14-pt steps with jitter so the line-flush branch
+        // (y_diff > 3.0) and paragraph-gap branch (y_diff > body*1.2)
+        // both get exercised.
+        const row_idx: f64 = @as(f64, @floatFromInt(i));
+        const y0: f64 = 700.0 - row_idx * 14.0 + (rng.float(f64) - 0.5) * 6.0;
+        const w: f64 = @as(f64, @floatFromInt(text.len)) * fs * 0.5 + 1.0;
+        try spans.append(allocator, .{
+            .x0 = x0,
+            .y0 = y0,
+            .x1 = x0 + w,
+            .y1 = y0 + fs,
+            .text = text,
+            .font_size = fs,
+        });
+    }
+
+    // Toggle the semantic-detection knobs ~ uniformly to widen branch
+    // coverage. `apply_bidi=false` half the time skips the per-line
+    // bidi pass; the bidi resolver itself is iter-8 territory.
+    const opts: markdown.MarkdownOptions = .{
+        .detect_headings = rng.boolean(),
+        .detect_emphasis = rng.boolean(),
+        .detect_code = rng.boolean(),
+        .detect_lists = rng.boolean(),
+        .detect_tables = rng.boolean(),
+        .page_breaks_as_hr = rng.boolean(),
+        .apply_bidi = rng.boolean(),
+    };
+
+    // `renderPageToMarkdown`'s inferred error set today is just
+    // `error{OutOfMemory}` (alloc + dupe + appendSlice). Bubble OOM as
+    // a no-op (allocator pressure isn't a SUT bug); any future error
+    // added to the set will surface here as a compile error and force
+    // a deliberate decision.
+    const out = markdown.renderPageToMarkdown(allocator, spans.items, 612.0, opts) catch |e| {
+        if (e == error.OutOfMemory) return;
+        return e;
+    };
+    defer allocator.free(out);
+
+    // Invariant 1: every span text is ASCII-only in our pool, so the
+    // output must validate as UTF-8 too. (Bullet code points U+2022 /
+    // U+25CF / U+25A0 are valid 3-byte UTF-8 → still UTF-8-valid.)
+    if (!std.unicode.utf8ValidateSlice(out)) return error.MarkdownRenderInvalidUtf8;
+
+    // Invariant 2: heuristic size ceiling. Worst-case prefix is
+    // "###### " (7 bytes), worst-case suffix is "```\n…\n```\n"
+    // (10 bytes around code blocks); use 32× per element + slack as a
+    // generous upper bound. Most pool texts ≤ 64 bytes, so the bound
+    // is comfortably above the renderer's actual output.
+    var total_text_len: usize = 0;
+    for (spans.items) |s| total_text_len += s.text.len;
+    const upper_bound: usize = 32 * (spans.items.len + 1) + 32 * total_text_len + 1024;
+    if (out.len > upper_bound) return error.MarkdownRenderOutputTooLarge;
+
+    // Invariant 3: line-break sentinel uses the empty rodata literal `""`;
+    // the per-element free in `render` guards on `text.len > 0`. If the
+    // renderer ever emits a literal NUL byte we want to know about it
+    // — markdown is text and a NUL would corrupt downstream NDJSON.
+    if (std.mem.indexOfScalar(u8, out, 0)) |_| return error.MarkdownRenderEmbeddedNul;
+}
+
+/// Pivot per iter-12 brief: `markdown_render_tagged` covers the
+/// `tagged=true` half of `renderCore`; this target drives the
+/// `tagged=false` half. Same `%PDF-` / `%%EOF` / reparse-yields-pages
+/// property as the tagged target.
+///
+/// Mirror of `fuzzMarkdownRenderTagged` (line ~1040) but uses
+/// `markdown_to_pdf.render` (the `renderWithIo(allocator, null, …)`
+/// alias) so the StructTree assembly path stays cold.
+fn fuzzMarkdownToPdfUntagged(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // Same 2 KiB cap as the tagged target — render() expands one PDF
+    // page per `---` line in the worst case; unbounded markdown blows
+    // past the page-tree depth budget without surfacing fresh bugs.
+    const len = rng.intRangeAtMost(usize, 0, @min(scratch.len, 2048));
+    rng.bytes(scratch[0..len]);
+
+    // `render`'s inferred error set is narrower than `renderTagged`'s
+    // (no struct-tree assembly), so a single OutOfMemory swallow
+    // covers it. Any other error (e.g. drawing-engine panic surfaced
+    // as an error) bubbles up and counts as a finding.
+    const bytes = markdown_to_pdf.render(allocator, scratch[0..len]) catch |e| {
+        if (e == error.OutOfMemory) return;
+        return e;
+    };
+    defer allocator.free(bytes);
+
+    // Same structural invariants as the tagged target (line ~1055).
+    if (!std.mem.startsWith(u8, bytes, "%PDF-")) return error.MarkdownUntaggedMissingMagic;
+    if (std.mem.indexOf(u8, bytes, "%%EOF") == null) return error.MarkdownUntaggedMissingEof;
+
+    const doc = zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.default()) catch
+        return error.MarkdownUntaggedUnreadable;
+    defer doc.close();
+    if (doc.pageCount() == 0) return error.MarkdownUntaggedZeroPages;
+
+    // Negative-space check (iter-10 P2 — probe each transition's
+    // post-condition explicitly). The untagged path must NOT emit a
+    // /StructTreeRoot dictionary. A bare substring search is OK here
+    // because content streams are not flate-compressed at this tier
+    // for the StructTree dict itself (only page content streams are).
+    if (std.mem.indexOf(u8, bytes, "/StructTreeRoot")) |_| {
+        return error.MarkdownUntaggedHasStructTreeRoot;
     }
 }
 
