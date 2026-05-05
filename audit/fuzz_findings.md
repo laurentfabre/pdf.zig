@@ -100,9 +100,11 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 | **markdown_render_tagged** | **118.6 s** | **v1.6 PR-W10d — renderTagged → reopen-via-parser round-trip** |
 | **truetype_parse_random** | **7.4 s** | **v1.6 PR-W7 — TTF parser robustness on adversarial bytes** |
 | **jpeg_meta_random** | **7.3 s** | **v1.6 PR-W8 — JPEG SOF/SOI parser robustness** |
-| **decompress_ascii_hex_random** | TBD (1M not yet rerun) | **iter-1 — `/Filter ASCIIHexDecode` random-bytes** |
-| **decompress_runlength_random** | TBD (1M not yet rerun) | **iter-1 — `/Filter RunLengthDecode` biased-bytes** |
-| **Total** | **2616.3 s (43 min 36 s) + iter-1 deltas** | |
+| **decompress_ascii_hex_random** | **98.9 s** | **iter-1 — `/Filter ASCIIHexDecode` random-bytes** |
+| **decompress_runlength_random** | **111.3 s** | **iter-1 — `/Filter RunLengthDecode` biased-bytes** |
+| **Total** | **2826.8 s (47 min 7 s) — 25/25 clean at 1M, base seed `0x19df72ef96f`** | |
+
+The aggressive-gated `decompress_ascii85_roundtrip` is `reproducer_only` and skipped from the default + aggressive sweeps; deterministically reproduces Finding 005 below.
 
 Aggressive-mode targets (`PDFZIG_FUZZ_AGGRESSIVE=1`):
 - `pdf_open_mutation` — 50k iters, 1.7 s, clean

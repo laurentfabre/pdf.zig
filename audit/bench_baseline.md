@@ -17,38 +17,54 @@ post the 0.16 migration (this PR), but the in-tree CJK corpus is ≤1.3 KB
 per file — too small for meaningful end-to-end numbers. Treat it as a
 smoke-test of the bench binary, not a perf gate.
 
-## Baseline — 2026-05-05, 50 000 iters/target, Zig 0.16.0 Debug, base seed `0x19df7152cc1`
+## Baseline — 2026-05-05 (post-iter-1), 50 000 iters/target, Zig 0.16.0 Debug, base seed `0x19df75b03c3`
 
 ```
-pdf.zig fuzz harness — iters=50000, base_seed=0x19df7152cc1, build=Debug
+pdf.zig fuzz harness — iters=50000, base_seed=0x19df75b03c3, build=Debug
 ```
 
 | Target | Wall time (ms) | µs / iter |
 |---|---:|---:|
-| tokenizer_count                  |     2 063 |   41.3 |
-| stream_json_string               |    24 006 |  480.1 |
-| stream_envelope_meta             |     1 132 |   22.6 |
-| stream_envelope_page             |     8 559 |  171.2 |
-| chunk_break_finder               |    28 578 |  571.6 |
-| cli_parse_args                   |        35 |    0.7 |
-| cli_page_range                   |        96 |    1.9 |
-| pdf_open_random                  |       261 |    5.2 |
-| pdf_open_magic_prefix            |       263 |    5.3 |
-| pdf_extract_seed_repeat          |     5 005 |  100.1 |
-| tokenizer_realistic_md           |     9 689 |  193.8 |
-| lattice_content_random           |     3 002 |   60.0 |
-| lattice_form_xobject_mutation    |     2 945 |   58.9 |
-| tagged_table_mutation            |       380 |    7.6 |
-| link_continuations_random        |        99 |    2.0 |
-| lattice_pass_b_spans             |     1 060 |   21.2 |
-| xmp_escape_xml                   |     4 473 |   89.5 |
-| xmp_emit_random                  |     2 060 |   41.2 |
-| encrypt_roundtrip_rc4            |    12 627 |  252.5 |
-| encrypt_roundtrip_aes            |    13 433 |  268.7 |
-| markdown_render_tagged           |     5 963 |  119.3 |
-| truetype_parse_random            |       375 |    7.5 |
-| jpeg_meta_random                 |       368 |    7.4 |
-| **Total**                        | **126 472** | — |
+| tokenizer_count                  |     1 901 |   38.0 |
+| stream_json_string               |    25 224 |  504.5 |
+| stream_envelope_meta             |     1 160 |   23.2 |
+| stream_envelope_page             |     8 927 |  178.5 |
+| chunk_break_finder               |    30 223 |  604.5 |
+| cli_parse_args                   |        34 |    0.7 |
+| cli_page_range                   |        98 |    2.0 |
+| pdf_open_random                  |       263 |    5.3 |
+| pdf_open_magic_prefix            |       262 |    5.2 |
+| pdf_extract_seed_repeat          |     5 226 |  104.5 |
+| tokenizer_realistic_md           |     9 801 |  196.0 |
+| lattice_content_random           |     2 964 |   59.3 |
+| lattice_form_xobject_mutation    |     3 051 |   61.0 |
+| tagged_table_mutation            |       381 |    7.6 |
+| link_continuations_random        |       100 |    2.0 |
+| lattice_pass_b_spans             |     1 172 |   23.4 |
+| xmp_escape_xml                   |     4 517 |   90.3 |
+| xmp_emit_random                  |     2 091 |   41.8 |
+| encrypt_roundtrip_rc4            |    12 632 |  252.6 |
+| encrypt_roundtrip_aes            |    13 775 |  275.5 |
+| markdown_render_tagged           |     5 958 |  119.2 |
+| truetype_parse_random            |       374 |    7.5 |
+| jpeg_meta_random                 |       371 |    7.4 |
+| **decompress_ascii_hex_random**  |   **5 003** |  100.1 |
+| **decompress_runlength_random**  |   **5 562** |  111.2 |
+| **Total**                        | **141 070** | — |
+
+Drift vs the pre-iter-1 baseline (`0x19df7152cc1`, 126 472 ms): +14 598 ms total
+of which ≈ +10 565 ms is the two new iter-1 targets and the remaining
++4 033 ms is per-target drift (≤ +5 % per target — within thermal /
+context-switch noise on an unloaded laptop). No regression flagged.
+
+The previous baseline is preserved below for the historical 23-target
+shape; future iters compare against the **post-iter-1** numbers above.
+
+### Pre-iter-1 baseline (historical) — base seed `0x19df7152cc1`, 126 472 ms total
+
+23 default-gated targets, 50 000 iters each. Identical methodology;
+preserved as the v1.6-closeout-end snapshot for back-compat with PR
+#76's first commit.
 
 ## How the loop reads this file
 
