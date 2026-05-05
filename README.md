@@ -130,6 +130,10 @@ See [`docs/decisions.md`](docs/decisions.md) for the full chain.
 - **Streaming protocol**: NDJSON envelope with `kind` + `source` + `doc_id` (UUIDv7 minted at invocation start); per-page flush; SIGPIPE-clean; terminal `kind:"fatal"` record on parser death (no SIGABRT in release).
 - **License**: MIT or CC0 to match upstream Lulzx attribution. Option A (MuPDF wrapper) was reclassified as AGPL-only after Codex caught the static-link copyleft contagion (see `docs/architecture.md` §5.1).
 
+## Audit harnesses
+
+- [`audit/qpdf_check.py`](audit/qpdf_check.py) — runs `qpdf --check` against every `generate*Pdf` fixture in `src/testpdf.zig` and reports the pass rate as a markdown table. Run locally with `python3 audit/qpdf_check.py --min-pass-pct 0` (qpdf required); CI gate at `.github/workflows/qpdf-check.yml`.
+
 ## Source / context
 
 - **Architecture**: [`docs/architecture.md`](docs/architecture.md) (v3, ~800 lines, 2 Claude↔Codex review cycles)

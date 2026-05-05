@@ -112,6 +112,25 @@ pub fn build(b: *std.Build) void {
     const gen_cjk_step = b.step("gen-cjk-corpus", "Materialise the synthetic CJK corpus to audit/cjk-pdfs/synthetic/");
     gen_cjk_step.dependOn(&run_gen_cjk.step);
 
+    // PR-22a [infra]: qpdf --check CI harness. Emitter is a standalone
+    // exe that materialises every public `generate*Pdf` from
+    // `src/testpdf.zig` to a temp dir; the Python driver runs
+    // `qpdf --check` on each. Skips cleanly if qpdf is not on PATH.
+    const qpdf_emit_root = b.createModule(.{ .root_source_file = b.path("audit/qpdf_emit_fixtures.zig"), .target = target, .optimize = optimize });
+    qpdf_emit_root.addImport("testpdf", b.createModule(.{ .root_source_file = b.path("src/testpdf.zig"), .target = target, .optimize = optimize }));
+    const qpdf_emit = b.addExecutable(.{ .name = "qpdf-emit-fixtures", .root_module = qpdf_emit_root });
+    // Expose the emitter as a named step so `audit/qpdf_check.py` can
+    // invoke `zig build qpdf-emit-fixtures` in CI before running qpdf.
+    // Locally, `zig build qpdf-check` covers both via `addArtifactArg`,
+    // but CI's pre-step needs the binary installed to `zig-out/bin/`
+    // explicitly.
+    const install_qpdf_emit = b.addInstallArtifact(qpdf_emit, .{});
+    b.step("qpdf-emit-fixtures", "Build the qpdf-emit-fixtures binary into zig-out/bin/").dependOn(&install_qpdf_emit.step);
+    const run_qpdf_check = b.addSystemCommand(&.{ "python3", "audit/qpdf_check.py", "--emitter" });
+    run_qpdf_check.addArtifactArg(qpdf_emit);
+    if (b.args) |args| run_qpdf_check.addArgs(args);
+    b.step("qpdf-check", "Run qpdf --check on every testpdf fixture (skips if qpdf not on PATH)").dependOn(&run_qpdf_check.step);
+
     // Streaming-layer unit tests (uuid, tokenizer, stream, chunk, cli).
     // Each module's tests are also picked up via the main `test` step below.
     const stream_unit_tests = b.addTest(.{

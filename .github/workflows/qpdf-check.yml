@@ -1,0 +1,55 @@
+name: qpdf check
+
+# PR-22a [infra]: gate emitted PDFs against `qpdf --check`.
+# Triggered only on PRs that touch the writer stack or the fixture set.
+# Threshold starts at 80% and escalates to 100% after PR-W10b
+# (OutputIntents + sRGB ICC) lands. See
+# `docs/v1.6-wave3-and-v2.0-design.md` §PR-22a.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/pdf_writer.zig'
+      - 'src/pdf_document.zig'
+      - 'src/markdown_to_pdf.zig'
+      - 'src/struct_writer.zig'
+      - 'src/xmp_writer.zig'
+      - 'src/testpdf.zig'
+      - 'tests/fixtures/**'
+      - 'audit/qpdf_check.py'
+      - 'audit/qpdf_emit_fixtures.zig'
+      - '.github/workflows/qpdf-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qpdf-check:
+    name: qpdf check (>=80% fixtures pass)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install qpdf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qpdf
+          qpdf --version
+
+      - name: Run qpdf --check on every testpdf fixture
+        run: python3 audit/qpdf_check.py --min-pass-pct 80 --report qpdf-check-report.md
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qpdf-check-report
+          path: qpdf-check-report.md
+          if-no-files-found: ignore
