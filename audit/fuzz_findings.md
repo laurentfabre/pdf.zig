@@ -107,13 +107,14 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 | **parser_init_at_offset_random** | **0.3 s** | **iter-2 — random byte-offsets into seed-pool PDFs through `Parser.initAt`** |
 | **interpreter_random_ops** | **57.1 s** | **iter-3 — biased COS-operator bytes through `ContentLexer.next()`** |
 | **interpreter_bdc_emc_nesting** | **161.6 s** | **iter-3 — synthesised PDFs with hostile BDC/EMC nesting through `Document.extractMarkdown`** |
-| writer_drawtext_roundtrip | TBD (1M not yet rerun; 12.2 s / 100k) | iter-4 — DocumentBuilder ↔ Document text round-trip |
-| writer_multipage_count | TBD (1M not yet rerun; 53.6 s / 100k) | iter-4 — multipage page-tree round-trip |
-| writer_text_escape_roundtrip | TBD (1M not yet rerun; 8.3 s / 100k) | iter-4 — PDF metachar escape round-trip via raw extractText |
-| decompress_runlength_diff | TBD (1M not yet rerun; 1.5 s / 100k) | iter-5 — RLE encode/decode differential |
-| decompress_ascii_hex_diff | TBD (1M not yet rerun; 2.0 s / 100k) | iter-5 — ASCIIHex encode/decode differential |
-| decompress_filter_chain_diff | TBD (1M not yet rerun; 1.5 s / 100k) | iter-5 — filter chain ownership transfer |
-| **Total** | **3146.7 s (52 min 27 s) at 1M (post-iter-3 + Codex-fix) — 30/30 clean, base seed `0x19df7a94d4a`; iter-4 & iter-5 1M rerun pending** | |
+| writer_drawtext_roundtrip | **116.5 s** | iter-4 — DocumentBuilder ↔ Document text round-trip |
+| writer_multipage_count | **515.7 s** | iter-4 — multipage page-tree round-trip |
+| writer_text_escape_roundtrip | **80.4 s** | iter-4 — PDF metachar escape round-trip via raw extractText |
+| decompress_runlength_diff | **60.6 s** | iter-5 — RLE encode/decode differential |
+| decompress_ascii_hex_diff | **108.6 s** | iter-5 — ASCIIHex encode/decode differential |
+| decompress_filter_chain_diff | **63.0 s** | iter-5 — filter chain ownership transfer |
+| pdf_of_pdf_roundtrip | **794.7 s** | iter-7 — multi-stage adversarial PDF-of-PDF (4M stage-cycles at 1M iters × 4 stages) |
+| **Total** | **4788.6 s (79 min 49 s) at 1M post-iter-7 — 38/38 clean, base seed `0x19df7f8182f`. iter-8 (bidi)/9 (cff repro-only)/10 (pdf_resources)/11 (attr_flattener) 1M rerun pending.** | |
 
 The aggressive-gated `decompress_ascii85_roundtrip` is `reproducer_only` and skipped from the default + aggressive sweeps; deterministically reproduces Finding 005 below.
 
