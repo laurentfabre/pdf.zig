@@ -232,6 +232,43 @@ const TARGETS = [_]Target{
     //     pageCount > 0) but probes the no-StructTreeRoot codepath.
     .{ .name = "markdown_render_pdf_to_md", .run = fuzzMarkdownRenderPdfToMd },
     .{ .name = "markdown_to_pdf_untagged", .run = fuzzMarkdownToPdfUntagged },
+    // Iter-13 (audit/fuzz_loop_state.md row 8 — image_writer.zig).
+    // `image_writer.emitImageObject` was previously only reachable via the
+    // `jpeg_meta` byte-input fuzz; this iter exercises the embed-into-PDF
+    // path itself. Self-contained surface — only depends on
+    // `pdf_writer.Writer`.
+    //
+    // SUT-independent invariants:
+    //   - emit produces a well-framed indirect object (`N 0 obj … endobj`).
+    //   - The dict carries every required image-XObject key per PDF §8.9.5
+    //     (/Subtype /Image, /Width N, /Height N, /ColorSpace /Device*,
+    //     /BitsPerComponent N) with values matching the input ImageRef.
+    //   - Encoding-specific filter is correct (DCT → /DCTDecode;
+    //     raw_flate → /FlateDecode; raw_uncompressed → no /Filter token).
+    //   - DCT passthrough preserves the input bytes verbatim inside the
+    //     emitted stream (the contract — caller already validated geometry
+    //     via jpeg_meta and the writer must NOT re-encode).
+    //   - Round-trip: parsing the emitted indirect object via
+    //     `parser.Parser.parseIndirectObject` recovers the same width /
+    //     height / bits-per-component integers fed in.
+    //
+    // **Finding 010 (this iter)**: `image_writer_emit_random_geom` is
+    // `reproducer_only` because the `raw_flate` branch
+    // deterministically panics inside stdlib flate when the body is
+    // ≤ 8 B. Repro: bytes len 0, encoding=raw_flate, any geometry →
+    // `std.compress.flate.Compress.init` asserts
+    // `output.buffer.len > 8` (lib/std/compress/flate/Compress.zig:309).
+    // Root cause: `pdf_writer.writeStreamCompressed` allocates the
+    // output collector with `initCapacity(allocator, body.len)`
+    // (pdf_writer.zig:397) — when body.len ≤ 8 the writer buffer is
+    // too small for the zlib header alone. Fix is one-line (clamp the
+    // capacity to a min like 64) but per the loop rules we don't
+    // auto-fix; promote T1 back to default-gate after the fix lands.
+    // T2 (DCT-only) and T3 (uncompressed/dct round-trip) dodge the
+    // bug by construction and remain default-gate.
+    .{ .name = "image_writer_emit_random_geom", .run = fuzzImageWriterEmitRandomGeom, .reproducer_only = true },
+    .{ .name = "image_writer_emit_dct_verbatim", .run = fuzzImageWriterEmitDctVerbatim },
+    .{ .name = "image_writer_emit_roundtrip_dims", .run = fuzzImageWriterEmitRoundtripDims },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -4009,6 +4046,311 @@ fn fuzzMarkdownToPdfUntagged(rng: std.Random, allocator: std.mem.Allocator, scra
     // strong correctness check. A negative-space catalog probe
     // would need a parsed-object-graph inspection (deferred —
     // we'd want a `Document.hasStructTree()` helper or similar).
+}
+
+// ============================================================================
+// Iter-13 — image_writer.zig (`emitImageObject`).
+// ============================================================================
+
+/// Pick an image-friendly bits-per-component value. `emitImageObject`
+/// asserts BPC ∈ {1, 2, 4, 8, 16}; the fuzz harness must respect that
+/// pre-condition (asserting from the harness side would be a SUT-test,
+/// not a SUT-independent invariant).
+fn randomImageBpc(rng: std.Random) u8 {
+    return switch (rng.intRangeAtMost(u8, 0, 4)) {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        else => 16,
+    };
+}
+
+/// Random ImageRef with the *full* spread of legal field values. Unlike
+/// `synthRandomImageRef` (iter-10) which fixes BPC=8 and small geometry
+/// for registry-stress, this one biases toward boundary BPC values
+/// (1/2/4/8/16), wider geometry (1..1024), and a larger payload pool to
+/// stress the writer's stream framing across DEFLATE block boundaries.
+///
+/// `bytes` is heap-allocated and owned by the caller (NOT the registry —
+/// these targets call `emitImageObject` directly without going through
+/// `ResourceRegistry.registerImage`, so the test owns the slice).
+fn synthImageRefForEmit(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    payload_max: usize,
+) !image_writer.ImageRef {
+    const len = rng.intRangeAtMost(usize, 0, payload_max);
+    const bytes = try allocator.alloc(u8, len);
+    errdefer allocator.free(bytes);
+    rng.bytes(bytes);
+
+    return .{
+        .bytes = bytes,
+        .encoding = switch (rng.intRangeAtMost(u8, 0, 2)) {
+            0 => .dct_passthrough,
+            1 => .raw_uncompressed,
+            else => .raw_flate,
+        },
+        .width = rng.intRangeAtMost(u32, 1, 1024),
+        .height = rng.intRangeAtMost(u32, 1, 1024),
+        .bits_per_component = randomImageBpc(rng),
+        .colorspace = switch (rng.intRangeAtMost(u8, 0, 2)) {
+            0 => .gray,
+            1 => .rgb,
+            else => .cmyk,
+        },
+    };
+}
+
+/// T1 — random geometry / encoding / colorspace through `emitImageObject`,
+/// asserting structural framing on the emitted bytes.
+///
+/// SUT-independent invariants:
+///   - Indirect object framing: `N 0 obj` and `endobj` both present, with
+///     `N` matching the obj_num assigned by the writer.
+///   - Required image-XObject dict keys present per PDF §8.9.5 (/Subtype
+///     /Image, /Width N, /Height N, /ColorSpace /Device*, /BitsPerComponent
+///     N) — substring scan, with values matching the ImageRef.
+///   - Encoding-specific filter discipline:
+///       dct_passthrough  → contains "/Filter /DCTDecode"
+///       raw_flate        → contains "/Filter /FlateDecode"
+///       raw_uncompressed → contains NO "/Filter" token
+///   - `stream` and `endstream` keywords are both present (the dict body
+///     was correctly handed to `writeStream` / `writeStreamCompressed`).
+fn fuzzImageWriterEmitRandomGeom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+
+    var ref = try synthImageRefForEmit(rng, allocator, 256);
+    defer allocator.free(ref.bytes);
+
+    ref.obj_num = try w.allocObjectNum();
+
+    try image_writer.emitImageObject(&ref, &w);
+
+    const out = w.buf.written();
+
+    // Object framing.
+    var hdr_buf: [32]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "{d} 0 obj", .{ref.obj_num}) catch unreachable;
+    if (std.mem.indexOf(u8, out, hdr) == null) return error.ImageWriterMissingObjHeader;
+    if (std.mem.indexOf(u8, out, "endobj") == null) return error.ImageWriterMissingEndObj;
+    if (std.mem.indexOf(u8, out, "stream") == null) return error.ImageWriterMissingStream;
+    if (std.mem.indexOf(u8, out, "endstream") == null) return error.ImageWriterMissingEndStream;
+
+    // Required dict keys.
+    if (std.mem.indexOf(u8, out, "/Subtype /Image") == null) return error.ImageWriterMissingSubtype;
+    var dim_buf: [32]u8 = undefined;
+    const w_str = std.fmt.bufPrint(&dim_buf, "/Width {d}", .{ref.width}) catch unreachable;
+    if (std.mem.indexOf(u8, out, w_str) == null) return error.ImageWriterMissingWidth;
+    var dim_buf2: [32]u8 = undefined;
+    const h_str = std.fmt.bufPrint(&dim_buf2, "/Height {d}", .{ref.height}) catch unreachable;
+    if (std.mem.indexOf(u8, out, h_str) == null) return error.ImageWriterMissingHeight;
+    var bpc_buf: [32]u8 = undefined;
+    const bpc_str = std.fmt.bufPrint(&bpc_buf, "/BitsPerComponent {d}", .{ref.bits_per_component}) catch unreachable;
+    if (std.mem.indexOf(u8, out, bpc_str) == null) return error.ImageWriterMissingBpc;
+
+    const cs_token = switch (ref.colorspace) {
+        .gray => "/ColorSpace /DeviceGray",
+        .rgb => "/ColorSpace /DeviceRGB",
+        .cmyk => "/ColorSpace /DeviceCMYK",
+    };
+    if (std.mem.indexOf(u8, out, cs_token) == null) return error.ImageWriterMissingColorSpace;
+
+    // Encoding-specific filter. raw_uncompressed must NOT emit /Filter
+    // (negative-space invariant — guards against a future change that
+    // accidentally compresses the raw path).
+    switch (ref.encoding) {
+        .dct_passthrough => {
+            if (std.mem.indexOf(u8, out, "/Filter /DCTDecode") == null) {
+                return error.ImageWriterMissingDctFilter;
+            }
+        },
+        .raw_flate => {
+            if (std.mem.indexOf(u8, out, "/Filter /FlateDecode") == null) {
+                return error.ImageWriterMissingFlateFilter;
+            }
+        },
+        .raw_uncompressed => {
+            if (std.mem.indexOf(u8, out, "/Filter") != null) {
+                return error.ImageWriterRawHasFilter;
+            }
+        },
+    }
+}
+
+/// T2 — DCT passthrough verbatim-bytes contract.
+///
+/// PDF 1.7 §8.9.5.1: when `/Filter /DCTDecode` is set, the stream body is
+/// the JPEG byte stream as-is. `image_writer` documents this as the DCT
+/// passthrough contract — the writer must NOT re-encode JPEG bytes. This
+/// target asserts the contract by scanning the emitted stream body for
+/// the verbatim input slice.
+///
+/// The payload is forced ≥ 4 bytes so that a uniform-random scan for the
+/// slice in `out` has a vanishingly small false-positive probability
+/// (≈ |out| × 256^-4 ≪ 1).
+fn fuzzImageWriterEmitDctVerbatim(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+
+    // Force ≥ 4 B so the verbatim-substring check is meaningful.
+    const len = rng.intRangeAtMost(usize, 4, 512);
+    const bytes = try allocator.alloc(u8, len);
+    defer allocator.free(bytes);
+    rng.bytes(bytes);
+
+    var ref: image_writer.ImageRef = .{
+        .bytes = bytes,
+        .encoding = .dct_passthrough,
+        .width = rng.intRangeAtMost(u32, 1, 1024),
+        .height = rng.intRangeAtMost(u32, 1, 1024),
+        .bits_per_component = 8, // JPEG is always 8 BPC in PDF.
+        .colorspace = switch (rng.intRangeAtMost(u8, 0, 2)) {
+            0 => .gray,
+            1 => .rgb,
+            else => .cmyk,
+        },
+    };
+    ref.obj_num = try w.allocObjectNum();
+
+    try image_writer.emitImageObject(&ref, &w);
+
+    const out = w.buf.written();
+
+    // Locate the body — between `stream\n` and `\nendstream`. PDF allows
+    // either "stream\n" or "stream\r\n"; the writer emits "stream\n" so
+    // we scan for that exact opener.
+    const stream_kw = "stream\n";
+    const endstream_kw = "endstream";
+    const start_idx = std.mem.indexOf(u8, out, stream_kw) orelse
+        return error.ImageWriterDctNoStreamKw;
+    const body_start = start_idx + stream_kw.len;
+    const end_idx = std.mem.indexOfPos(u8, out, body_start, endstream_kw) orelse
+        return error.ImageWriterDctNoEndstream;
+    if (end_idx <= body_start) return error.ImageWriterDctEmptyBody;
+
+    // The body should contain the verbatim payload. We allow a trailing
+    // newline before `endstream` (the writer emits one for readability).
+    const body = out[body_start..end_idx];
+    if (std.mem.indexOf(u8, body, bytes) == null) {
+        return error.ImageWriterDctBytesNotVerbatim;
+    }
+
+    // Pair invariant: body length ≥ payload length (DCT passthrough must
+    // not silently truncate). Trailing newline accounts for ≤ 2 extra B.
+    if (body.len < bytes.len) return error.ImageWriterDctBodyShorterThanPayload;
+}
+
+/// T3 — round-trip width / height / BPC through `parseIndirectObject`.
+///
+/// Emit a single image XObject body, hand the bytes to a fresh
+/// `parser.Parser`, and assert the parsed dict carries integer values
+/// equal to the input ImageRef. This is the strongest possible structural
+/// invariant: the dict survived the writer + made it through the parser
+/// with semantic integrity.
+///
+/// Restricts to `raw_uncompressed` and `dct_passthrough` so the emitted
+/// stream body is a literal byte sequence — `raw_flate` would wrap the
+/// body in DEFLATE which `parseIndirectObject` happily skips past via
+/// `/Length`, but having a known-shape body simplifies the test.
+fn fuzzImageWriterEmitRoundtripDims(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+
+    const len = rng.intRangeAtMost(usize, 0, 64);
+    const bytes = try allocator.alloc(u8, len);
+    defer allocator.free(bytes);
+    rng.bytes(bytes);
+
+    const expected_width = rng.intRangeAtMost(u32, 1, 65535);
+    const expected_height = rng.intRangeAtMost(u32, 1, 65535);
+    const expected_bpc = randomImageBpc(rng);
+
+    var ref: image_writer.ImageRef = .{
+        .bytes = bytes,
+        .encoding = if (rng.boolean()) .raw_uncompressed else .dct_passthrough,
+        .width = expected_width,
+        .height = expected_height,
+        .bits_per_component = expected_bpc,
+        .colorspace = switch (rng.intRangeAtMost(u8, 0, 2)) {
+            0 => .gray,
+            1 => .rgb,
+            else => .cmyk,
+        },
+    };
+    ref.obj_num = try w.allocObjectNum();
+
+    try image_writer.emitImageObject(&ref, &w);
+
+    const emitted = w.buf.written();
+
+    // Drive the production COS parser over the emitted body.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var p = parser.Parser.init(arena.allocator(), emitted);
+    const got = p.parseIndirectObject() catch |err| switch (err) {
+        // Genuine parser errors here are findings (the writer just
+        // emitted these bytes; if the parser can't read them, one side
+        // is wrong). Surface them as test errors.
+        error.UnexpectedToken,
+        error.UnexpectedEof,
+        error.InvalidNumber,
+        error.InvalidString,
+        error.InvalidHexString,
+        error.InvalidName,
+        error.InvalidDictionary,
+        error.InvalidArray,
+        error.InvalidStream,
+        error.InvalidReference,
+        error.NestingTooDeep,
+        => return error.ImageWriterRoundtripParseFail,
+        error.OutOfMemory => return err,
+    };
+
+    if (got.num != ref.obj_num) return error.ImageWriterRoundtripObjNumMismatch;
+    if (got.gen != 0) return error.ImageWriterRoundtripGenNonZero;
+
+    // Image XObject must round-trip as a stream (dict + body), not a
+    // bare dict.
+    const stream_obj = switch (got.obj) {
+        .stream => |s| s,
+        else => return error.ImageWriterRoundtripNotStream,
+    };
+
+    const dict = stream_obj.dict;
+
+    // Width / Height / BPC: integer-equality round-trip.
+    const got_w = dict.getInt("Width") orelse return error.ImageWriterRoundtripNoWidth;
+    const got_h = dict.getInt("Height") orelse return error.ImageWriterRoundtripNoHeight;
+    const got_bpc = dict.getInt("BitsPerComponent") orelse return error.ImageWriterRoundtripNoBpc;
+    if (got_w != @as(i64, expected_width)) return error.ImageWriterRoundtripWidthMismatch;
+    if (got_h != @as(i64, expected_height)) return error.ImageWriterRoundtripHeightMismatch;
+    if (got_bpc != @as(i64, expected_bpc)) return error.ImageWriterRoundtripBpcMismatch;
+
+    // Subtype: name-equality round-trip.
+    const subtype = dict.getName("Subtype") orelse return error.ImageWriterRoundtripNoSubtype;
+    if (!std.mem.eql(u8, subtype, "Image")) return error.ImageWriterRoundtripSubtypeMismatch;
+
+    // ColorSpace: name-equality round-trip — must match the input enum.
+    const expected_cs = switch (ref.colorspace) {
+        .gray => "DeviceGray",
+        .rgb => "DeviceRGB",
+        .cmyk => "DeviceCMYK",
+    };
+    const got_cs = dict.getName("ColorSpace") orelse return error.ImageWriterRoundtripNoColorSpace;
+    if (!std.mem.eql(u8, got_cs, expected_cs)) return error.ImageWriterRoundtripColorSpaceMismatch;
 }
 
 // ============================================================================

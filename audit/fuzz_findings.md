@@ -462,6 +462,66 @@ The iter-10 `pdf_resources_image_register_assign` target now pins the *current* 
 
 ---
 
+## Finding 010 — `pdf_writer.writeStreamCompressed` panics inside stdlib flate when body ≤ 8 B
+
+**Status**: OPEN
+**Path**: `src/pdf_writer.zig:397` (root cause) → `lib/std/compress/flate/Compress.zig:309` (panic site)
+**Surfaced by**: iter-13 `image_writer_emit_random_geom` at seed 0x1, < 1k iters in Debug.
+**Class**: runtime panic (`reached unreachable code`) on legal API call
+
+### Behaviour
+
+`std.compress.flate.Compress.init` asserts `output.buffer.len > 8` (the zlib header alone takes 2 B + the trailing Adler-32 takes 4 B; the encoder needs at least one extra byte of headroom). `pdf_writer.writeStreamCompressed` allocates the output collector with `initCapacity(allocator, body.len)` — when the caller-supplied body is ≤ 8 B the writer's output buffer is too small and the assert fires.
+
+Repro path:
+
+1. `Writer.init(allocator)` → `allocObjectNum()` → `beginObject(num, 0)`.
+2. Build any 0..8-byte body (the harness uses `image_writer.ImageRef{ encoding = .raw_flate, bytes = …, … }` with `bytes.len = 0` as the minimal repro).
+3. Call `image_writer.emitImageObject(&ref, &w)` — internally fans out to `writeStreamCompressed`.
+4. Panic.
+
+Bug class is **denial-of-service via bounded-cause input**, but the input (`bytes`) is *internal to the writer* — no attacker-controlled byte stream reaches `writeStreamCompressed` from a parser path; the body is always a sample buffer the caller built. So the panic is a builder-bug surface (e.g., a future `addImageRaw(width=0, height=0, …)` or a 1×1 grayscale icon at 1 BPC = 1-byte body) rather than a network-reachable DoS.
+
+### Recommended fix
+
+One-line patch at `src/pdf_writer.zig:397`:
+
+```zig
+// Was:
+//   var compressed = try std.Io.Writer.Allocating.initCapacity(self.allocator, body.len);
+// After:
+const min_cap: usize = 64; // zlib header (2) + Adler-32 (4) + slack
+var compressed = try std.Io.Writer.Allocating.initCapacity(
+    self.allocator,
+    @max(body.len, min_cap),
+);
+```
+
+`Allocating.initCapacity` reserves a buffer of *at least* the requested size. Clamping to `max(body.len, 64)` keeps the steady-state cost identical (large bodies dominate) while making the small-body case safe. The 64 B floor is comfortable headroom over the 8 B assert.
+
+### Why this wasn't caught earlier
+
+`image_writer`'s in-tree tests use `body = "AAAA…" ** 16` (line 214 — 576 B) which sails past the 8 B threshold. The DCT-passthrough test uses `body.len = 4` but routes through `writeStream` (uncompressed) not `writeStreamCompressed`. The single test that touches `writeStreamCompressed` always passes a > 8 B body.
+
+The iter-13 `image_writer_emit_random_geom` target is gated `reproducer_only` until this fix lands — running it in the default sweep would crash an otherwise-clean `PDFZIG_FUZZ_ITERS=100000 zig build fuzz` run. Promote back to default-gate after the fix.
+
+### User-facing impact
+
+**Low.** No in-tree call path produces a < 8 B body to `writeStreamCompressed` today: `DocumentBuilder.addImage*` validates `width > 0` and `height > 0`, and the smallest valid raw image is 1×1 with 1 BPC = 1 component-byte = 1 B body, which DOES trip the bug. So a user who calls `addImageRaw(1, 1, .gray, 8, &[_]u8{0xFF}, .flate)` currently panics. ReleaseSafe / Debug both panic; ReleaseFast would be UB (the assert disappears but `Compress.init` writes past the buffer).
+
+### Repro script
+
+```sh
+PDFZIG_FUZZ_TARGET=image_writer_emit_random_geom \
+PDFZIG_FUZZ_ITERS=1000 \
+PDFZIG_FUZZ_SEED=0x1 \
+~/.zvm/bin/zig build fuzz
+```
+
+Trips at iter ≤ 1k in Debug. Stack frame ordering: `start → main → fuzzImageWriterEmitRandomGeom → emitImageObject → writeStreamCompressed → Compress.init → assert`.
+
+---
+
 ## Reproducer index
 
 - `audit/fuzz_corpus_crash_001.bin` — the 643-byte mutated PDF that initially caused the false-positive harness segfault. Kept as an interesting input even though the crash was harness-side; it is a useful smoke-test PDF for parser robustness (CLI handles it cleanly: `pdf.zig info audit/fuzz_corpus_crash_001.bin` → `pages: 0`).
