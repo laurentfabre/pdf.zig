@@ -35,6 +35,19 @@ pub const XRefTable = struct {
     /// Allocator for HashMap internals
     allocator: std.mem.Allocator,
 
+    /// PR-W9 [feat]: optional decryption hook. When set,
+    /// `pagetree.resolveRef` calls `decrypt_fn(decrypt_ctx, &obj, num,
+    /// gen, arena)` to transparently decrypt strings + streams after
+    /// parsing. Type-erased to keep xref.zig free of crypto deps.
+    decrypt_ctx: ?*const anyopaque = null,
+    decrypt_fn: ?*const fn (
+        ctx: *const anyopaque,
+        obj: *Object,
+        obj_num: u32,
+        gen: u16,
+        arena: std.mem.Allocator,
+    ) anyerror!void = null,
+
     pub fn init(allocator: std.mem.Allocator) XRefTable {
         return .{
             .entries = std.AutoHashMap(u32, XRefEntry).init(allocator),

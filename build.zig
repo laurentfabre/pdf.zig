@@ -291,6 +291,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_font_embedder_unit_tests = b.addRunArtifact(font_embedder_unit_tests);
 
+    // PR-W9 [feat]: encryption module tests (RC4 + AES-CBC primitives,
+    // Standard Security Handler key derivation, /Encrypt round-trips).
+    const crypto_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/crypto.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_crypto_unit_tests = b.addRunArtifact(crypto_unit_tests);
+
+    const encrypt_writer_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/encrypt_writer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_encrypt_writer_unit_tests = b.addRunArtifact(encrypt_writer_unit_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_simd_unit_tests.step);
@@ -309,6 +329,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_truetype_unit_tests.step);
     test_step.dependOn(&run_cmap_writer_unit_tests.step);
     test_step.dependOn(&run_font_embedder_unit_tests.step);
+    test_step.dependOn(&run_crypto_unit_tests.step);
+    test_step.dependOn(&run_encrypt_writer_unit_tests.step);
 
     // Allocation-failure tests — Week 4 of architecture.md §11.
     // Asserts the documented shape of upstream OOM behaviour (Findings 001–003
