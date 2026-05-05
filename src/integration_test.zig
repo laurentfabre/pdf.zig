@@ -2735,3 +2735,122 @@ test "PR-W8.1: markdown ![alt](path) round-trip via renderWithIo preserves JPEG 
     defer allocator.free(md);
     try std.testing.expect(std.mem.indexOf(u8, md, "Heading") != null);
 }
+
+test "PR-22d: /Lang propagates from catalog to descendants" {
+    // Fixture: Catalog has /Lang (en-US). Tree shape:
+    //   Document          (no own /Lang)
+    //   ├── P             (no own /Lang)   → inherits "en-US"
+    //   └── Span /Lang fr-FR               → keeps "fr-FR"
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateLangPropagationPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const tree = try doc.getStructTree();
+    try std.testing.expect(tree.root != null);
+
+    const root = tree.root.?;
+    try std.testing.expectEqualStrings("Document", root.struct_type);
+    // Document inherits the catalog's /Lang.
+    try std.testing.expect(root.lang != null);
+    try std.testing.expectEqualStrings("en-US", root.lang.?);
+
+    // Walk children: first is /P (inherits), second is /Span (explicit).
+    var found_p = false;
+    var found_span = false;
+    for (root.children) |child| {
+        switch (child) {
+            .element => |e| {
+                if (std.mem.eql(u8, e.struct_type, "P")) {
+                    found_p = true;
+                    try std.testing.expect(e.lang != null);
+                    try std.testing.expectEqualStrings("en-US", e.lang.?);
+                } else if (std.mem.eql(u8, e.struct_type, "Span")) {
+                    found_span = true;
+                    try std.testing.expect(e.lang != null);
+                    try std.testing.expectEqualStrings("fr-FR", e.lang.?);
+                }
+            },
+            .mcid => {},
+        }
+    }
+    try std.testing.expect(found_p);
+    try std.testing.expect(found_span);
+}
+
+test "PR-22d: emitElementJson includes inherited and explicit lang" {
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateLangPropagationPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const tree = try doc.getStructTree();
+    try std.testing.expect(tree.root != null);
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try zpdf.structtree.emitElementJson(tree.root.?, &aw.writer, 0);
+
+    const json = aw.written();
+    // Document carries inherited lang.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"Document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"lang\":\"en-US\"") != null);
+    // Explicit Span lang survives.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"lang\":\"fr-FR\"") != null);
+    // P inherits — must also see en-US under a P-typed element.
+    // Cheap structural check: the second `"lang":"en-US"` lives in the P subtree.
+    const first = std.mem.indexOf(u8, json, "\"lang\":\"en-US\"").?;
+    const second = std.mem.indexOf(u8, json[first + 1 ..], "\"lang\":\"en-US\"");
+    try std.testing.expect(second != null);
+}
+
+test "PR-22d: pathological /Lang (control bytes) is rejected, not propagated" {
+    // The BCP-47 validator is private; the contract is observed via
+    // the public propagateLang. Build a tree by hand and exercise
+    // valid + invalid `root_lang` strings: invalid → no inheritance.
+    const allocator = std.testing.allocator;
+
+    // Manually construct a tiny tree (no PDF parse needed). Each
+    // children slice is heap-allocated so StructTree.deinit's
+    // unconditional `allocator.free(elem.children)` works uniformly.
+    const elem_p = try allocator.create(zpdf.structtree.StructElement);
+    const p_children = try allocator.alloc(zpdf.structtree.StructChild, 0);
+    elem_p.* = .{ .struct_type = "P", .children = p_children };
+
+    const root_children = try allocator.alloc(zpdf.structtree.StructChild, 1);
+    root_children[0] = .{ .element = elem_p };
+
+    const elem_root = try allocator.create(zpdf.structtree.StructElement);
+    elem_root.* = .{ .struct_type = "Document", .children = root_children };
+
+    const elements = try allocator.alloc(*zpdf.structtree.StructElement, 2);
+    elements[0] = elem_root;
+    elements[1] = elem_p;
+
+    var tree = zpdf.structtree.StructTree{
+        .root = elem_root,
+        .elements = elements,
+        .allocator = allocator,
+    };
+    defer tree.deinit();
+
+    // 1) Pathological: control byte → rejected → lang stays null.
+    try zpdf.structtree.propagateLang(&tree, "en\x00US");
+    try std.testing.expect(elem_root.lang == null);
+    try std.testing.expect(elem_p.lang == null);
+
+    // 2) Pathological: 36-byte oversized tag → rejected.
+    try zpdf.structtree.propagateLang(&tree, "a" ** 36);
+    try std.testing.expect(elem_root.lang == null);
+
+    // 3) Valid → propagates.
+    try zpdf.structtree.propagateLang(&tree, "en-US");
+    try std.testing.expect(elem_root.lang != null);
+    try std.testing.expectEqualStrings("en-US", elem_root.lang.?);
+    try std.testing.expect(elem_p.lang != null);
+    try std.testing.expectEqualStrings("en-US", elem_p.lang.?);
+}
