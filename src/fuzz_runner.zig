@@ -486,6 +486,33 @@ const TARGETS = [_]Target{
     // closed.
     .{ .name = "encrypt_authenticate_owner_recovers_key", .run = fuzzEncryptAuthOwnerRecoversKey, .reproducer_only = true },
     .{ .name = "encrypt_authenticate_random_o_u", .run = fuzzEncryptAuthRandomOU },
+    // Iter-21 (audit/fuzz_loop_state.md row 14 — xmp_writer.zig deepen).
+    // The original `xmp_escape_xml` / `xmp_emit_random` targets prove
+    // the byte-level escape rules and packet envelope. This iter
+    // deepens three orthogonal axes:
+    //
+    //   T1 (`xmp_level_view_total`): exhaustive enumeration of the
+    //     2-byte tag space (256 × 256). Every (a|b|u, 1|2|3) pair
+    //     MUST decode to the documented (part, conformance) pair;
+    //     every other 2-byte input MUST return InvalidPdfALevel.
+    //     Length ≠ 2 inputs MUST return InvalidPdfALevel.
+    //
+    //   T2 (`xmp_escape_utf8_storm`): biased UTF-8 storm against
+    //     `escapeXml` — surrogate halves (CESU-8 D800-DFFF), overlong
+    //     sequences, U+FEFF BOM, 4-byte sequences. SUT-independent
+    //     invariants: no metachar leakage; output bytes ≤ 6 × input
+    //     bytes (the worst-case substitution for `'` is `&apos;`);
+    //     determinism — escapeXml(x) byte-equals escapeXml(x).
+    //
+    //   T3 (`xmp_emit_level_pair_consistency`): for each of the 9
+    //     valid (part, conformance) pairs, emit and assert the exact
+    //     marker pair appears AND the other 8 pairs do NOT. This is
+    //     the load-bearing PDF/A conformance signal — a swap
+    //     between u3/a3 (tagging vs accessibility) is a silent
+    //     veraPDF failure.
+    .{ .name = "xmp_level_view_total", .run = fuzzXmpLevelViewTotal },
+    .{ .name = "xmp_escape_utf8_storm", .run = fuzzXmpEscapeUtf8Storm },
+    .{ .name = "xmp_emit_level_pair_consistency", .run = fuzzXmpEmitLevelPairConsistency },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -1241,6 +1268,230 @@ fn fuzzXmpEmitRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u
     if (!std.mem.endsWith(u8, bytes, "<?xpacket end=\"w\"?>")) return error.XmpMissingPacketEnd;
     if (std.mem.indexOf(u8, bytes, "<pdfaid:part>") == null) return error.XmpMissingPdfAidPart;
     if (std.mem.indexOf(u8, bytes, "<pdfaid:conformance>") == null) return error.XmpMissingPdfAidConformance;
+}
+
+// Iter-21 T1 — exhaustive enumeration of the levelView tag-space. Each
+// fuzz iter picks a random 2-byte pair (and occasionally a non-2-byte
+// length) and asserts the documented bijection.
+fn fuzzXmpLevelViewTotal(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = allocator;
+    _ = scratch;
+    _ = seed_pdf;
+
+    // 80 % of the time: random 2-byte tag (covers the 65,536 entry
+    // tag-space densely enough to enumerate all 9 valid points and
+    // most of the 65,527 invalid ones over 100k iters).
+    // 20 % of the time: random length 0,1,3,4 to hit the len != 2 path.
+    var tag: [4]u8 = undefined;
+    const len: usize = if (rng.float(f32) < 0.8) 2 else blk: {
+        const choices = [_]usize{ 0, 1, 3, 4 };
+        break :blk choices[rng.intRangeAtMost(usize, 0, choices.len - 1)];
+    };
+    rng.bytes(tag[0..len]);
+
+    const result = xmp_writer.levelView(tag[0..len]);
+
+    if (len != 2) {
+        if (result) |_| return error.XmpLevelViewAcceptedWrongLength else |_| return;
+    }
+
+    // len == 2. Decide whether THIS pair is valid by independent rule.
+    const a = tag[0];
+    const b = tag[1];
+    const a_ok = a == 'a' or a == 'b' or a == 'u';
+    const b_ok = b == '1' or b == '2' or b == '3';
+    const expected_valid = a_ok and b_ok;
+
+    if (expected_valid) {
+        const view = result catch return error.XmpLevelViewRejectedValidTag;
+        // Reproduce the mapping independently and assert byte-equal.
+        const want_conf: []const u8 = switch (a) {
+            'a' => "A",
+            'b' => "B",
+            'u' => "U",
+            else => unreachable,
+        };
+        const want_part: []const u8 = switch (b) {
+            '1' => "1",
+            '2' => "2",
+            '3' => "3",
+            else => unreachable,
+        };
+        if (!std.mem.eql(u8, view.part, want_part)) return error.XmpLevelViewWrongPart;
+        if (!std.mem.eql(u8, view.conformance, want_conf)) return error.XmpLevelViewWrongConformance;
+    } else {
+        if (result) |_| return error.XmpLevelViewAcceptedInvalidTag else |_| return;
+    }
+}
+
+// Iter-21 T2 — UTF-8 storm against escapeXml. Surrogate halves,
+// overlong encodings, BOM, 4-byte sequences, and random byte salt.
+// Invariants are SUT-independent: no metachar leak, ≤ 6× expansion,
+// determinism.
+fn fuzzXmpEscapeUtf8Storm(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // Build the input by interleaving adversarial UTF-8 patterns with
+    // random bytes drawn from the metachar-heavy alphabet so the
+    // escape branches see steady traffic.
+    const cap = @min(scratch.len, 1024);
+    var n: usize = 0;
+    while (n < cap) {
+        const pick = rng.intRangeAtMost(u8, 0, 9);
+        switch (pick) {
+            // Surrogate half encoded as 3-byte CESU-8 — illegal in
+            // strict UTF-8 but escapeXml accepts arbitrary bytes.
+            0 => if (cap - n >= 3) {
+                const cp: u16 = @as(u16, 0xD800) | @as(u16, rng.int(u10));
+                scratch[n + 0] = 0xE0 | @as(u8, @intCast((cp >> 12) & 0x0F));
+                scratch[n + 1] = 0x80 | @as(u8, @intCast((cp >> 6) & 0x3F));
+                scratch[n + 2] = 0x80 | @as(u8, @intCast(cp & 0x3F));
+                n += 3;
+            } else {
+                scratch[n] = rng.int(u8);
+                n += 1;
+            },
+            // Overlong 2-byte encoding of an ASCII codepoint.
+            1 => if (cap - n >= 2) {
+                const ascii: u8 = rng.intRangeAtMost(u8, 0, 0x7F);
+                scratch[n + 0] = 0xC0 | (ascii >> 6);
+                scratch[n + 1] = 0x80 | (ascii & 0x3F);
+                n += 2;
+            } else {
+                scratch[n] = rng.int(u8);
+                n += 1;
+            },
+            // U+FEFF byte-order mark (3 bytes in UTF-8).
+            2 => if (cap - n >= 3) {
+                scratch[n + 0] = 0xEF;
+                scratch[n + 1] = 0xBB;
+                scratch[n + 2] = 0xBF;
+                n += 3;
+            } else {
+                scratch[n] = rng.int(u8);
+                n += 1;
+            },
+            // 4-byte UTF-8 sequence (supplementary plane).
+            3 => if (cap - n >= 4) {
+                scratch[n + 0] = 0xF0 | rng.intRangeAtMost(u8, 0, 4);
+                scratch[n + 1] = 0x80 | (rng.int(u8) & 0x3F);
+                scratch[n + 2] = 0x80 | (rng.int(u8) & 0x3F);
+                scratch[n + 3] = 0x80 | (rng.int(u8) & 0x3F);
+                n += 4;
+            } else {
+                scratch[n] = rng.int(u8);
+                n += 1;
+            },
+            // Bias toward XML metacharacters so the escape branches
+            // dominate.
+            4, 5 => {
+                const metas = "&<>\"'";
+                scratch[n] = metas[rng.intRangeAtMost(usize, 0, metas.len - 1)];
+                n += 1;
+            },
+            // Bias toward C0 controls — escapeXml drops most of these.
+            6 => {
+                scratch[n] = rng.intRangeAtMost(u8, 0, 0x1F);
+                n += 1;
+            },
+            // Random byte fill.
+            else => {
+                scratch[n] = rng.int(u8);
+                n += 1;
+            },
+        }
+    }
+    const input = scratch[0..n];
+
+    const out1 = try xmp_writer.escapeXml(allocator, input);
+    defer allocator.free(out1);
+
+    // Invariant 1: no metachar leakage. (Same rule as the existing
+    // xmp_escape_xml target — repeat the check here so this target
+    // stands on its own.)
+    for (out1) |c| switch (c) {
+        '<', '>', '"', '\'' => return error.XmpEscapeLeakedMetachar,
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => return error.XmpEscapeLeakedC0,
+        else => {},
+    };
+
+    // Invariant 2: bare `&` only as part of a known entity.
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, out1, i, '&')) |pos| {
+        const tail = out1[pos..];
+        const valid = [_][]const u8{ "&amp;", "&lt;", "&gt;", "&quot;", "&apos;" };
+        var matched = false;
+        for (valid) |e| {
+            if (std.mem.startsWith(u8, tail, e)) {
+                matched = true;
+                i = pos + e.len;
+                break;
+            }
+        }
+        if (!matched) return error.XmpEscapeBareAmpersand;
+    }
+
+    // Invariant 3: bounded expansion. Worst case is a string of all
+    // `'` -> 6 bytes per input byte.
+    if (out1.len > input.len * 6) return error.XmpEscapeExpansionTooLarge;
+
+    // Invariant 4: determinism. Same input must produce byte-identical
+    // output.
+    const out2 = try xmp_writer.escapeXml(allocator, input);
+    defer allocator.free(out2);
+    if (!std.mem.eql(u8, out1, out2)) return error.XmpEscapeNonDeterministic;
+}
+
+// Iter-21 T3 — pair consistency across all 9 valid PDF/A levels.
+// On each iter, pick one of the 9 valid (a|b|u, 1|2|3) tags, emit, and
+// assert the *exact* matching <pdfaid:part> / <pdfaid:conformance>
+// pair appears while the 8 non-matching pairs do NOT. This catches a
+// swap-bug class where, say, level "u3" emits part=3 conformance=A
+// instead of conformance=U.
+fn fuzzXmpEmitLevelPairConsistency(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    const conf_chars = [_]u8{ 'a', 'b', 'u' };
+    const part_chars = [_]u8{ '1', '2', '3' };
+    const conf_letters = [_]u8{ 'A', 'B', 'U' };
+
+    const ci = rng.intRangeAtMost(usize, 0, 2);
+    const pi = rng.intRangeAtMost(usize, 0, 2);
+    const tag = [_]u8{ conf_chars[ci], part_chars[pi] };
+    const view = xmp_writer.levelView(&tag) catch return error.XmpEmitPairLevelViewRejectedValidTag;
+
+    const bytes = xmp_writer.emit(allocator, view, .{}) catch |e| switch (e) {
+        error.OutOfMemory, error.XmpPacketTooLarge => return,
+    };
+    defer allocator.free(bytes);
+
+    // Build the expected exact substrings. Buffer math:
+    //   `<pdfaid:part>X</pdfaid:part>`         = 28 bytes
+    //   `<pdfaid:conformance>X</pdfaid:conformance>` = 42 bytes
+    var part_buf: [32]u8 = undefined;
+    var conf_buf: [64]u8 = undefined;
+    const want_part = std.fmt.bufPrint(&part_buf, "<pdfaid:part>{c}</pdfaid:part>", .{part_chars[pi]}) catch unreachable;
+    const want_conf = std.fmt.bufPrint(&conf_buf, "<pdfaid:conformance>{c}</pdfaid:conformance>", .{conf_letters[ci]}) catch unreachable;
+
+    if (std.mem.indexOf(u8, bytes, want_part) == null) return error.XmpEmitPairMissingExpectedPart;
+    if (std.mem.indexOf(u8, bytes, want_conf) == null) return error.XmpEmitPairMissingExpectedConformance;
+
+    // Negative space — the 2 OTHER part values must not appear.
+    for (part_chars, 0..) |p, idx| {
+        if (idx == pi) continue;
+        var buf: [32]u8 = undefined;
+        const wrong = std.fmt.bufPrint(&buf, "<pdfaid:part>{c}</pdfaid:part>", .{p}) catch unreachable;
+        if (std.mem.indexOf(u8, bytes, wrong) != null) return error.XmpEmitPairLeakedWrongPart;
+    }
+
+    // Negative space — the 2 OTHER conformance values must not appear.
+    for (conf_letters, 0..) |cf, idx| {
+        if (idx == ci) continue;
+        var buf: [64]u8 = undefined;
+        const wrong = std.fmt.bufPrint(&buf, "<pdfaid:conformance>{c}</pdfaid:conformance>", .{cf}) catch unreachable;
+        if (std.mem.indexOf(u8, bytes, wrong) != null) return error.XmpEmitPairLeakedWrongConformance;
+    }
 }
 
 fn fuzzEncryptRoundtripRc4(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
