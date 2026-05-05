@@ -370,6 +370,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_attr_flattener_unit_tests = b.addRunArtifact(attr_flattener_unit_tests);
 
+    // PR-23c [feat]: a11y_tree NDJSON emitter tests.
+    const a11y_emitter_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/a11y_emitter.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_a11y_emitter_unit_tests = b.addRunArtifact(a11y_emitter_unit_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_simd_unit_tests.step);
@@ -394,6 +404,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mcid_resolver_unit_tests.step);
     test_step.dependOn(&run_xmp_writer_unit_tests.step);
     test_step.dependOn(&run_attr_flattener_unit_tests.step);
+    test_step.dependOn(&run_a11y_emitter_unit_tests.step);
 
     // Allocation-failure tests — Week 4 of architecture.md §11.
     // Asserts the documented shape of upstream OOM behaviour (Findings 001–003
