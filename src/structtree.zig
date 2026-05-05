@@ -20,6 +20,13 @@ const Object = parser.Object;
 const ObjRef = parser.ObjRef;
 const XRefTable = xref_mod.XRefTable;
 
+/// PR-23b: re-export the inherited-attribute flattener so callers that
+/// already import `structtree` don't need a separate import for the
+/// opt-in walker. Implementation lives in `attr_flattener.zig`.
+pub const flattenAttrs = @import("attr_flattener.zig").flatten;
+pub const FlattenedAttrs = @import("attr_flattener.zig").FlattenedAttrs;
+pub const flattenAttrsInPlace = @import("attr_flattener.zig").flattenInPlace;
+
 /// PR-SX1: minimal type alias for the wave-3.2 RoleMap parser. Today's
 /// stub takes the catalog as a parsed `Object.Dict` and a resolver
 /// callback so PR-22b can walk `/RoleMap` without re-importing parser
