@@ -42,6 +42,8 @@ const pdf_writer = @import("pdf_writer.zig");
 const attr_flattener = @import("attr_flattener.zig");
 const structtree = @import("structtree.zig");
 const markdown = @import("markdown.zig");
+const a11y_emitter = @import("a11y_emitter.zig");
+const uuid = @import("uuid.zig");
 
 // ============================================================================
 // Target registry
@@ -269,6 +271,30 @@ const TARGETS = [_]Target{
     .{ .name = "image_writer_emit_random_geom", .run = fuzzImageWriterEmitRandomGeom, .reproducer_only = true },
     .{ .name = "image_writer_emit_dct_verbatim", .run = fuzzImageWriterEmitDctVerbatim },
     .{ .name = "image_writer_emit_roundtrip_dims", .run = fuzzImageWriterEmitRoundtripDims },
+    // Iter-14 (audit/fuzz_loop_state.md row 12 — a11y_emitter.zig).
+    // Emits a `kind:"a11y_tree"` NDJSON record from a parsed StructTree.
+    // Same arena-synth pattern as iter-11 (attr_flattener) — synth a
+    // random `*StructTree` in arena and pair it with a `*Document` whose
+    // pages are populated by `generateMinimalPdf`.
+    //
+    // SUT-independent invariants (iter-7 P2 — pure properties of the
+    // emitted bytes; do NOT re-derive what the emitter is supposed to
+    // compute):
+    //   - Output is valid UTF-8.
+    //   - Output starts the JSON object (`{"kind":"a11y_tree"`) and ends
+    //     in `}\n` (NDJSON terminator) per `Envelope.endA11yTreeRecord`.
+    //   - Brace + bracket balance == 0 across the whole record.
+    //   - No embedded NUL byte in the output.
+    //   - `"_truncated_max_depth"` substring appears iff we constructed
+    //     a chain ≥ MAX_EMIT_DEPTH deep.
+    //   - When `include_reading_order:false` is set, `"reading_order":`
+    //     does NOT appear (negative-space).
+    //   - DFS order: when reading_order is enabled and every leaf carries
+    //     a unique sentinel MCID, the MCIDs appear in the JSON in the
+    //     same DFS order as on the source tree (modulo /Artifact + BMC).
+    .{ .name = "a11y_emitter_synth_tree_emit", .run = fuzzA11yEmitterSynthTreeEmit },
+    .{ .name = "a11y_emitter_flatten_then_emit", .run = fuzzA11yEmitterFlattenThenEmit },
+    .{ .name = "a11y_emitter_reading_order_dfs", .run = fuzzA11yEmitterReadingOrderDfs },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -3850,6 +3876,381 @@ fn fuzzAttrFlattenerDepthBound(rng: std.Random, allocator: std.mem.Allocator, sc
         if (!expect_too_deep) return error.FlattenInPlaceRejectedShallowChain;
         if (err != error.StructTreeTooDeep) return err;
     }
+}
+
+// ============================================================================
+// Targets — a11y_emitter (iter-14, row 12)
+// ============================================================================
+//
+// `a11y_emitter.emit` walks a `*StructTree` and writes a single
+// `kind:"a11y_tree"` NDJSON record. Self-contained surface — public-only
+// fn `emit()` (the recursive `emitElement` / `writeReadingOrder` are
+// file-private). We drive the public surface by constructing a random
+// in-arena `StructTree` + a real minimal `*Document` (so `doc.pages` has
+// a non-empty list to satisfy the page_obj_to_idx walk).
+//
+// MCID resolution is *off* in T1/T2 — it requires a real /Pg → content
+// stream wiring that a synthetic StructTree doesn't have. T3 enables
+// `include_reading_order` only (no MCID-text resolve) by giving each
+// leaf a `page_ref = first_page.ref` so the page lookup succeeds.
+
+const A11Y_TYPE_POOL = [_][]const u8{ "Document", "Sect", "P", "Span", "H1", "Figure", "Table", "TR", "TD" };
+const A11Y_ALT_POOL = [_][]const u8{ "alt-text-A", "alt-B", "" };
+const A11Y_ACTUAL_POOL = [_][]const u8{ "actual-X", "ACT", "" };
+const A11Y_LANG_POOL = [_][]const u8{ "en-US", "fr-FR", "ja-JP", "C" };
+const A11Y_ROLE_POOL = [_][]const u8{ "P", "Sect", "H1" };
+
+/// Pick a string from the pool or null with a 1-in-3 null bias.
+fn a11yPickOptional(rng: std.Random, pool: []const []const u8) ?[]const u8 {
+    if (rng.intRangeAtMost(u8, 0, 2) == 0) return null;
+    return pool[rng.intRangeAtMost(usize, 0, pool.len - 1)];
+}
+
+/// Recursively build a random tree under `aa`. `next_mcid` is a
+/// monotonic counter so every leaf MCID is unique — lets T3 verify DFS
+/// order on the emitted reading_order array.
+///
+/// `mcid_page_ref` is threaded onto every emitted MCID; null means leaf
+/// MCIDs are skipped by the reading-order walker (T1/T2 path).
+fn buildRandomA11yTree(
+    aa: std.mem.Allocator,
+    rng: std.Random,
+    depth: u32,
+    max_depth: u32,
+    next_mcid: *i32,
+    mcid_page_ref: ?structtree.MarkedContentRef,
+) anyerror!*structtree.StructElement {
+    // Hard cap children at depth==max_depth to bound size; below that
+    // 0..3 children per element.
+    const n_kids: usize = if (depth >= max_depth) 0 else rng.intRangeAtMost(usize, 0, 3);
+
+    var kids: std.ArrayList(structtree.StructChild) = .empty;
+    for (0..n_kids) |_| {
+        // Coin flip per child slot: element vs MCID. ~1-in-4 MCIDs so
+        // the tree branches before MCIDs dominate.
+        if (rng.intRangeAtMost(u8, 0, 3) == 0) {
+            const m: i32 = next_mcid.*;
+            next_mcid.* += 1;
+            var ref: structtree.MarkedContentRef = .{ .mcid = m };
+            if (mcid_page_ref) |p| ref.page_ref = p.page_ref;
+            try kids.append(aa, .{ .mcid = ref });
+        } else {
+            const sub = try buildRandomA11yTree(aa, rng, depth + 1, max_depth, next_mcid, mcid_page_ref);
+            try kids.append(aa, .{ .element = sub });
+        }
+    }
+    const kids_slice = try kids.toOwnedSlice(aa);
+
+    const elem = try aa.create(structtree.StructElement);
+    elem.* = .{
+        .struct_type = A11Y_TYPE_POOL[rng.intRangeAtMost(usize, 0, A11Y_TYPE_POOL.len - 1)],
+        .alt_text = a11yPickOptional(rng, &A11Y_ALT_POOL),
+        .actual_text = a11yPickOptional(rng, &A11Y_ACTUAL_POOL),
+        .lang = a11yPickOptional(rng, &A11Y_LANG_POOL),
+        .resolved_role = a11yPickOptional(rng, &A11Y_ROLE_POOL),
+        .children = kids_slice,
+    };
+    return elem;
+}
+
+/// Verify the brace + bracket nesting balance of `out` is zero. Skip
+/// braces/brackets that fall inside a JSON string literal (delimited by
+/// unescaped `"`). Returns the closing balance — caller asserts == 0.
+///
+/// SUT-independent: this is a property of any well-formed JSON, not a
+/// re-derivation of what the emitter computed.
+fn a11yJsonBalance(out: []const u8) i32 {
+    var balance: i32 = 0;
+    var in_str: bool = false;
+    var i: usize = 0;
+    while (i < out.len) : (i += 1) {
+        const c = out[i];
+        if (in_str) {
+            if (c == '\\' and i + 1 < out.len) {
+                i += 1;
+                continue;
+            }
+            if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{', '[' => balance += 1,
+            '}', ']' => balance -= 1,
+            else => {},
+        }
+    }
+    return balance;
+}
+
+/// Shared helper: build a one-page minimal Document (in-memory). The
+/// document is *only* used to populate `doc.pages.items` so
+/// `a11y_emitter.emit` can iterate them without panicking. Any MCID
+/// page_refs the synth tree wants to point at can be obtained via
+/// `doc.pages.items[0].ref`.
+fn a11yOpenSyntheticDoc(allocator: std.mem.Allocator) !*zpdf.Document {
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "iter-14");
+    defer allocator.free(pdf_data);
+    return try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+}
+
+/// T1 — synth random tree, drive `emit()` with all opts off (no flatten,
+/// no MCID-text resolve, no reading_order). Asserts the byte-level
+/// envelope contract: well-formed JSON, valid UTF-8, no NUL, contains
+/// the kind tag, ends with `}\n`, brace balance zero.
+fn fuzzA11yEmitterSynthTreeEmit(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const doc = try a11yOpenSyntheticDoc(allocator);
+    defer doc.close();
+
+    // Sometimes empty tree — emit must produce `"root":null` cleanly.
+    var tree: structtree.StructTree = .{ .root = null, .elements = &.{}, .allocator = aa };
+    var mcid_counter: i32 = 0;
+    if (rng.intRangeAtMost(u8, 0, 9) != 0) {
+        const max_depth = rng.intRangeAtMost(u32, 0, 10);
+        const root = try buildRandomA11yTree(aa, rng, 0, max_depth, &mcid_counter, null);
+        tree.root = root;
+    }
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const fixed_id: uuid.String = "01020304-0506-7890-abcd-ef0123456789".*;
+    var env = stream.Envelope.initWithId(&aw.writer, "iter14.pdf", fixed_id);
+
+    try a11y_emitter.emit(&env, doc, &tree, allocator, .{
+        .flatten_attrs = false,
+        .resolve_mcid_text = false,
+        .include_reading_order = false,
+    });
+
+    const out = aw.written();
+
+    // Envelope shape: starts with `{"kind":"a11y_tree"` and ends in `}\n`.
+    if (!std.mem.startsWith(u8, out, "{\"kind\":\"a11y_tree\"")) return error.A11yEmitMissingKind;
+    if (out.len < 2 or out[out.len - 1] != '\n' or out[out.len - 2] != '}') return error.A11yEmitMissingTerminator;
+
+    // No embedded NUL.
+    if (std.mem.indexOfScalar(u8, out, 0)) |_| return error.A11yEmitEmbeddedNul;
+
+    // Valid UTF-8 (the input pools are ASCII; any non-ASCII is a writer bug).
+    if (!std.unicode.utf8ValidateSlice(out)) return error.A11yEmitInvalidUtf8;
+
+    // Brace + bracket balance is zero outside string literals.
+    if (a11yJsonBalance(out) != 0) return error.A11yEmitUnbalancedJson;
+
+    // Negative-space: opts disabled `include_reading_order`, so the key
+    // must NOT appear. (writeAll-style probes are stable here because
+    // the literal `"reading_order"` cannot leak via attr text — pool
+    // strings don't contain that substring.)
+    if (std.mem.indexOf(u8, out, "\"reading_order\":") != null) return error.A11yEmitUnexpectedReadingOrder;
+
+    // Tree-or-null: when the synth tree was empty, the record carries
+    // `"root":null`; otherwise it must contain `"root":{` (object).
+    if (tree.root == null) {
+        if (std.mem.indexOf(u8, out, "\"root\":null") == null) return error.A11yEmitEmptyTreeMissingNull;
+    } else {
+        if (std.mem.indexOf(u8, out, "\"root\":{") == null) return error.A11yEmitNonEmptyTreeNotObject;
+    }
+}
+
+/// T2 — flatten + emit pipeline. Same envelope contract as T1, plus:
+///   - `flatten_attrs = true` (in-place flatten runs before the walker).
+///   - Inheritance witness: `attr_flattener.flattenInPlace` walks /Alt
+///     and /ActualText only (per src/attr_flattener.zig:135-136 — /Lang
+///     and /resolved_role are NOT touched in-place; PR-22d's
+///     `propagateLang` is the dedicated /Lang walker). When the root
+///     pins /Alt to a unique sentinel string before flattening, every
+///     descendant that did NOT have its own /Alt set must end up
+///     carrying the sentinel. The oracle is the count of "alt-less"
+///     descendants in the pre-flatten tree; the emitted JSON must
+///     contain at least that many sentinel substrings.
+///
+/// This probes the flatten + emit composition that the public `emit()`
+/// owns end-to-end. A regression in either subsystem (flattener loses
+/// inheritance, emitter forgets to dereference the field) trips here.
+fn fuzzA11yEmitterFlattenThenEmit(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const doc = try a11yOpenSyntheticDoc(allocator);
+    defer doc.close();
+
+    // Build a tree, then patch the root with a pinned sentinel /Alt
+    // value (no overlap with `A11Y_ALT_POOL` so we can count it
+    // unambiguously in the emitted JSON). The inheritance contract:
+    // every alt-less descendant inherits the root's /Alt after
+    // flattenInPlace.
+    const max_depth = rng.intRangeAtMost(u32, 1, 8);
+    var mcid_counter: i32 = 0;
+    const root = try buildRandomA11yTree(aa, rng, 0, max_depth, &mcid_counter, null);
+    const PINNED_ALT: []const u8 = "PINSENTINEL"; // no overlap with A11Y_ALT_POOL
+    root.alt_text = PINNED_ALT;
+    // Make the root `Document` so the in-place flattener treats the
+    // whole tree as one inheritance scope (matches the writer-side
+    // tagging contract).
+    root.struct_type = "Document";
+
+    // Oracle: count descendants whose nearest alt-bearing ancestor is
+    // the root. After flattenInPlace these (and only these) inherit
+    // `root.alt_text`; subtrees rooted at an alt-bearing intermediate
+    // inherit from that intermediate instead. So the JSON must contain
+    // exactly `1 (root) + inheriting_count` `"alt":"PINSENTINEL"`
+    // substrings.
+    const inheriting_count = countDescendantsInheritingRootAlt(root);
+
+    var tree: structtree.StructTree = .{ .root = root, .elements = &.{}, .allocator = aa };
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const fixed_id: uuid.String = "01020304-0506-7890-abcd-ef0123456789".*;
+    var env = stream.Envelope.initWithId(&aw.writer, "iter14.pdf", fixed_id);
+
+    try a11y_emitter.emit(&env, doc, &tree, allocator, .{
+        .flatten_attrs = true,
+        .resolve_mcid_text = false,
+        .include_reading_order = false,
+    });
+
+    const out = aw.written();
+
+    // Envelope contract (same as T1).
+    if (!std.mem.startsWith(u8, out, "{\"kind\":\"a11y_tree\"")) return error.A11yFlattenMissingKind;
+    if (out.len < 2 or out[out.len - 1] != '\n' or out[out.len - 2] != '}') return error.A11yFlattenMissingTerminator;
+    if (std.mem.indexOfScalar(u8, out, 0)) |_| return error.A11yFlattenEmbeddedNul;
+    if (!std.unicode.utf8ValidateSlice(out)) return error.A11yFlattenInvalidUtf8;
+    if (a11yJsonBalance(out) != 0) return error.A11yFlattenUnbalancedJson;
+
+    // Inheritance witness: every alt-less descendant must now carry the
+    // sentinel (root + alt_less_pre = 1 + alt_less_pre). The emitter
+    // serialises `alt_text` via `writeJsonString` so the literal value
+    // appears verbatim inside `"alt":"PINSENTINEL"`.
+    const expected = 1 + inheriting_count;
+    const seen = std.mem.count(u8, out, "\"alt\":\"PINSENTINEL\"");
+    if (seen != expected) return error.A11yFlattenAltNotPropagated;
+}
+
+/// Count descendants of `root` whose nearest alt-bearing ancestor is
+/// `root` itself — i.e. every element on the path from `root` to the
+/// element (exclusive of root, inclusive of the element) has alt_text
+/// == null. After `flattenInPlace`, exactly these descendants inherit
+/// `root.alt_text`; descendants whose nearest alt-bearing ancestor is
+/// some intermediate node inherit *that* node's value instead.
+fn countDescendantsInheritingRootAlt(elem: *const structtree.StructElement) usize {
+    var n: usize = 0;
+    for (elem.children) |c| switch (c) {
+        .element => |sub| {
+            if (sub.alt_text == null) {
+                // Sub has no own /Alt → it inherits from `elem` which
+                // (per caller's contract) inherits from root.
+                n += 1;
+                // Sub's own descendants will inherit from sub
+                // (which now carries the root's value transitively).
+                n += countDescendantsInheritingRootAlt(sub);
+            }
+            // If sub has its own /Alt, the subtree under sub inherits
+            // from sub (NOT from root). Don't count that subtree.
+        },
+        .mcid => {},
+    };
+    return n;
+}
+
+/// T3 — reading_order DFS-order property. Build a random tree where
+/// every MCID carries the page_ref of `doc.pages.items[0]`, so the
+/// reading-order walker accepts it. Each MCID is monotonically numbered
+/// during the DFS construction. The emitted reading_order array MUST
+/// list these MCIDs in strictly-monotonic order — i.e. the writer's
+/// DFS matches the builder's DFS.
+///
+/// /Artifact subtrees are excluded from reading_order; we do NOT inject
+/// /Artifact nodes at this iter to keep the oracle simple. Adding them
+/// is a follow-up if a future iter wants negative-space coverage.
+fn fuzzA11yEmitterReadingOrderDfs(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const doc = try a11yOpenSyntheticDoc(allocator);
+    defer doc.close();
+    if (doc.pages.items.len == 0) return; // Defensive: minimal PDF should have ≥ 1 page.
+
+    const page_ref = doc.pages.items[0].ref;
+    const mcid_page: structtree.MarkedContentRef = .{ .mcid = 0, .page_ref = page_ref };
+
+    const max_depth = rng.intRangeAtMost(u32, 0, 8);
+    var mcid_counter: i32 = 0;
+    const root = try buildRandomA11yTree(aa, rng, 0, max_depth, &mcid_counter, mcid_page);
+
+    // Patch the root struct_type to never be "Artifact" (the synth
+    // builder picks from a non-Artifact pool already, but be explicit).
+    root.struct_type = "Document";
+
+    var tree: structtree.StructTree = .{ .root = root, .elements = &.{}, .allocator = aa };
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const fixed_id: uuid.String = "01020304-0506-7890-abcd-ef0123456789".*;
+    var env = stream.Envelope.initWithId(&aw.writer, "iter14.pdf", fixed_id);
+
+    try a11y_emitter.emit(&env, doc, &tree, allocator, .{
+        .flatten_attrs = false,
+        .resolve_mcid_text = false,
+        .include_reading_order = true,
+    });
+
+    const out = aw.written();
+
+    // Envelope contract.
+    if (a11yJsonBalance(out) != 0) return error.A11yReadingOrderUnbalancedJson;
+    if (!std.unicode.utf8ValidateSlice(out)) return error.A11yReadingOrderInvalidUtf8;
+    if (std.mem.indexOf(u8, out, "\"reading_order\":[") == null) return error.A11yReadingOrderMissingKey;
+
+    // Locate the reading_order substring; scan it for `"mcid":N` tokens
+    // in the order they appear. The sequence must be strictly
+    // monotonic (each successive N > previous N) AND the count must
+    // match the number of MCIDs in the synth tree (which equals
+    // `mcid_counter` since every leaf MCID is unique by construction).
+    const ro_key = "\"reading_order\":[";
+    const ro_start = std.mem.indexOf(u8, out, ro_key).? + ro_key.len;
+    const ro_end_offset = std.mem.indexOfScalarPos(u8, out, ro_start, ']') orelse return error.A11yReadingOrderUnterminated;
+    const ro_slice = out[ro_start..ro_end_offset];
+
+    var prev: i64 = -1;
+    var seen: usize = 0;
+    var search_pos: usize = 0;
+    const mcid_key = "\"mcid\":";
+    while (std.mem.indexOfPos(u8, ro_slice, search_pos, mcid_key)) |k| {
+        const val_start = k + mcid_key.len;
+        // Parse the integer literal; it ends at the first non-digit.
+        var end: usize = val_start;
+        while (end < ro_slice.len) : (end += 1) {
+            const c = ro_slice[end];
+            if (c < '0' or c > '9') break;
+        }
+        if (end == val_start) return error.A11yReadingOrderMcidNotNumeric;
+        const n = std.fmt.parseInt(i64, ro_slice[val_start..end], 10) catch return error.A11yReadingOrderMcidParseFail;
+        if (n <= prev) return error.A11yReadingOrderNotMonotonic;
+        prev = n;
+        seen += 1;
+        search_pos = end;
+    }
+
+    // Count match: the synth tree allocated `mcid_counter` MCIDs (each
+    // unique). reading_order should list every one (no /Artifact gates,
+    // no negative MCIDs, every page_ref valid).
+    if (seen != @as(usize, @intCast(mcid_counter))) return error.A11yReadingOrderCountMismatch;
 }
 
 // ============================================================================
