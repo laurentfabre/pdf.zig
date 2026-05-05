@@ -33,12 +33,24 @@ const LINE_GAP: f64 = 1.4; // multiplier on font size
 
 /// Render `markdown` into a PDF byte buffer. Caller owns the result;
 /// free with `allocator.free(bytes)`.
+///
+/// Image-line support (`![alt](path)`) is **disabled** in this entry
+/// point — there's no `std.Io` to back disk reads. Use `renderWithIo`
+/// from a CLI/daemon that already owns an `io`.
 pub fn render(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
+    return renderWithIo(allocator, null, markdown);
+}
+
+/// Same as `render`, but threads `io` through so `![alt](path)` lines
+/// can resolve. When `io` is null the image-line handler silently skips
+/// (the existing "image errors don't fail the render" contract).
+pub fn renderWithIo(allocator: std.mem.Allocator, io: ?std.Io, markdown: []const u8) ![]u8 {
     var doc = pdf_document.DocumentBuilder.init(allocator);
     defer doc.deinit();
 
     var renderer = Renderer{
         .allocator = allocator,
+        .io = io,
         .doc = &doc,
         .page = null,
         .y = 0,
@@ -66,6 +78,17 @@ pub fn render(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
         skip_blank = false;
 
         const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (parseImageLine(trimmed)) |path| {
+            // PR-W8 [feat]: `![alt](path.jpg)` line. JPEG-only at this
+            // tier; PNGs / WebP follow in a later PR. On any error
+            // (missing file, non-JPEG, parse failure) we skip silently
+            // — markdown rendering shouldn't fail because one image
+            // can't be decoded.
+            renderer.imageLine(path) catch {
+                continue;
+            };
+            continue;
+        }
         if (std.mem.startsWith(u8, trimmed, "# ") and !std.mem.startsWith(u8, trimmed, "## ")) {
             try renderer.heading(trimmed[2..], H1_SIZE);
         } else if (std.mem.startsWith(u8, trimmed, "## ") and !std.mem.startsWith(u8, trimmed, "### ")) {
@@ -98,6 +121,19 @@ fn bulletPrefix(line: []const u8) ?usize {
     return null;
 }
 
+/// PR-W8 [feat]: match a single `![alt](path)` line and return the
+/// `path` slice (borrowed from `line`). Trailing whitespace on the
+/// line was already stripped by the caller. The alt text is ignored;
+/// the path is what we feed to `addImageJpeg`.
+fn parseImageLine(line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, "![")) return null;
+    const close_bracket = std.mem.indexOfScalarPos(u8, line, 2, ']') orelse return null;
+    if (close_bracket + 1 >= line.len or line[close_bracket + 1] != '(') return null;
+    const close_paren = std.mem.indexOfScalarPos(u8, line, close_bracket + 2, ')') orelse return null;
+    if (close_paren + 1 != line.len) return null; // require nothing after `)`
+    return line[close_bracket + 2 .. close_paren];
+}
+
 /// Match `1. `, `42. `, etc. Returns bytes to skip past the number
 /// + dot + space, or null. The caller can slice [0..skip-2] to get
 /// the number text without the trailing `. `.
@@ -112,6 +148,9 @@ fn numberedPrefix(line: []const u8) ?usize {
 
 const Renderer = struct {
     allocator: std.mem.Allocator,
+    /// Optional `std.Io` for resolving `![alt](path)` image lines off
+    /// disk. When null, image lines are skipped silently (test-only path).
+    io: ?std.Io = null,
     doc: *pdf_document.DocumentBuilder,
     page: ?*pdf_document.PageBuilder,
     /// Current y position (PDF user space, top of the next line).
@@ -144,6 +183,36 @@ const Renderer = struct {
 
     fn paragraph(self: *Renderer, text: []const u8) !void {
         try self.flowText(text, .helvetica, BODY_SIZE, MARGIN);
+    }
+
+    /// PR-W8 [feat]: load a JPEG from disk and place it at the current
+    /// y-cursor scaled to fit the body column width (preserving aspect
+    /// ratio). Advances the cursor by the placed image height + a
+    /// small gap. Errors propagate to the caller, which skips silently.
+    fn imageLine(self: *Renderer, path: []const u8) !void {
+        // Bounded read — refuse anything larger than 16 MiB so a path
+        // typo doesn't try to slurp /dev/zero.
+        const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+        const io = self.io orelse return error.NoIoForImageLoading;
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(MAX_IMAGE_BYTES));
+        defer self.allocator.free(bytes);
+
+        const handle = try self.doc.addImageJpeg(bytes);
+        // Scale to body column; preserve aspect ratio.
+        const body_width = PAGE_WIDTH - 2 * MARGIN;
+        // We don't have direct access to the registered image's
+        // geometry from this layer, so re-parse the metadata. Cheap —
+        // SOF marker scan only.
+        const meta = try @import("jpeg_meta.zig").parse(bytes);
+        const aspect = @as(f64, @floatFromInt(meta.height)) / @as(f64, @floatFromInt(meta.width));
+        const draw_w = body_width;
+        const draw_h = body_width * aspect;
+        try self.ensureSpace(draw_h + BODY_SIZE * 0.6);
+        const page = self.page.?;
+        // PDF y-axis is bottom-up: image's lower-left corner sits at
+        // (MARGIN, y - draw_h).
+        try page.drawImage(MARGIN, self.y - draw_h, draw_w, draw_h, handle);
+        try self.advance(draw_h + BODY_SIZE * 0.6);
     }
 
     fn listItem(self: *Renderer, text: []const u8, marker: []const u8) !void {
