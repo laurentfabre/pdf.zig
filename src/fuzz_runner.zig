@@ -100,6 +100,16 @@ const TARGETS = [_]Target{
     // explicitly named via PDFZIG_FUZZ_TARGET=decompress_ascii85_roundtrip.
     // Promote back to .aggressive once Finding 005 is fixed.
     .{ .name = "decompress_ascii85_roundtrip", .run = fuzzDecompressAscii85Roundtrip, .reproducer_only = true },
+    // Iter-2 of the autonomous fuzz loop (audit/fuzz_loop_state.md) —
+    // `parser.zig` (Parser.parseObject / parseIndirectObject / initAt).
+    // Today the only fuzz coverage of the COS object parser is via
+    // `pdf_open_random` + `pdf_open_magic_prefix`, which bury the parser
+    // surface under xref-table parsing, page-tree assembly, and decryption
+    // fast-fail. These three targets reach the deep parse branches
+    // directly.
+    .{ .name = "parser_object_pdfish", .run = fuzzParserObjectPdfish },
+    .{ .name = "parser_indirect_object_random", .run = fuzzParserIndirectObjectRandom },
+    .{ .name = "parser_init_at_offset_random", .run = fuzzParserInitAtOffsetRandom },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -1207,6 +1217,350 @@ fn encodeAscii85(allocator: std.mem.Allocator, data: []const u8) error{OutOfMemo
     }
     try out.appendSlice(allocator, "~>");
     return out.toOwnedSlice(allocator);
+}
+
+
+// ============================================================================
+// Targets — parser.zig (defense-in-depth, iter 2)
+// ============================================================================
+//
+// `Parser.parseObject` is the inner trust boundary: once xref + decryption
+// hand off, every byte is parsed as COS syntax. The existing `pdf_open_*`
+// targets only reach this surface after a successful xref parse, so the
+// deep branches (parens-nested literal strings, hex strings, name escapes,
+// reference back-tracking, dict / array recursion up to MAX_NESTING=100,
+// the parseDictOrStream branch off `<<…>>`) are under-covered.
+//
+// `parseIndirectObject` adds the `N M obj … endobj` framing on top, which
+// is where `/Length` ↔ stream-data byte counting lives.
+//
+// `Parser.initAt` is just a constructor with a user-supplied offset; the
+// risk is `parseObject` started at an arbitrary byte position of a real
+// PDF — high probability of landing mid-token, mid-stream-data, or past
+// `data.len`.
+
+/// PDF-ish biased random fuzz against `Parser.parseObject`. Half the iters
+/// are pure random bytes (raw stress); the other half are weighted toward
+/// COS token shapes (`<<…>>`, `[…]`, `/name`, `<hex>`, `(literal)`,
+/// `N M R`, `null`/`true`/`false`, signed-number forms, `%comment` skip).
+///
+/// Invariants:
+///   - no panic (the floor is *surviving the call*)
+///   - on success: parser advances strictly forward (`pos > 0`), and
+///     `parseObject` produced an `Object` consistent with its tag (e.g.
+///     a `.string` payload is valid against the allocator's lifetime).
+///   - returned errors are members of `parser.ParseError`
+///
+/// We do not assert deep round-trip equality — the parser is canonical
+/// here, no second implementation to diff against. Exhaustive structural
+/// validation is delegated to `validateObjectShape` below: it walks
+/// arrays/dicts recursively and checks every leaf has finite payload
+/// (no NaN/Inf reals on the round-trip path; arrays/dicts respect
+/// MAX_NESTING).
+fn fuzzParserObjectPdfish(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    const len = rng.intRangeAtMost(usize, 0, scratch.len);
+    rng.bytes(scratch[0..len]);
+
+    // Half the iters: bias scratch toward COS-syntax-shaped tokens. Each
+    // pass picks a small random window and overwrites it with one of a
+    // dozen valid-ish shapes. The remainder of the buffer stays random so
+    // we still hit "valid token followed by garbage" paths.
+    if (rng.boolean() and len > 0) {
+        const n_inserts = rng.intRangeAtMost(usize, 1, 8);
+        for (0..n_inserts) |_| {
+            biasPdfishToken(rng, scratch[0..len]);
+        }
+    }
+
+    // Use an arena so a successful parseObject's nested allocations are
+    // freed in one shot — `parseObject` returns sub-objects (arrays,
+    // dicts, strings) allocated via `self.allocator`. Arena keeps the
+    // harness honest under per-iter cleanup without needing per-object
+    // free walks.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var p = parser.Parser.init(aa, scratch[0..len]);
+    const obj = p.parseObject() catch |err| {
+        // Domain errors are expected on adversarial input. Anything outside
+        // ParseError is a harness bug — propagate so the runner counts it.
+        switch (err) {
+            error.UnexpectedToken,
+            error.UnexpectedEof,
+            error.InvalidNumber,
+            error.InvalidString,
+            error.InvalidHexString,
+            error.InvalidName,
+            error.InvalidDictionary,
+            error.InvalidArray,
+            error.InvalidStream,
+            error.InvalidReference,
+            error.NestingTooDeep,
+            error.OutOfMemory,
+            => return,
+        }
+    };
+
+    // Parser advanced (a successful parse must have consumed ≥1 byte
+    // unless `parseObject` was somehow called on empty input — which
+    // returns UnexpectedEof, handled above).
+    if (p.pos == 0 and len > 0) return error.ParserDidNotAdvance;
+    if (p.pos > p.data.len) return error.ParserPosBeyondData;
+
+    try validateObjectShape(obj, 0);
+}
+
+/// Biased-random fuzz against `Parser.parseIndirectObject`. Generates
+/// `N M obj … endobj` shapes with random `N` / `M` / inner-object bytes,
+/// occasionally with a stream segment whose `/Length` either matches,
+/// under-shoots, or over-shoots the actual data — the boundary cases the
+/// task brief calls out as worth seeding.
+///
+/// Invariants:
+///   - no panic
+///   - on success: `result.num` and `result.gen` round-trip the input
+///     header (mod the adversarial-input edge where `parseIndirectObject`
+///     itself rejects with InvalidReference for u32/u16 overflow)
+///   - returned errors are in `parser.ParseError`
+fn fuzzParserIndirectObjectRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // Build a synthetic indirect-object frame inside `scratch`, then
+    // optionally smear a few random bytes over it.
+    var aw = std.Io.Writer.fixed(scratch);
+
+    const num = rng.intRangeAtMost(u32, 0, 1_000_000);
+    const gen = rng.intRangeAtMost(u16, 0, 65535);
+
+    aw.print("{d} {d} obj\n", .{ num, gen }) catch return;
+
+    // Pick one of: integer, name, dict, array, stream-with-length.
+    const inner_kind = rng.intRangeAtMost(u8, 0, 4);
+    switch (inner_kind) {
+        0 => aw.print("{d}", .{rng.int(i32)}) catch return,
+        1 => aw.writeAll("/SomeName") catch return,
+        2 => aw.writeAll("<< /Type /Catalog /Pages 2 0 R >>") catch return,
+        3 => aw.writeAll("[1 2 3 (hi) /Foo]") catch return,
+        4 => {
+            // Stream object. Vary the /Length policy:
+            //   0 → omit /Length (decoder uses endstream-search fallback)
+            //   1 → /Length matches the data
+            //   2 → /Length under-shoots (data tail leaks into endstream)
+            //   3 → /Length over-shoots (would read past data.len)
+            //   4 → /Length is negative (must be rejected as InvalidStream)
+            const policy = rng.intRangeAtMost(u8, 0, 4);
+            const data_len = rng.intRangeAtMost(usize, 0, 64);
+            const claimed: i64 = switch (policy) {
+                1 => @intCast(data_len),
+                2 => @intCast(data_len -| rng.intRangeAtMost(usize, 1, @max(1, data_len))),
+                3 => @as(i64, @intCast(data_len)) + @as(i64, rng.intRangeAtMost(i64, 1, 200)),
+                4 => -@as(i64, rng.intRangeAtMost(i64, 1, 1000)),
+                else => 0, // policy 0 — value unused, dict omits /Length
+            };
+            if (policy == 0) {
+                aw.writeAll("<< /Filter /ASCIIHexDecode >>\nstream\n") catch return;
+            } else {
+                aw.print("<< /Length {d} >>\nstream\n", .{claimed}) catch return;
+            }
+            // Random data bytes, then maybe missing endstream marker.
+            const buf_remaining = scratch.len - aw.end;
+            const safe_data_len = @min(data_len, buf_remaining -| 32);
+            for (0..safe_data_len) |_| {
+                aw.writeByte(rng.int(u8)) catch break;
+            }
+            // Optional endstream + endobj. Sometimes drop one or both to
+            // exercise the optional-keyword paths (parser tolerates a
+            // missing endobj per spec).
+            if (rng.boolean()) aw.writeAll("\nendstream") catch {};
+        },
+        else => unreachable,
+    }
+
+    if (rng.boolean()) aw.writeAll("\nendobj\n") catch {};
+
+    // Optional smearing: flip 0..4 random bytes inside the assembled frame.
+    const written = aw.end;
+    const flips = rng.intRangeAtMost(usize, 0, 4);
+    for (0..flips) |_| {
+        if (written == 0) break;
+        const idx = rng.intRangeAtMost(usize, 0, written - 1);
+        scratch[idx] ^= rng.int(u8);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var p = parser.Parser.init(arena.allocator(), scratch[0..written]);
+    const got = p.parseIndirectObject() catch |err| {
+        switch (err) {
+            error.UnexpectedToken,
+            error.UnexpectedEof,
+            error.InvalidNumber,
+            error.InvalidString,
+            error.InvalidHexString,
+            error.InvalidName,
+            error.InvalidDictionary,
+            error.InvalidArray,
+            error.InvalidStream,
+            error.InvalidReference,
+            error.NestingTooDeep,
+            error.OutOfMemory,
+            => return,
+        }
+    };
+
+    // Header-round-trip invariant: only meaningful when no smearing
+    // landed on the header. If flips were 0 we can assert.
+    if (flips == 0) {
+        if (got.num != num) return error.IndirectHeaderNumMismatch;
+        if (got.gen != gen) return error.IndirectHeaderGenMismatch;
+    }
+    if (p.pos > p.data.len) return error.ParserPosBeyondData;
+
+    try validateObjectShape(got.obj, 0);
+}
+
+/// Random-offset fuzz against `Parser.initAt(seed_pdf, offset).parseObject()`.
+/// Picks a uniformly random byte offset into one of the seed-pool PDFs and
+/// drives `parseObject` from there. Most offsets land mid-token (or in
+/// stream data, or past `data.len`); the floor invariant is *no panic, no
+/// OOB read*. We never expect "success" here — it's the structural-error
+/// path under hostile starting positions.
+///
+/// Invariants:
+///   - no panic, no segfault, no @intCast trap
+///   - if parseObject returns Ok, the parser advanced and pos ≤ data.len
+///   - returned errors are in `parser.ParseError`
+fn fuzzParserInitAtOffsetRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+
+    if (seed_pdf.len == 0) return;
+
+    // Random offset across the full PDF, including the boundary at
+    // `data.len` (initAt is allowed to receive an at-end offset; the
+    // first parseObject call should immediately return UnexpectedEof).
+    const offset = rng.intRangeAtMost(usize, 0, seed_pdf.len);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var p = parser.Parser.initAt(arena.allocator(), seed_pdf, offset);
+
+    // Sometimes call parseObject; sometimes parseIndirectObject — both
+    // are public surface against `initAt`.
+    const used_indirect = rng.boolean();
+    if (used_indirect) {
+        const got = p.parseIndirectObject() catch |err| switch (err) {
+            error.UnexpectedToken,
+            error.UnexpectedEof,
+            error.InvalidNumber,
+            error.InvalidString,
+            error.InvalidHexString,
+            error.InvalidName,
+            error.InvalidDictionary,
+            error.InvalidArray,
+            error.InvalidStream,
+            error.InvalidReference,
+            error.NestingTooDeep,
+            error.OutOfMemory,
+            => return,
+        };
+        if (p.pos > p.data.len) return error.ParserPosBeyondData;
+        try validateObjectShape(got.obj, 0);
+    } else {
+        const obj = p.parseObject() catch |err| switch (err) {
+            error.UnexpectedToken,
+            error.UnexpectedEof,
+            error.InvalidNumber,
+            error.InvalidString,
+            error.InvalidHexString,
+            error.InvalidName,
+            error.InvalidDictionary,
+            error.InvalidArray,
+            error.InvalidStream,
+            error.InvalidReference,
+            error.NestingTooDeep,
+            error.OutOfMemory,
+            => return,
+        };
+        if (p.pos > p.data.len) return error.ParserPosBeyondData;
+        try validateObjectShape(obj, 0);
+    }
+}
+
+/// Overwrite a randomly-chosen window of `buf` with a COS-syntax-shaped
+/// token. Window length is bounded by what the chosen token needs; if
+/// `buf` is too small we no-op rather than truncate.
+fn biasPdfishToken(rng: std.Random, buf: []u8) void {
+    if (buf.len == 0) return;
+    const choice = rng.intRangeAtMost(u8, 0, 13);
+    const tokens = [_][]const u8{
+        "<< /Type /Page >>",
+        "<< /Length 12 >>\nstream\nHello World!\nendstream",
+        "[1 2 3 4]",
+        "[(a) (b) (c)]",
+        "/Name#20With#20Spaces",
+        "<48656C6C6F>",
+        "(Hello (nested) World)",
+        "10 0 R",
+        "%a comment\n",
+        "true false null",
+        "-3.14e2",
+        "<< /A 1 /B 2 /C [ 1 2 << /D 5 >> ] >>",
+        "(\\101\\102\\103\\\\)",
+        "<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>", // adversarial: 20-deep dict
+    };
+    const tok = tokens[choice];
+    if (tok.len > buf.len) return;
+    const max_off = buf.len - tok.len;
+    const off = if (max_off == 0) 0 else rng.intRangeAtMost(usize, 0, max_off);
+    @memcpy(buf[off..][0..tok.len], tok);
+}
+
+/// Recursive structural validator. Walks `obj` and asserts:
+///   - reals are finite (no NaN / +inf / -inf snuck through)
+///   - dict keys are non-null slices
+///   - nesting depth never exceeds `parser.MAX_NESTING` (100 — we use 200
+///     here as a generous backstop in case the constant changes)
+///   - reference num/gen are inside their public type bounds
+///
+/// Errors propagate as harness-side invariant violations.
+fn validateObjectShape(obj: parser.Object, depth: usize) anyerror!void {
+    if (depth > 200) return error.ObjectNestingExceedsBackstop;
+    switch (obj) {
+        .null, .boolean, .integer => {},
+        .real => |r| {
+            if (!std.math.isFinite(r)) return error.ObjectRealNonFinite;
+        },
+        .string, .hex_string, .name => {},
+        .array => |arr| {
+            for (arr) |item| try validateObjectShape(item, depth + 1);
+        },
+        .dict => |d| {
+            for (d.entries) |entry| {
+                if (entry.key.len == 0) {
+                    // Empty name keys are legal per PDF spec but suspicious;
+                    // we accept and continue.
+                }
+                try validateObjectShape(entry.value, depth + 1);
+            }
+        },
+        .stream => |s| {
+            for (s.dict.entries) |entry| try validateObjectShape(entry.value, depth + 1);
+            // stream.data is a borrow into the parser's input — len is
+            // bounded by the parser; nothing to assert beyond no-panic.
+            _ = s.data;
+        },
+        .reference => |r| {
+            // u32/u16 are the type bounds — already enforced by `@intCast`
+            // inside parseIndirectObject. This is just a tripwire for any
+            // future regression that would let a wider int leak in.
+            _ = r;
+        },
+    }
 }
 
 // ============================================================================

@@ -102,7 +102,10 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 | **jpeg_meta_random** | **7.3 s** | **v1.6 PR-W8 — JPEG SOF/SOI parser robustness** |
 | **decompress_ascii_hex_random** | **98.9 s** | **iter-1 — `/Filter ASCIIHexDecode` random-bytes** |
 | **decompress_runlength_random** | **111.3 s** | **iter-1 — `/Filter RunLengthDecode` biased-bytes** |
-| **Total** | **2826.8 s (47 min 7 s) — 25/25 clean at 1M, base seed `0x19df72ef96f`** | |
+| **parser_object_pdfish** | TBD (1M not yet rerun; 155 ms / 100k) | **iter-2 — biased COS-syntax bytes through `Parser.parseObject`** |
+| **parser_indirect_object_random** | TBD (1M not yet rerun; 16 ms / 100k) | **iter-2 — synthetic `N M obj … endobj` frames + `/Length` boundary cases through `Parser.parseIndirectObject`** |
+| **parser_init_at_offset_random** | TBD (1M not yet rerun; 4 ms / 100k) | **iter-2 — random byte-offsets into seed-pool PDFs through `Parser.initAt`** |
+| **Total** | **2826.8 s (47 min 7 s) at 1M (pre-iter-2) — 25/25 clean, base seed `0x19df72ef96f`; iter-2 1M rerun pending** | |
 
 The aggressive-gated `decompress_ascii85_roundtrip` is `reproducer_only` and skipped from the default + aggressive sweeps; deterministically reproduces Finding 005 below.
 
