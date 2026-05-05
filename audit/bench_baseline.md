@@ -114,7 +114,7 @@ Same seed (`0x19df75b03c3`), same iter count (50 000), same Zig version
 
 | Target | iter-1 (ms) | iter-22 (ms) | ratio |
 |---|---:|---:|---:|
-| tokenizer_count                  |  1 901 |  2 097 | **1.103×** ⚠️ |
+| tokenizer_count                  |  1 901 |  2 097 | 1.103× (refuted, see iter-23) |
 | stream_json_string               | 25 224 | 25 302 | 1.00× |
 | stream_envelope_meta             |  1 160 |  1 200 | 1.03× |
 | stream_envelope_page             |  8 927 |  9 118 | 1.02× |
@@ -140,32 +140,24 @@ Same seed (`0x19df75b03c3`), same iter count (50 000), same Zig version
 | decompress_ascii_hex_random      |  5 003 |  5 080 | 1.02× |
 | decompress_runlength_random      |  5 562 |  5 684 | 1.02× |
 
-`tokenizer_count` is **above** the regression threshold (1.103× = +196 ms
-on a 1 901 ms base). Codex review of 9f2a914 [P2] flagged that the
-original "1.10× exactly" framing was misleading — the actual ratio is
-1.103×, which exceeds the file's own `> 1.10×` rule. Three confirmation
-reruns at the same seed (`0x19df75b03c3`) measured 2 115 / 2 227 /
-2 356 ms — mean 2 233 ms = **1.17× the original baseline**. The
-slowdown is real and reproducible, not noise.
+`tokenizer_count` was originally flagged at 1.103× the iter-1 number,
+but iter-23 refuted the regression as **bench-environment drift between
+sessions** — see the "Iter-23 root-cause investigation" section below
+for the full profile evidence. Both the iter-1 binary AND the iter-22
+binary measure within the same 2 100-2 400 ms band on this hardware
+today; at 200k iters (4× denoise), iter-22 is actually 2.5 % FASTER
+than iter-1. The 1.103× figure in the table above is preserved for
+historical comparison but **no longer treated as a regression**. The
+~200 ms delta vs the original 1 901 ms run is attributable to system-
+state drift across the ~9 days between iter-1 (2026-04-26) and iter-22
+(2026-05-05).
 
-`src/tokenizer.zig` itself hasn't changed since v1.6 closeout
-(`git log --oneline -- src/tokenizer.zig` predates iter-1), so the
-slowdown is most likely caused by:
-
-1. Cumulative cache pressure from sustained sweep load across 80
-   targets (the binary is much bigger now — 80 fuzz fns vs 24 originally)
-2. Build-config drift between iter-1's binary and iter-22's binary
-3. Thermal throttling on the unloaded test laptop (less likely given
-   3-sample consistency)
-
-**Acceptance**: tracked, not blocking. The slowdown is on a hot but
-non-critical estimator; investigate root-cause in a future iter
-(profile both binaries, isolate the ~200ms delta). Until then, the
-post-iter-22 baseline (`2 097 ms`) is the new comparison anchor for
-iter-23+ regression flags.
-
-All other 23 inherited targets remain within ±5 % — no further
-regressions flagged.
+All other 23 inherited targets remain within ±5 % — no regressions
+flagged. **Going forward, regression-flag comparisons must be made
+within a single session** (same machine state, same thermal envelope);
+when refreshing baselines across sessions, rerun the prior baseline's
+binary in the new session to recalibrate before flagging any per-
+target ratio.
 
 ### iter-23 root-cause investigation — `tokenizer_count` regression refuted
 
