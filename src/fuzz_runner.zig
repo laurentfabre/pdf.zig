@@ -5851,7 +5851,13 @@ fn fuzzPdfWriterXrefByteOffsets(
 /// rules out drift between the targets' oracles. Returns
 /// `error.PagetreeShape*` on the first divergence.
 const PageTreeFanout: u32 = 10; // mirror PAGE_TREE_FANOUT (pdf_document.zig:100)
-const MaxTreeDepth: u32 = 6; // ceil(log_10(64)) + 1 = 3; leaving slack for assert.
+// Codex review of 81ab433 [P3]: original bound was 6 with "leaving slack
+// for assert" — but the slack lets a regressed writer emit several
+// unnecessary single-child /Pages levels and still pass. Tighten to
+// the analytical bound for the corpus: N ∈ [1, 64], FANOUT=10 →
+// ⌈log_10(64)⌉ = 2 leaf-tier levels + 1 root = 3. Strict upper bound;
+// the writer must NOT pad with single-child intermediates.
+const MaxTreeDepth: u32 = 3;
 
 const Iter18WalkErr = error{
     PagetreeShapeNoTypeName,
