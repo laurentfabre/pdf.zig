@@ -36,6 +36,9 @@ const interpreter = @import("interpreter.zig");
 const pdf_document = @import("pdf_document.zig");
 const bidi = @import("bidi.zig");
 const cff = @import("cff.zig");
+const pdf_resources = @import("pdf_resources.zig");
+const image_writer = @import("image_writer.zig");
+const pdf_writer = @import("pdf_writer.zig");
 
 // ============================================================================
 // Target registry
@@ -178,6 +181,26 @@ const TARGETS = [_]Target{
     .{ .name = "decompress_runlength_diff", .run = fuzzDecompressRunLengthDiff },
     .{ .name = "decompress_ascii_hex_diff", .run = fuzzDecompressAsciiHexDiff },
     .{ .name = "decompress_filter_chain_diff", .run = fuzzDecompressFilterChainDiff },
+    // Iter-10 (audit/fuzz_loop_state.md row 18 — pdf_resources.zig).
+    // Tier-4 stateful sequence fuzz on `ResourceRegistry`. The registry
+    // hands out font / image handles, dedupes builtin fonts, and freezes
+    // for further font registration after `assignFontObjectNumbers`.
+    // Self-contained surface — no parsing / xref state required.
+    //
+    // SUT-independent invariants:
+    //   - registerBuiltinFont is idempotent per BuiltinFont enum value.
+    //   - fontResourceName is `/F<idx>` and stable across calls.
+    //   - imageResourceName is `/Im<idx>` and stable across calls.
+    //   - fontCount / imageCount equal the number of successful registers.
+    //   - After assignFontObjectNumbers: every entry has obj_num != 0,
+    //     all obj_nums are pairwise distinct, registerBuiltinFont returns
+    //     `error.ObjectNumbersAlreadyAssigned` (negative-space invariant).
+    //   - After assignImageObjectNumbers: every image has obj_num != 0
+    //     AND `image_obj_nums[idx] == ref.obj_num` (registry / entry
+    //     mirror).
+    .{ .name = "pdf_resources_builtin_dedup", .run = fuzzPdfResourcesBuiltinDedup },
+    .{ .name = "pdf_resources_image_register_assign", .run = fuzzPdfResourcesImageRegisterAssign },
+    .{ .name = "pdf_resources_freeze_after_assign", .run = fuzzPdfResourcesFreezeAfterAssign },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -3107,6 +3130,337 @@ fn fuzzCffDictRandomTopDict(rng: std.Random, allocator: std.mem.Allocator, scrat
     defer cp.deinit();
 
     try cffSweepInvariants(&cp);
+}
+
+// ============================================================================
+// Targets — pdf_resources.zig (iter-10, row 18 of audit/fuzz_loop_state.md)
+// ============================================================================
+
+/// Pick a uniform random `BuiltinFont` from the 14-variant enum. The cast
+/// is safe because `intRangeAtMost(0, 13)` is bounded by the enum range.
+fn randomBuiltinFont(rng: std.Random) pdf_document.BuiltinFont {
+    const idx = rng.intRangeAtMost(u4, 0, 13);
+    return @enumFromInt(idx);
+}
+
+/// Build a synthetic ImageRef with random width/height/colorspace +
+/// caller-allocated bytes. The registry takes ownership of `bytes`, so
+/// the caller MUST pass a freshly-allocated slice (matching
+/// pdf_document.addImage*'s "copy-on-register" contract).
+fn synthRandomImageRef(rng: std.Random, allocator: std.mem.Allocator) !image_writer.ImageRef {
+    // Cap at 16 B per image so a fuzz iter can register dozens without
+    // blowing past the per-iter scratch budget.
+    const len = rng.intRangeAtMost(usize, 1, 16);
+    const bytes = try allocator.alloc(u8, len);
+    errdefer allocator.free(bytes);
+    rng.bytes(bytes);
+
+    // Width / height in [1, 256]: positive (image_writer.emitImageObject
+    // asserts > 0) and bounded so the assert path is fuzz-safe.
+    const cs_idx = rng.intRangeAtMost(u8, 0, 2);
+    return .{
+        .bytes = bytes,
+        .encoding = switch (rng.intRangeAtMost(u8, 0, 2)) {
+            0 => .dct_passthrough,
+            1 => .raw_uncompressed,
+            else => .raw_flate,
+        },
+        .width = rng.intRangeAtMost(u32, 1, 256),
+        .height = rng.intRangeAtMost(u32, 1, 256),
+        .bits_per_component = 8,
+        .colorspace = switch (cs_idx) {
+            0 => .gray,
+            1 => .rgb,
+            else => .cmyk,
+        },
+    };
+}
+
+/// T1 — register a random sequence of builtin fonts and assert dedup
+/// invariants. Each iter performs 1..32 register calls drawn uniformly
+/// from the 14-font enum, then sweeps the registry for:
+///   - Same `BuiltinFont` value → same `FontHandle` (idempotent dedup).
+///   - `fontResourceName(handle)` is `/F<idx>` and stable.
+///   - All resource names are pairwise distinct.
+///   - `fontCount()` == number of *distinct* BuiltinFonts seen.
+fn fuzzPdfResourcesBuiltinDedup(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var reg = pdf_resources.ResourceRegistry.init(allocator);
+    defer reg.deinit();
+
+    // Track first-seen handle per BuiltinFont enum value, for dedup
+    // checking against every subsequent register.
+    var first_handle: [14]?pdf_resources.FontHandle = @splat(null);
+    var distinct_count: u32 = 0;
+
+    const ops = rng.intRangeAtMost(u32, 1, 32);
+    var op: u32 = 0;
+    while (op < ops) : (op += 1) {
+        const font = randomBuiltinFont(rng);
+        const lookup_idx: usize = @intFromEnum(font);
+        const h = try reg.registerBuiltinFont(font);
+
+        if (first_handle[lookup_idx]) |prior| {
+            // Idempotency: subsequent registration of the same builtin
+            // returns the same handle.
+            if (prior != h) return error.PdfResourcesBuiltinHandleNotIdempotent;
+        } else {
+            first_handle[lookup_idx] = h;
+            distinct_count += 1;
+        }
+    }
+
+    if (reg.fontCount() != distinct_count) {
+        return error.PdfResourcesFontCountDisagrees;
+    }
+
+    // Sweep names: each handle's resource name must be `/F<idx>` and
+    // pairwise unique across all registered handles. Iter through the
+    // first_handle table so we exercise getter consistency for EVERY
+    // distinct font that was registered.
+    var name_buf: [16][]const u8 = undefined;
+    var seen: u32 = 0;
+    for (first_handle) |maybe_h| {
+        if (maybe_h) |h| {
+            const idx = @intFromEnum(h);
+            const name = reg.fontResourceName(h);
+            // Must start with "/F" and end in a decimal index matching idx.
+            if (name.len < 3 or name[0] != '/' or name[1] != 'F') {
+                return error.PdfResourcesFontNameMalformed;
+            }
+            const parsed = std.fmt.parseInt(u32, name[2..], 10) catch
+                return error.PdfResourcesFontNameNotDecimal;
+            if (parsed != idx) return error.PdfResourcesFontNameIndexMismatch;
+
+            // Stability: a second call returns byte-identical bytes.
+            const name2 = reg.fontResourceName(h);
+            if (!std.mem.eql(u8, name, name2)) {
+                return error.PdfResourcesFontNameNotStable;
+            }
+
+            name_buf[seen] = name;
+            seen += 1;
+        }
+    }
+
+    // Pairwise uniqueness across all registered handles.
+    var i: u32 = 0;
+    while (i < seen) : (i += 1) {
+        var j: u32 = i + 1;
+        while (j < seen) : (j += 1) {
+            if (std.mem.eql(u8, name_buf[i], name_buf[j])) {
+                return error.PdfResourcesFontNameCollision;
+            }
+        }
+    }
+}
+
+/// T2 — register a random sequence of images, then assign object
+/// numbers via a real `pdf_writer.Writer`. Asserts:
+///   - `imageCount()` reflects the number of successful registers.
+///   - Names are `/Im<idx>` and pairwise unique.
+///   - After `assignImageObjectNumbers`: every `imageObjectNum(h)` is
+///     non-zero and pairwise distinct (writer hands out fresh nums).
+///   - The internal `images.items[idx].ref.obj_num` mirrors the value
+///     in `image_obj_nums[idx]` (registry / entry consistency).
+fn fuzzPdfResourcesImageRegisterAssign(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var reg = pdf_resources.ResourceRegistry.init(allocator);
+    defer reg.deinit();
+
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+
+    const n = rng.intRangeAtMost(u32, 0, 16);
+    var handles: [16]pdf_resources.ImageHandle = undefined;
+    var actual_n: u32 = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const ref = try synthRandomImageRef(rng, allocator);
+        // Codex review-style note: `registerImage` takes ownership of
+        // `ref.bytes`. On error the registry has not appended yet, so
+        // the bytes belong to us — free or hand to the next attempt.
+        // The two errors registerImage can return are OutOfMemory and
+        // ObjectNumbersAlreadyAssigned; we haven't called assign* yet,
+        // so OOM is the only branch and we must free on it.
+        const handle = reg.registerImage(ref) catch |err| {
+            allocator.free(ref.bytes);
+            return err;
+        };
+        handles[i] = handle;
+        actual_n += 1;
+    }
+
+    if (reg.imageCount() != actual_n) return error.PdfResourcesImageCountDisagrees;
+
+    // Names: `/Im<idx>` and pairwise unique.
+    var seen_names: [16][]const u8 = undefined;
+    var s: u32 = 0;
+    while (s < actual_n) : (s += 1) {
+        const name = reg.imageResourceName(handles[s]);
+        if (name.len < 4 or name[0] != '/' or name[1] != 'I' or name[2] != 'm') {
+            return error.PdfResourcesImageNameMalformed;
+        }
+        const parsed = std.fmt.parseInt(u32, name[3..], 10) catch
+            return error.PdfResourcesImageNameNotDecimal;
+        if (parsed != @intFromEnum(handles[s])) {
+            return error.PdfResourcesImageNameIndexMismatch;
+        }
+        seen_names[s] = name;
+    }
+    var a: u32 = 0;
+    while (a < actual_n) : (a += 1) {
+        var b: u32 = a + 1;
+        while (b < actual_n) : (b += 1) {
+            if (std.mem.eql(u8, seen_names[a], seen_names[b])) {
+                return error.PdfResourcesImageNameCollision;
+            }
+        }
+    }
+
+    // Drive the writer side: assign object numbers and assert post-
+    // conditions on the registry. Skip if no images registered (the
+    // assign call is a no-op but the post-condition sweep is empty).
+    if (actual_n == 0) return;
+
+    try reg.assignImageObjectNumbers(&w);
+
+    // Sweep: every handle's obj_num is non-zero and pairwise distinct.
+    // The mirror invariant — `image_obj_nums[idx] == images[idx].ref.obj_num`
+    // — is checked via the public `imageObjectNum` getter (which reads
+    // `image_obj_nums`) and by re-fetching the entry's `ref.obj_num`
+    // via `images.items` slice access. This is a pair-assertion in the
+    // TigerStyle sense.
+    var nums: [16]u32 = undefined;
+    var k: u32 = 0;
+    while (k < actual_n) : (k += 1) {
+        const num = reg.imageObjectNum(handles[k]);
+        if (num == 0) return error.PdfResourcesImageObjNumZero;
+        // Pair: cross-check against the entry-side mirror.
+        const entry_num = reg.images.items[@intFromEnum(handles[k])].ref.obj_num;
+        if (entry_num != num) return error.PdfResourcesImageObjNumMirrorBroken;
+        nums[k] = num;
+    }
+    // Pairwise distinctness across handles.
+    var p: u32 = 0;
+    while (p < actual_n) : (p += 1) {
+        var q: u32 = p + 1;
+        while (q < actual_n) : (q += 1) {
+            if (nums[p] == nums[q]) return error.PdfResourcesImageObjNumDup;
+        }
+    }
+}
+
+/// T3 — freeze-after-assign negative-space invariant. Register some
+/// builtin fonts + images, run `assignFontObjectNumbers`, then assert
+/// every subsequent mutating call returns
+/// `error.ObjectNumbersAlreadyAssigned`. Crucially: `registerImage`
+/// also rejects post-assign even though `assignFontObjectNumbers` is
+/// the call that flipped the flag — the registry treats font + image
+/// freeze as a single epoch.
+fn fuzzPdfResourcesFreezeAfterAssign(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var reg = pdf_resources.ResourceRegistry.init(allocator);
+    defer reg.deinit();
+
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+
+    // Register 0..8 random builtin fonts.
+    const n_fonts = rng.intRangeAtMost(u32, 0, 8);
+    var i: u32 = 0;
+    while (i < n_fonts) : (i += 1) {
+        _ = try reg.registerBuiltinFont(randomBuiltinFont(rng));
+    }
+    const fonts_before = reg.fontCount();
+
+    // Register 0..8 images.
+    const n_imgs = rng.intRangeAtMost(u32, 0, 8);
+    var j: u32 = 0;
+    while (j < n_imgs) : (j += 1) {
+        const ref = try synthRandomImageRef(rng, allocator);
+        _ = reg.registerImage(ref) catch |err| {
+            allocator.free(ref.bytes);
+            return err;
+        };
+    }
+    const imgs_before = reg.imageCount();
+
+    // Freeze the registry. After this returns, all mutating font ops
+    // must reject. Image side: `registerImage` checks the same flag,
+    // so it also rejects. (The semantic asymmetry that
+    // `assignImageObjectNumbers` does NOT flip the flag is documented
+    // in src/pdf_resources.zig:378 — the caller is expected to drive
+    // the freeze through the font path. We don't assert on that side.)
+    try reg.assignFontObjectNumbers(&w);
+
+    // Negative-space invariant 1: font register rejects.
+    const new_font = randomBuiltinFont(rng);
+    if (reg.registerBuiltinFont(new_font)) |_| {
+        return error.PdfResourcesFontRegisterAcceptedAfterFreeze;
+    } else |err| switch (err) {
+        error.ObjectNumbersAlreadyAssigned => {},
+        else => return err,
+    }
+
+    // Negative-space invariant 2: assign-twice rejects.
+    if (reg.assignFontObjectNumbers(&w)) |_| {
+        return error.PdfResourcesAssignTwiceAccepted;
+    } else |err| switch (err) {
+        error.ObjectNumbersAlreadyAssigned => {},
+        else => return err,
+    }
+
+    // Negative-space invariant 3: image register rejects (shared epoch).
+    // The bytes we tried to hand off were never owned by the registry,
+    // so we must free them ourselves.
+    const ref = try synthRandomImageRef(rng, allocator);
+    if (reg.registerImage(ref)) |_| {
+        return error.PdfResourcesImageRegisterAcceptedAfterFreeze;
+    } else |err| switch (err) {
+        error.ObjectNumbersAlreadyAssigned => {
+            allocator.free(ref.bytes);
+        },
+        else => {
+            allocator.free(ref.bytes);
+            return err;
+        },
+    }
+
+    // Positive-space invariant: counts are unchanged after the
+    // rejected calls. The registry must NOT half-commit on rejection.
+    if (reg.fontCount() != fonts_before) return error.PdfResourcesFontCountChangedAfterFreeze;
+    if (reg.imageCount() != imgs_before) return error.PdfResourcesImageCountChangedAfterFreeze;
+
+    // Positive-space invariant: all assigned font obj_nums are non-zero
+    // and pairwise distinct.
+    if (fonts_before > 0) {
+        // Iterate the parallel `font_obj_nums` slice via the public
+        // accessor on each handle. Handles are dense `0..fonts_before`.
+        var nums_buf: [8]u32 = undefined;
+        var f: u32 = 0;
+        while (f < fonts_before) : (f += 1) {
+            const handle: pdf_resources.FontHandle = @enumFromInt(f);
+            const num = reg.fontObjectNum(handle);
+            if (num == 0) return error.PdfResourcesFontObjNumZero;
+            nums_buf[f] = num;
+        }
+        var x: u32 = 0;
+        while (x < fonts_before) : (x += 1) {
+            var y: u32 = x + 1;
+            while (y < fonts_before) : (y += 1) {
+                if (nums_buf[x] == nums_buf[y]) {
+                    return error.PdfResourcesFontObjNumDup;
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
