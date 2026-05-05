@@ -48,6 +48,7 @@ const struct_writer = @import("struct_writer.zig");
 const mcid_resolver = @import("mcid_resolver.zig");
 const pagetree = @import("pagetree.zig");
 const outline = @import("outline.zig");
+const font_embedder = @import("font_embedder.zig");
 
 // ============================================================================
 // Target registry
@@ -513,6 +514,26 @@ const TARGETS = [_]Target{
     .{ .name = "xmp_level_view_total", .run = fuzzXmpLevelViewTotal },
     .{ .name = "xmp_escape_utf8_storm", .run = fuzzXmpEscapeUtf8Storm },
     .{ .name = "xmp_emit_level_pair_consistency", .run = fuzzXmpEmitLevelPairConsistency },
+    // Iter-24 (audit/fuzz_loop_state.md row 7 — font_embedder.zig). Drives
+    // the full Type0/CID-Font/FontDescriptor/FontFile2/ToUnicode/CIDToGIDMap
+    // emit pipeline against a deterministic-but-parametrised minimal TTF
+    // synthesised inline (`buildMinimalTtf`). Iters 22 + 23 shied away from
+    // /System/Library/Fonts because that fixture isn't reproducible across
+    // machines; an inline generator pins the bytes.
+    //
+    // SUT-independent invariants asserted on the emitted PDF bytes:
+    //   - All six reserved object numbers appear as `N 0 obj` headers
+    //     exactly once each, balanced by `endobj` count.
+    //   - The Type0 wrapper carries `/Type /Font /Subtype /Type0`,
+    //     `/Encoding /Identity-H`, `/DescendantFonts [<cid_obj> 0 R]`,
+    //     and `/ToUnicode <to_unicode_obj> 0 R`.
+    //   - The CIDFontType2 dict carries `/Subtype /CIDFontType2`,
+    //     `/CIDSystemInfo`, `/CIDToGIDMap <cidmap_obj> 0 R`, and a
+    //     `/W [...]` array containing every kept old-GID (= CID).
+    //   - The FontDescriptor carries `/FontFile2 <fontfile_obj> 0 R`.
+    //   - The BaseFont 6-letter prefix (A..Z) appears verbatim before
+    //     every `/BaseFont /` and `/FontName /` occurrence.
+    .{ .name = "font_embedder_emit_minimal_ttf", .run = fuzzFontEmbedderEmitMinimalTtf },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -1667,6 +1688,357 @@ fn fuzzJpegMetaRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []
     }
 }
 
+// ============================================================================
+// Iter-24 — font_embedder.zig deep fuzz (audit/fuzz_loop_state.md row 7)
+// ============================================================================
+//
+// `font_embedder.emit()` assembles five (six with /CIDToGIDMap) PDF objects
+// from a parsed TrueType font. Iters 22 + 23 deferred this module because
+// the in-tree truetype tests open `/System/Library/Fonts/Monaco.ttf` —
+// machine-dependent, not deterministic, not reproducible at 100k iters.
+//
+// Fix: synthesise a minimal valid TTF inline. `buildMinimalTtf` produces
+// a parametrised 8-table font (head, maxp, cmap, glyf, loca, hhea, hmtx,
+// name + offset table) with a fixed-shape Format-4 cmap that maps three
+// ASCII codepoints to GIDs 1, 2, 3 (with .notdef = 0). The harness then
+// drives `truetype.parse` → `font_embedder.init` → `rememberCodepoint`
+// (random subset of {A, B, C}) → `assignObjectNumbers` → `emit` and
+// asserts SUT-independent invariants on the emitted bytes.
+
+const FE_TTF_BUF_LEN: usize = 2048;
+
+/// Build a minimal-but-valid TrueType font in `out`. Returns the emitted
+/// length. `num_glyphs` ∈ [2, 4] gives the parametrisation: glyph 0 is
+/// always .notdef; glyphs 1..num_glyphs-1 are empty (zero-byte) outline
+/// glyphs that the cmap maps from ASCII 'A' onward. The cmap covers
+/// exactly num_glyphs - 1 codepoints (so the maximum GID emitted by the
+/// cmap is num_glyphs - 1, never out of range). All offsets are bounds-
+/// checked so the fuzz harness fails fast if the generator drifts; we
+/// want crashes to land in the SUT, not the generator.
+fn buildMinimalTtf(out: []u8, num_glyphs_in: u8) error{TtfBufTooSmall}!usize {
+    std.debug.assert(num_glyphs_in >= 2);
+    std.debug.assert(num_glyphs_in <= 4);
+
+    const num_glyphs: u16 = num_glyphs_in;
+    const num_tables: u16 = 8;
+
+    // Pre-compute table body sizes (unpadded). Tag-ascending order:
+    //   cmap, glyf, head, hhea, hmtx, loca, maxp, name.
+    // Format-4 cmap: 4-byte cmap index + 8-byte encoding record + Format-4
+    // subtable. Subtable: header (14 bytes) + endCount[seg] + reservedPad(2)
+    // + startCount[seg] + idDelta[seg] + idRangeOffset[seg].
+    // We use seg_count = 2: one segment for ['A' .. 'A' + num_glyphs - 1]
+    // (mapping by id_delta) plus the mandatory terminator [0xFFFF, 0xFFFF].
+    const seg_count: u16 = 2;
+    const f4_subtable_len: usize = 14 + 2 * @as(usize, seg_count) * 4 + 2;
+    const cmap_len: usize = 4 + 8 + f4_subtable_len;
+    const glyf_len: usize = 4; // 4-byte pad for empty .notdef
+    const head_len: usize = 54;
+    const hhea_len: usize = 36;
+    const hmtx_len: usize = @as(usize, num_glyphs) * 4;
+    const loca_len: usize = (@as(usize, num_glyphs) + 1) * 2; // short format
+    const maxp_len: usize = 6;
+    const name_len: usize = 6 + 12 + 8; // 1 record, 8-byte string "Test\x00\x00\x00\x00"
+
+    const Tbl = struct { tag: u32, len: usize };
+    const tables = [_]Tbl{
+        .{ .tag = truetype.TableTag.cmap, .len = cmap_len },
+        .{ .tag = truetype.TableTag.glyf, .len = glyf_len },
+        .{ .tag = truetype.TableTag.head, .len = head_len },
+        .{ .tag = truetype.TableTag.hhea, .len = hhea_len },
+        .{ .tag = truetype.TableTag.hmtx, .len = hmtx_len },
+        .{ .tag = truetype.TableTag.loca, .len = loca_len },
+        .{ .tag = truetype.TableTag.maxp, .len = maxp_len },
+        .{ .tag = truetype.TableTag.name, .len = name_len },
+    };
+
+    const dir_len: usize = 12 + @as(usize, num_tables) * 16;
+    var total: usize = dir_len;
+    var offsets: [8]usize = undefined;
+    var padded: [8]usize = undefined;
+    for (tables, 0..) |t, i| {
+        offsets[i] = total;
+        const p = (t.len + 3) & ~@as(usize, 3);
+        padded[i] = p;
+        total += p;
+    }
+    if (total > out.len) return error.TtfBufTooSmall;
+    @memset(out[0..total], 0);
+
+    // Offset table.
+    std.mem.writeInt(u32, out[0..4], 0x00010000, .big);
+    std.mem.writeInt(u16, out[4..6], num_tables, .big);
+    std.mem.writeInt(u16, out[6..8], 64, .big); // searchRange
+    std.mem.writeInt(u16, out[8..10], 3, .big); // entrySelector
+    std.mem.writeInt(u16, out[10..12], 64, .big); // rangeShift
+
+    // Directory records (tag, checksum=0 placeholder, offset, length).
+    for (tables, 0..) |t, i| {
+        const r = 12 + i * 16;
+        std.mem.writeInt(u32, out[r..][0..4], t.tag, .big);
+        std.mem.writeInt(u32, out[r + 4 ..][0..4], 0, .big);
+        std.mem.writeInt(u32, out[r + 8 ..][0..4], @intCast(offsets[i]), .big);
+        std.mem.writeInt(u32, out[r + 12 ..][0..4], @intCast(t.len), .big);
+    }
+
+    // Body writers — each receives its own slice.
+    // cmap (offsets[0]).
+    {
+        const cmap_off = offsets[0];
+        const cmap = out[cmap_off..][0..cmap_len];
+        std.mem.writeInt(u16, cmap[0..2], 0, .big); // version
+        std.mem.writeInt(u16, cmap[2..4], 1, .big); // numTables
+        std.mem.writeInt(u16, cmap[4..6], 3, .big); // platformID = MS
+        std.mem.writeInt(u16, cmap[6..8], 1, .big); // encodingID = Unicode BMP
+        std.mem.writeInt(u32, cmap[8..12], 12, .big); // subtable offset
+
+        const sub = cmap[12..][0..f4_subtable_len];
+        std.mem.writeInt(u16, sub[0..2], 4, .big); // format
+        std.mem.writeInt(u16, sub[2..4], @intCast(f4_subtable_len), .big);
+        std.mem.writeInt(u16, sub[4..6], 0, .big); // language
+        std.mem.writeInt(u16, sub[6..8], seg_count * 2, .big);
+        std.mem.writeInt(u16, sub[8..10], 4, .big); // searchRange
+        std.mem.writeInt(u16, sub[10..12], 1, .big); // entrySelector
+        std.mem.writeInt(u16, sub[12..14], 0, .big); // rangeShift
+
+        const end_off: usize = 14;
+        const start_off: usize = end_off + 2 * @as(usize, seg_count) + 2;
+        const delta_off: usize = start_off + 2 * @as(usize, seg_count);
+        const ro_off: usize = delta_off + 2 * @as(usize, seg_count);
+
+        // Segment 0: ['A' .. 'A' + num_glyphs - 1] with id_delta so
+        // GID = code + delta (mod 65536). delta = 1 - 'A' for GID 1..n.
+        // seg0 covers `num_glyphs - 1` codepoints starting at 'A', which
+        // map via id_delta to GIDs 1..num_glyphs-1. The maximum GID
+        // emitted is num_glyphs - 1, strictly < num_glyphs.
+        const seg0_start: u16 = 'A';
+        const seg0_end: u16 = @intCast(@as(u16, 'A') + num_glyphs - 2);
+        const seg0_delta_i: i16 = 1 - @as(i16, 'A');
+        const seg0_delta: u16 = @bitCast(seg0_delta_i);
+
+        std.mem.writeInt(u16, sub[end_off..][0..2], seg0_end, .big);
+        std.mem.writeInt(u16, sub[end_off + 2 ..][0..2], 0xFFFF, .big);
+        // start codes (after reservedPad).
+        std.mem.writeInt(u16, sub[start_off..][0..2], seg0_start, .big);
+        std.mem.writeInt(u16, sub[start_off + 2 ..][0..2], 0xFFFF, .big);
+        std.mem.writeInt(u16, sub[delta_off..][0..2], seg0_delta, .big);
+        std.mem.writeInt(u16, sub[delta_off + 2 ..][0..2], 1, .big);
+        std.mem.writeInt(u16, sub[ro_off..][0..2], 0, .big);
+        std.mem.writeInt(u16, sub[ro_off + 2 ..][0..2], 0, .big);
+    }
+
+    // glyf (offsets[1]) — already zeroed (4-byte pad), all glyphs are empty.
+
+    // head (offsets[2]).
+    {
+        const h = out[offsets[2]..][0..head_len];
+        std.mem.writeInt(u32, h[0..4], 0x00010000, .big); // version
+        std.mem.writeInt(u32, h[4..8], 0x00010000, .big); // fontRevision
+        std.mem.writeInt(u32, h[8..12], 0, .big); // checkSumAdjustment (recompute later if used)
+        std.mem.writeInt(u32, h[12..16], 0x5F0F3CF5, .big); // magicNumber
+        std.mem.writeInt(u16, h[16..18], 0, .big); // flags
+        std.mem.writeInt(u16, h[18..20], 1000, .big); // unitsPerEm
+        // created/modified (8 bytes each) — leave zero.
+        std.mem.writeInt(i16, h[36..38], 0, .big); // xMin
+        std.mem.writeInt(i16, h[38..40], 0, .big); // yMin
+        std.mem.writeInt(i16, h[40..42], 1000, .big); // xMax
+        std.mem.writeInt(i16, h[42..44], 1000, .big); // yMax
+        std.mem.writeInt(u16, h[44..46], 0, .big); // macStyle
+        std.mem.writeInt(u16, h[46..48], 8, .big); // lowestRecPPEM
+        std.mem.writeInt(i16, h[48..50], 2, .big); // fontDirectionHint
+        std.mem.writeInt(i16, h[50..52], 0, .big); // indexToLocFormat = 0 (short)
+        std.mem.writeInt(i16, h[52..54], 0, .big); // glyphDataFormat
+    }
+
+    // hhea (offsets[3]).
+    {
+        const h = out[offsets[3]..][0..hhea_len];
+        std.mem.writeInt(u32, h[0..4], 0x00010000, .big); // version
+        std.mem.writeInt(i16, h[4..6], 800, .big); // ascender
+        std.mem.writeInt(i16, h[6..8], -200, .big); // descender
+        std.mem.writeInt(i16, h[8..10], 100, .big); // lineGap
+        std.mem.writeInt(u16, h[10..12], 1000, .big); // advanceWidthMax
+        // remaining fields (12..34) zeroed.
+        std.mem.writeInt(u16, h[34..36], num_glyphs, .big); // numLongHMetrics
+    }
+
+    // hmtx (offsets[4]) — `num_glyphs` long metrics, advance=500, lsb=0.
+    {
+        const h = out[offsets[4]..][0..hmtx_len];
+        var i: u16 = 0;
+        while (i < num_glyphs) : (i += 1) {
+            std.mem.writeInt(u16, h[@as(usize, i) * 4 ..][0..2], 500, .big);
+            std.mem.writeInt(i16, h[@as(usize, i) * 4 + 2 ..][0..2], 0, .big);
+        }
+    }
+
+    // loca (offsets[5]) — short format. All glyphs zero-length:
+    // loca[i] = 0 for i ≤ num_glyphs (since glyf body is just padding).
+    // glyph_offsets[i] = u16 * 2; we write 0 everywhere.
+    @memset(out[offsets[5]..][0..loca_len], 0);
+
+    // maxp (offsets[6]) — version 0.5 (no profile fields).
+    {
+        const m = out[offsets[6]..][0..maxp_len];
+        std.mem.writeInt(u32, m[0..4], 0x00005000, .big); // version 0.5
+        std.mem.writeInt(u16, m[4..6], num_glyphs, .big); // numGlyphs
+    }
+
+    // name (offsets[7]) — 1 record, nameID=6 (PostScript name), Mac Roman.
+    {
+        const n = out[offsets[7]..][0..name_len];
+        const string_storage_off: u16 = 6 + 12; // immediately after the records
+        std.mem.writeInt(u16, n[0..2], 0, .big); // format
+        std.mem.writeInt(u16, n[2..4], 1, .big); // count
+        std.mem.writeInt(u16, n[4..6], string_storage_off, .big); // stringOffset
+
+        // record: platform=1 (Mac), encoding=0 (Roman), language=0,
+        // nameID=6 (PostScript), length=4, offset=0.
+        std.mem.writeInt(u16, n[6..8], 1, .big);
+        std.mem.writeInt(u16, n[8..10], 0, .big);
+        std.mem.writeInt(u16, n[10..12], 0, .big);
+        std.mem.writeInt(u16, n[12..14], 6, .big);
+        std.mem.writeInt(u16, n[14..16], 4, .big);
+        std.mem.writeInt(u16, n[16..18], 0, .big);
+        // String storage: "Test" + 4 zero pad → 8 bytes.
+        @memcpy(n[string_storage_off..][0..4], "Test");
+    }
+
+    return total;
+}
+
+fn fuzzFontEmbedderEmitMinimalTtf(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = seed_pdf;
+    if (scratch.len < FE_TTF_BUF_LEN) return;
+
+    // 1. Parametrise the synth TTF: num_glyphs ∈ [2, 4]. With num_glyphs=N,
+    //    cmap maps codepoints 'A' .. 'A' + N - 2 to GIDs 1 .. N - 1.
+    //    n=1 is excluded because cmap segments cannot be empty.
+    const num_glyphs: u8 = rng.intRangeAtMost(u8, 2, 4);
+    const ttf_len = buildMinimalTtf(scratch[0..FE_TTF_BUF_LEN], num_glyphs) catch
+        return error.FontEmbedderTtfBuildFailed;
+    const ttf = scratch[0..ttf_len];
+
+    // 2. Parse it. A failure here means the generator drifted; surface as
+    //    an invariant violation, NOT an early return.
+    var parsed = truetype.parse(allocator, ttf) catch |e| switch (e) {
+        error.OutOfMemory => return,
+        else => return error.FontEmbedderParseFailed,
+    };
+    defer parsed.deinit(allocator);
+
+    // 3. Construct embedder + remember a random subset of mappable cps.
+    var ref = font_embedder.EmbeddedFontRef.init(allocator, &parsed, "Test") catch return;
+    defer ref.deinit();
+
+    // Optional: drop random codepoints, including some that map to .notdef
+    // (out-of-range from the cmap segment) so the seen-skip branch in emit
+    // gets exercised.
+    const cp_count = rng.intRangeAtMost(usize, 0, 8);
+    var ci: usize = 0;
+    while (ci < cp_count) : (ci += 1) {
+        const choice = rng.intRangeAtMost(u8, 0, 4);
+        const cp: u21 = switch (choice) {
+            0 => 'A',
+            1 => 'B',
+            2 => 'C',
+            3 => 'D',
+            else => @intCast(rng.intRangeAtMost(u32, 0, 0xFFFF)), // mostly .notdef
+        };
+        ref.rememberCodepoint(cp) catch return;
+    }
+
+    // 4. Drive a real pdf_writer.Writer through assignObjectNumbers + emit.
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+    try w.writeHeader();
+
+    font_embedder.assignObjectNumbers(ref, &w) catch |e| switch (e) {
+        error.OutOfMemory => return,
+        else => return e,
+    };
+
+    // Six reserved object numbers MUST all be non-zero and pairwise distinct.
+    const obj_nums = [_]u32{
+        ref.obj_type0,    ref.obj_cid_font,    ref.obj_descriptor,
+        ref.obj_font_file, ref.obj_to_unicode, ref.obj_cid_to_gid_map,
+    };
+    for (obj_nums) |n| {
+        if (n == 0) return error.FontEmbedderObjNumZero;
+    }
+    for (obj_nums, 0..) |a, i| {
+        for (obj_nums[i + 1 ..]) |b| {
+            if (a == b) return error.FontEmbedderObjNumDuplicate;
+        }
+    }
+
+    font_embedder.emit(ref, &w) catch |e| switch (e) {
+        error.OutOfMemory => return,
+        // The minimal-TTF generator is tested exhaustively above; any
+        // structural error from emit() against a parse-validated font is
+        // a finding, not a tolerated failure.
+        else => return e,
+    };
+
+    const emitted = w.buf.written();
+
+    // 5. SUT-independent invariants on the emitted bytes.
+    //
+    // 5a. Each reserved obj_num appears exactly once as `N 0 obj`.
+    var hdr_buf: [32]u8 = undefined;
+    for (obj_nums) |n| {
+        const hdr = std.fmt.bufPrint(&hdr_buf, "{d} 0 obj", .{n}) catch
+            return error.FontEmbedderHdrFmtFailed;
+        const c = std.mem.count(u8, emitted, hdr);
+        if (c != 1) return error.FontEmbedderObjHeaderCountWrong;
+    }
+    // 5b. `endobj` count ≥ 6 (writeHeader emits no objects, every obj must close).
+    if (std.mem.count(u8, emitted, "endobj") < 6) return error.FontEmbedderEndobjCountLow;
+
+    // 5c. Type0 wrapper structural markers.
+    if (std.mem.indexOf(u8, emitted, "/Subtype /Type0") == null)
+        return error.FontEmbedderType0SubtypeMissing;
+    if (std.mem.indexOf(u8, emitted, "/Encoding /Identity-H") == null)
+        return error.FontEmbedderIdentityHMissing;
+    if (std.mem.indexOf(u8, emitted, "/DescendantFonts") == null)
+        return error.FontEmbedderDescendantFontsMissing;
+    if (std.mem.indexOf(u8, emitted, "/ToUnicode") == null)
+        return error.FontEmbedderToUnicodeMissing;
+
+    // 5d. CIDFontType2 structural markers.
+    if (std.mem.indexOf(u8, emitted, "/Subtype /CIDFontType2") == null)
+        return error.FontEmbedderCidFontSubtypeMissing;
+    if (std.mem.indexOf(u8, emitted, "/CIDSystemInfo") == null)
+        return error.FontEmbedderCidSystemInfoMissing;
+    if (std.mem.indexOf(u8, emitted, "/CIDToGIDMap") == null)
+        return error.FontEmbedderCidToGidMapMissing;
+    if (std.mem.indexOf(u8, emitted, "/W [") == null)
+        return error.FontEmbedderWidthsMissing;
+
+    // 5e. FontDescriptor.
+    if (std.mem.indexOf(u8, emitted, "/Type /FontDescriptor") == null)
+        return error.FontEmbedderFontDescriptorMissing;
+    if (std.mem.indexOf(u8, emitted, "/FontFile2") == null)
+        return error.FontEmbedderFontFile2Missing;
+
+    // 5f. The 6-letter A..Z subset prefix MUST be byte-equal to ref.base_font[0..6]
+    //     and appear at every BaseFont/FontName slot. Three slots use
+    //     `/<prefix>+Test`: Type0, CIDFontType2, FontDescriptor.
+    const prefix = ref.base_font[0..6];
+    for (prefix) |b| {
+        if (b < 'A' or b > 'Z') return error.FontEmbedderPrefixNotUppercase;
+    }
+    var name_buf: [16]u8 = undefined;
+    const full_name = std.fmt.bufPrint(&name_buf, "/{s}+Test", .{prefix}) catch
+        return error.FontEmbedderNameFmtFailed;
+    if (std.mem.count(u8, emitted, full_name) < 3)
+        return error.FontEmbedderBaseFontNameCountLow;
+}
 
 // ============================================================================
 // Targets — decompress.zig (defense-in-depth)
