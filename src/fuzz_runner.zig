@@ -344,6 +344,31 @@ const TARGETS = [_]Target{
     .{ .name = "mcid_resolver_resolve_one_oracle", .run = fuzzMcidResolverResolveOneOracle },
     .{ .name = "mcid_resolver_resolve_batch_parallel", .run = fuzzMcidResolverResolveBatchParallel },
     .{ .name = "mcid_resolver_parse_struct_tree_with_text", .run = fuzzMcidResolverParseStructTreeWithText },
+    // Iter-17 (audit/fuzz_loop_state.md row 17 — pdf_writer.zig).
+    // Iter-4 already round-tripped the writer via DocumentBuilder ↔
+    // Document; that exercises the *composition* path. Iter-17 hits
+    // the writer's own escape + indirect-ref machinery at unit level
+    // (no DocumentBuilder, no extractor). Three default-gate targets:
+    //   T1 (`pdf_writer_name_escape_roundtrip`): random-byte name →
+    //     writeName → parser.parseObject → assert byte-identical
+    //     recovery. Probes the `#XX` hex-escape table and the
+    //     delimiter set at writer side AND the parser's
+    //     `decodeNameEscapes` symmetry.
+    //   T2 (`pdf_writer_string_escape_roundtrip`): random bytes
+    //     including `(` `)` `\\` NUL CR LF BS FF HT through both
+    //     writeStringLiteral and writeStringHex; parser.parseObject
+    //     recovers them byte-identically. Hex form is a control —
+    //     it has no escape rules so any divergence is on the
+    //     literal-form escape side.
+    //   T3 (`pdf_writer_xref_byte_offsets`): allocate N (1..16)
+    //     objects, emit each at a known byte position, write xref,
+    //     then parse the emitted xref table and assert every `n`
+    //     entry's offset equals the actual `N 0 obj` byte offset
+    //     in the buffer. SUT-independent oracle: the writer must
+    //     not lie about where it put each object.
+    .{ .name = "pdf_writer_name_escape_roundtrip", .run = fuzzPdfWriterNameEscapeRoundtrip },
+    .{ .name = "pdf_writer_string_escape_roundtrip", .run = fuzzPdfWriterStringEscapeRoundtrip },
+    .{ .name = "pdf_writer_xref_byte_offsets", .run = fuzzPdfWriterXrefByteOffsets },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -5449,6 +5474,331 @@ fn fuzzMcidResolverParseStructTreeWithText(
 
     if (td_count != 6) return error.McidResolverTreeWalkBadTdCount;
     for (seen) |s| if (!s) return error.McidResolverTreeWalkMissingLabel;
+}
+
+// ============================================================================
+// iter-17 — pdf_writer.zig escape + indirect-ref machinery (row 17)
+// ============================================================================
+
+/// T1 — random-byte name round-trip via parser.
+///
+/// Build a random byte sequence (length 0..64) covering the
+/// problematic PDF name-syntax bytes — delimiters `( ) < > [ ] { } / %`,
+/// whitespace, `#` (escape sigil itself), and 0x00..0x20 / 0x7f..0xff
+/// — then call `Writer.writeName(bytes)` and parse the emitted bytes
+/// back via `parser.Parser.parseObject`. The parser's
+/// `decodeNameEscapes` MUST recover the original byte sequence
+/// verbatim.
+///
+/// SUT-independent invariants:
+///   - Emitted bytes start with `/` and contain only printable
+///     ASCII in `[0x21, 0x7e]` (writer must escape everything else).
+///   - Parser yields `Object.name` whose bytes equal the input.
+///   - Empty-name (`bytes.len == 0`) emits exactly `/` and parses
+///     to a zero-length name.
+fn fuzzPdfWriterNameEscapeRoundtrip(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = seed_pdf;
+
+    // Random length 0..64. Build a biased byte pool that maximises
+    // the probability of hitting the writer's escape branch. PDF
+    // §7.3.5: a name byte is "regular" iff in [0x21, 0x7e] AND not
+    // in the delimiter set AND not `#`. Anything else MUST escape.
+    const name_len = rng.intRangeAtMost(usize, 0, 64);
+    if (name_len > scratch.len) return;
+    const name_bytes = scratch[0..name_len];
+
+    for (name_bytes) |*b| {
+        const choice = rng.intRangeAtMost(u8, 0, 7);
+        b.* = switch (choice) {
+            0 => '(',
+            1 => ')',
+            2 => '<',
+            3 => '/',
+            4 => '#',
+            5 => 0x00, // NUL — must escape
+            6 => rng.intRangeAtMost(u8, 0x80, 0xff), // high-bit
+            else => rng.intRangeAtMost(u8, 0x21, 0x7e), // mostly-regular
+        };
+    }
+
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+    try w.writeName(name_bytes);
+    const emitted = w.buf.written();
+
+    // Invariant 1: emission shape.
+    if (emitted.len == 0 or emitted[0] != '/') {
+        return error.PdfWriterNameMissingSlash;
+    }
+    // Invariant 2: every emitted byte after `/` is in printable ASCII.
+    // The writer is a one-shot emitter — anything outside [0x21, 0x7e]
+    // is a writer bug regardless of input.
+    for (emitted[1..]) |b| {
+        if (b < 0x21 or b > 0x7e) return error.PdfWriterNameEmittedNonPrintable;
+    }
+
+    // Round-trip via parser.
+    var p = parser.Parser.init(allocator, emitted);
+    const obj = try p.parseObject();
+    switch (obj) {
+        .name => |decoded| {
+            // Invariant 3: byte-identical recovery.
+            if (decoded.len != name_bytes.len) {
+                return error.PdfWriterNameRoundtripLenMismatch;
+            }
+            if (!std.mem.eql(u8, decoded, name_bytes)) {
+                return error.PdfWriterNameRoundtripBytesMismatch;
+            }
+        },
+        else => return error.PdfWriterNameParserReturnedNonName,
+    }
+}
+
+/// T2 — random-byte string round-trip through both literal and hex forms.
+///
+/// PDF §7.3.4.2 (literal) and §7.3.4.3 (hex) are independent encodings
+/// of the same byte payload. The writer escapes literals
+/// (`(` → `\(`, etc.) but emits hex strings byte-for-byte as `<XX…>`.
+/// Round-trip via `parser.Parser.parseObject` MUST recover the input
+/// verbatim from BOTH forms; any divergence pinpoints the literal-form
+/// escape table (since hex has no such table to misuse).
+///
+/// SUT-independent invariants:
+///   - Literal emission begins with `(` and ends with `)`.
+///   - Hex emission begins with `<` and ends with `>`.
+///   - Parser yields `Object.string` (literal) or `Object.hex_string`
+///     (hex) whose bytes equal the input.
+///   - Both forms recover identical payloads.
+fn fuzzPdfWriterStringEscapeRoundtrip(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = seed_pdf;
+
+    // Random length 0..96 with a payload biased toward the seven
+    // literal-form metachars `(` `)` `\\` `\n` `\r` `\t` plus NUL,
+    // BS, FF, and high-bit bytes. The remainder fills with regular
+    // ASCII so the parser's main loop also runs.
+    const slen = rng.intRangeAtMost(usize, 0, 96);
+    if (slen > scratch.len) return;
+    const payload = scratch[0..slen];
+    for (payload) |*b| {
+        const choice = rng.intRangeAtMost(u8, 0, 11);
+        b.* = switch (choice) {
+            0 => '(',
+            1 => ')',
+            2 => '\\',
+            3 => '\n',
+            4 => '\r',
+            5 => '\t',
+            6 => 0x00, // NUL
+            7 => 0x08, // BS
+            8 => 0x0c, // FF
+            9 => rng.intRangeAtMost(u8, 0x80, 0xff), // high-bit
+            else => rng.intRangeAtMost(u8, 0x20, 0x7e), // printable
+        };
+    }
+
+    // ---------- literal form ----------
+    {
+        var w = pdf_writer.Writer.init(allocator);
+        defer w.deinit();
+        try w.writeStringLiteral(payload);
+        const emitted = w.buf.written();
+        if (emitted.len < 2 or emitted[0] != '(' or emitted[emitted.len - 1] != ')') {
+            return error.PdfWriterStringLiteralFraming;
+        }
+        var p = parser.Parser.init(allocator, emitted);
+        const obj = try p.parseObject();
+        switch (obj) {
+            .string => |decoded| {
+                defer allocator.free(decoded);
+                if (decoded.len != payload.len) {
+                    return error.PdfWriterStringLiteralLenMismatch;
+                }
+                if (!std.mem.eql(u8, decoded, payload)) {
+                    return error.PdfWriterStringLiteralBytesMismatch;
+                }
+            },
+            else => return error.PdfWriterStringLiteralParserKind,
+        }
+    }
+
+    // ---------- hex form ----------
+    {
+        var w = pdf_writer.Writer.init(allocator);
+        defer w.deinit();
+        try w.writeStringHex(payload);
+        const emitted = w.buf.written();
+        if (emitted.len < 2 or emitted[0] != '<' or emitted[emitted.len - 1] != '>') {
+            return error.PdfWriterStringHexFraming;
+        }
+        // Each input byte = 2 emitted hex chars + the surrounding < >.
+        if (emitted.len != payload.len * 2 + 2) {
+            return error.PdfWriterStringHexUnexpectedLen;
+        }
+        var p = parser.Parser.init(allocator, emitted);
+        const obj = try p.parseObject();
+        switch (obj) {
+            .hex_string => |decoded| {
+                defer allocator.free(decoded);
+                if (decoded.len != payload.len) {
+                    return error.PdfWriterStringHexLenMismatch;
+                }
+                if (!std.mem.eql(u8, decoded, payload)) {
+                    return error.PdfWriterStringHexBytesMismatch;
+                }
+            },
+            else => return error.PdfWriterStringHexParserKind,
+        }
+    }
+}
+
+/// T3 — xref byte-offset accounting.
+///
+/// Allocate N (1..16) objects, emit each one at a writer-tracked
+/// byte position with a small random body, write the xref, and
+/// then parse the emitted `xref` block. For every `n` entry, the
+/// 10-digit offset MUST match the actual byte offset of the
+/// corresponding `N 0 obj` token in the writer's buffer.
+///
+/// This is an independent SUT-independent oracle on the writer's
+/// own bookkeeping — `beginObject` records `self.buf.written().len`
+/// (pdf_writer.zig:194), and the xref emitter prints that field
+/// (pdf_writer.zig:447). T3 walks the buffer once independently,
+/// finds each `N 0 obj` token by scanning, and asserts the recorded
+/// offset agrees with the scan.
+///
+/// Invariants:
+///   - `writeXref` returns the byte offset of the literal `xref` token.
+///   - The xref body has exactly `N+1` 20-byte entries (object 0
+///     plus the N allocated objects).
+///   - Object 0's entry starts with `0000000000 65535 f`.
+///   - Every `n` entry's leading 10 digits parse as the byte offset
+///     of `N 0 obj` in the buffer (SUT-independent scan).
+///   - Object numbers are assigned monotonically 1..N.
+fn fuzzPdfWriterXrefByteOffsets(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = seed_pdf;
+
+    const n_objects = rng.intRangeAtMost(usize, 1, 16);
+
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+    try w.writeHeader();
+
+    // Track each object's byte offset as we go. Independent of the
+    // writer's internal bookkeeping — we capture `buf.written().len`
+    // immediately before `beginObject`.
+    var expected_offsets: [16]u64 = undefined;
+    var obj_nums: [16]u32 = undefined;
+
+    for (0..n_objects) |i| {
+        const num = try w.allocObjectNum();
+        obj_nums[i] = num;
+        expected_offsets[i] = w.buf.written().len;
+        try w.beginObject(num, 0);
+        // Tiny random body — `K /<int>` style content. Length 4..16
+        // bytes, kept inside the printable-ASCII band so writeRaw
+        // doesn't trip the xref offset accounting (the offset is
+        // recorded BEFORE the body is written, so body content
+        // shouldn't matter, but feed varied data to broaden coverage
+        // of the buf.writer.print path).
+        const body_len = rng.intRangeAtMost(usize, 4, 16);
+        if (body_len > scratch.len) return;
+        for (scratch[0..body_len]) |*b| {
+            b.* = rng.intRangeAtMost(u8, 0x20, 0x7e);
+            // Avoid bytes that would derail the parser if it ever
+            // tried to read this body (it won't here — we only walk
+            // the xref). Keeps the buffer ASCII-clean for debugging.
+            if (b.* == '(' or b.* == ')' or b.* == '<' or b.* == '>') b.* = 'X';
+        }
+        try w.writeRaw(scratch[0..body_len]);
+        try w.endObject();
+    }
+
+    // Use object 1 (always emitted) as the trailer's /Root.
+    const xref_offset = try w.writeXref();
+    try w.writeTrailer(xref_offset, obj_nums[0], null);
+    const bytes = try w.finalize();
+    defer allocator.free(bytes);
+
+    // Invariant: monotonic numbering 1..N.
+    for (obj_nums[0..n_objects], 0..) |num, i| {
+        const expected: u32 = @intCast(i + 1);
+        if (num != expected) return error.PdfWriterXrefNonMonotonicNum;
+    }
+
+    // Independent scan: the byte-offset reported by the Writer for
+    // object i must equal the position of the literal `N 0 obj`
+    // token in the finalized buffer.
+    for (obj_nums[0..n_objects], 0..) |num, i| {
+        var token_buf: [32]u8 = undefined;
+        const token = try std.fmt.bufPrint(&token_buf, "{d} 0 obj", .{num});
+        const found = std.mem.indexOf(u8, bytes, token) orelse {
+            return error.PdfWriterXrefObjectTokenMissing;
+        };
+        if (found != @as(usize, @intCast(expected_offsets[i]))) {
+            return error.PdfWriterXrefOffsetMismatch;
+        }
+    }
+
+    // Locate `xref\n` in the finalized buffer and confirm the
+    // returned offset agrees.
+    const xref_pos = std.mem.indexOf(u8, bytes, "xref\n") orelse {
+        return error.PdfWriterXrefTokenMissing;
+    };
+    if (xref_pos != @as(usize, @intCast(xref_offset))) {
+        return error.PdfWriterXrefReturnedOffsetMismatch;
+    }
+
+    // Walk the xref body. The header is `xref\n0 N+1\n`; each entry
+    // is 20 bytes (10 offset digits, ' ', 5 generation digits, ' ',
+    // 'n' or 'f', ' ', '\n').
+    const xref_body_start = blk: {
+        // Skip `xref\n`.
+        var p = xref_pos + "xref\n".len;
+        // Skip `0 N+1\n` line.
+        const nl = std.mem.indexOfScalarPos(u8, bytes, p, '\n') orelse
+            return error.PdfWriterXrefMissingSubsection;
+        p = nl + 1;
+        break :blk p;
+    };
+
+    // Object 0 is the free-list head: `0000000000 65535 f \n`.
+    if (xref_body_start + 20 > bytes.len) return error.PdfWriterXrefBodyTooShort;
+    const obj0_entry = bytes[xref_body_start .. xref_body_start + 20];
+    if (!std.mem.startsWith(u8, obj0_entry, "0000000000 65535 f")) {
+        return error.PdfWriterXrefObj0Malformed;
+    }
+
+    // Now N data entries. Each MUST report the captured
+    // `expected_offsets[i]`.
+    for (0..n_objects) |i| {
+        const off = xref_body_start + 20 + i * 20;
+        if (off + 20 > bytes.len) return error.PdfWriterXrefEntryOutOfRange;
+        const entry = bytes[off .. off + 20];
+        if (entry[entry.len - 4] != ' ' or entry[entry.len - 3] != 'n') {
+            return error.PdfWriterXrefEntryNotInUse;
+        }
+        const reported = std.fmt.parseInt(u64, entry[0..10], 10) catch {
+            return error.PdfWriterXrefEntryBadOffset;
+        };
+        if (reported != expected_offsets[i]) {
+            return error.PdfWriterXrefRecordedOffsetMismatch;
+        }
+    }
 }
 
 // ============================================================================
