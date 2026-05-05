@@ -118,6 +118,17 @@ const TARGETS = [_]Target{
     // directly, instead of going through the lattice geometry layer.
     .{ .name = "interpreter_random_ops", .run = fuzzInterpreterRandomOps },
     .{ .name = "interpreter_bdc_emc_nesting", .run = fuzzInterpreterBdcEmcNesting },
+    // Iter-4 (audit/fuzz_loop_state.md tier 3 — round-trip / property fuzz)
+    // — DocumentBuilder.write() ↔ Document.openFromMemory ↔ extractMarkdown
+    // — exercises the full writer ↔ reader pipeline (xref, page tree,
+    // builtin font dict, content stream, text-extraction state machine).
+    // Today's fuzz coverage of this seam is asymmetric: random PDFs flow
+    // through `pdf_open_random` (read-only) and the seed-mutation targets,
+    // but no target builds a valid PDF from a randomized in-memory tree
+    // and asserts an algebraic emit→reparse→equal property.
+    .{ .name = "writer_drawtext_roundtrip", .run = fuzzWriterDrawTextRoundtrip },
+    .{ .name = "writer_multipage_count", .run = fuzzWriterMultipageCount },
+    .{ .name = "writer_text_escape_roundtrip", .run = fuzzWriterTextEscapeRoundtrip },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -1851,6 +1862,213 @@ fn fuzzInterpreterBdcEmcNesting(rng: std.Random, allocator: std.mem.Allocator, s
     defer allocator.free(md);
 
     if (!std.unicode.utf8ValidateSlice(md)) return error.InterpreterMarkdownInvalidUtf8;
+}
+
+// ============================================================================
+// Iter-4 — DocumentBuilder ↔ Document round-trip (tier 3, audit/fuzz_loop_state.md)
+// ============================================================================
+
+/// Round-trip property: build a single-page PDF with N drawn-text strings
+/// → Document.openFromMemory → extractMarkdown → assert every drawn string
+/// is present in the extracted markdown.
+///
+/// Inputs constrained to printable ASCII (0x20..0x7E excluding the PDF
+/// metachars `( ) \`) so the WinAnsi-filter doesn't drop bytes and the
+/// drawn string survives intact through escape→content-stream→reparse.
+/// Metachar coverage lives in the dedicated escape-roundtrip target so a
+/// failure in either path points at the correct seam.
+///
+/// What this exercises:
+///   - PageBuilder.drawText escape path (parens, backslashes are excluded
+///     here on purpose to keep the equality check unambiguous)
+///   - DocumentBuilder.write xref + page-tree assembly
+///   - Document.openFromMemory parser end-to-end on a writer-produced doc
+///   - extractMarkdown text-extraction on a builtin Helvetica page
+///
+/// Invariants:
+///   - written bytes start with the PDF magic
+///   - reopen succeeds (`openFromMemory` does not return an error)
+///   - pageCount() == 1
+///   - extracted markdown is valid UTF-8
+///   - every drawn string appears as a substring of the extracted markdown
+fn fuzzWriterDrawTextRoundtrip(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+
+    // 1..4 strings per page; each 4..16 bytes of alphanumeric ASCII.
+    // Restricted to [A-Za-z0-9] because the extractor is markdown-shape-
+    // aware: a drawn `*foo*` re-emerges as `**foo**` (or italic markers),
+    // a leading `# ` becomes a heading prefix, etc. Those are *correct*
+    // round-trips at the markdown layer but break the byte-identical
+    // substring assertion this target encodes. The PDF metachars
+    // `(` / `)` / `\\` are exercised by the dedicated escape-roundtrip
+    // target below.
+    const safe_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const n_strings = rng.intRangeAtMost(usize, 1, 4);
+
+    var emitted: [4][]u8 = undefined;
+    var emitted_count: usize = 0;
+    defer for (emitted[0..emitted_count]) |s| allocator.free(s);
+
+    var y: f64 = 700.0;
+    for (0..n_strings) |i| {
+        const slen = rng.intRangeAtMost(usize, 4, 16);
+        const buf = try allocator.alloc(u8, slen);
+        emitted[i] = buf;
+        emitted_count += 1;
+        for (buf) |*b| b.* = safe_charset[rng.intRangeAtMost(usize, 0, safe_charset.len - 1)];
+        try page.drawText(50.0, y, .helvetica, 12.0, buf);
+        y -= 20.0;
+    }
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    // Postcondition: writer emits a valid PDF prefix.
+    if (bytes.len < 5 or !std.mem.startsWith(u8, bytes, "%PDF-")) {
+        return error.WriterOutputMissingMagic;
+    }
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+    if (d.pageCount() != 1) return error.WriterPageCountMismatch;
+
+    const md = try d.extractMarkdown(0, allocator);
+    defer allocator.free(md);
+    if (!std.unicode.utf8ValidateSlice(md)) return error.WriterMarkdownInvalidUtf8;
+
+    for (emitted[0..emitted_count]) |s| {
+        if (std.mem.indexOf(u8, md, s) == null) {
+            return error.WriterDrawnTextNotFoundInMarkdown;
+        }
+    }
+}
+
+/// Round-trip property: build a PDF with a random number of pages
+/// (1..16), each with a random media-box and one drawn label, then
+/// reopen and verify the page count round-trips exactly + every page
+/// extracts without parser error.
+///
+/// What this exercises:
+///   - balanced page-tree assembly (the writer chooses /Kids structure
+///     based on page count; up to 16 forces > 1 internal node)
+///   - varying media-box rectangles (writer real-number formatter)
+///   - extractMarkdown on every page (page-cache state stability)
+///
+/// Invariants:
+///   - openFromMemory succeeds
+///   - pageCount() == n_pages
+///   - every page's extractMarkdown succeeds + returns valid UTF-8
+fn fuzzWriterMultipageCount(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const n_pages = rng.intRangeAtMost(usize, 1, 16);
+
+    // Vary the media-box per page within a sensible PDF-real range
+    // (0..2400 pt — the spec's UserUnit-1 ceiling for letter-class
+    // media). Width / height kept ≥ 100 pt so drawText coords are valid.
+    for (0..n_pages) |i| {
+        const w = 100.0 + rng.float(f64) * 2300.0;
+        const h = 100.0 + rng.float(f64) * 2300.0;
+        const page = try doc.addPage(.{ 0.0, 0.0, w, h });
+        // Draw a per-page label so each page has a non-empty content
+        // stream — extractMarkdown on a page with zero text returns "",
+        // which is a valid but uninteresting round-trip.
+        var label_buf: [16]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buf, "P{d}", .{i});
+        try page.drawText(20.0, h - 40.0, .helvetica, 10.0, label);
+    }
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+    if (d.pageCount() != n_pages) return error.WriterPageCountMismatch;
+
+    var idx: usize = 0;
+    while (idx < n_pages) : (idx += 1) {
+        const md = try d.extractMarkdown(idx, allocator);
+        defer allocator.free(md);
+        if (!std.unicode.utf8ValidateSlice(md)) return error.WriterMarkdownInvalidUtf8;
+    }
+}
+
+/// Round-trip property focused on the PDF text-string escape rules:
+/// `(`, `)`, `\` must be escaped on the writer side and unescaped on
+/// the reader side. Builds a single-page PDF with a randomized string
+/// containing a random sprinkling of metachars, writes, reopens, and
+/// asserts the drawn text appears verbatim in the extracted *raw text*
+/// (not markdown — the markdown layer applies its own escaping pass
+/// over `\\`/`*`/`_` etc., which would mask a real PDF-escape bug).
+///
+/// What this exercises:
+///   - drawText's metachar-escape path on inputs that actually contain
+///     metachars (the round-trip target above intentionally avoids them
+///     so a failure here pinpoints the escape seam)
+///   - the parser's PDF literal-string unescaper (interpreter.zig
+///     parseStringLiteral / parseLiteralString)
+///   - extractText writer-streaming surface
+///
+/// Invariants:
+///   - reopen succeeds, pageCount() == 1
+///   - extracted raw text contains the originally-drawn string verbatim
+fn fuzzWriterTextEscapeRoundtrip(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // Build a 4..32 byte string biased toward the three PDF metachars
+    // `(`, `)`, `\` (each ~1/8 probability) interleaved with safe
+    // alphanumerics. Restricted to [A-Za-z0-9] (plus the three
+    // metachars) so the round-trip equality test exercises the PDF
+    // text-string escape seam without confounding with the markdown
+    // layer's punctuation handling.
+    const safe_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const slen = rng.intRangeAtMost(usize, 4, 32);
+    if (slen > scratch.len) return;
+    for (scratch[0..slen]) |*b| {
+        const choice = rng.intRangeAtMost(u8, 0, 7);
+        b.* = switch (choice) {
+            0 => '(',
+            1 => ')',
+            2 => '\\',
+            else => safe_charset[rng.intRangeAtMost(usize, 0, safe_charset.len - 1)],
+        };
+    }
+    const drawn = scratch[0..slen];
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+    try page.drawText(50.0, 700.0, .helvetica, 12.0, drawn);
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+    if (d.pageCount() != 1) return error.WriterPageCountMismatch;
+
+    // Stream raw extracted text into an Allocating writer — bypasses
+    // the markdown layer (which would re-escape backslashes / asterisks
+    // / underscores and break a byte-identical comparison even though
+    // the PDF round-trip itself was correct).
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try d.extractText(0, &aw.writer);
+    const raw = aw.written();
+    if (!std.unicode.utf8ValidateSlice(raw)) return error.WriterRawTextInvalidUtf8;
+
+    if (std.mem.indexOf(u8, raw, drawn) == null) {
+        return error.WriterEscapedTextNotFoundInRawText;
+    }
 }
 
 // ============================================================================

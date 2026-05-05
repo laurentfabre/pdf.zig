@@ -110,7 +110,7 @@ the raw-bytes boundary and only deeper-API or stateful fuzzing remains.
 | 14 | `xmp_writer.zig` | already byte-fuzzed; deepen `levelView` corner cases | byte-input | |
 | 15 | `markdown.zig` | the markdown parser itself (not just `renderTagged`) | only via tokenizer_realistic_md | |
 | 16 | `markdown_to_pdf.zig` | already byte-fuzzed (`markdown_render_tagged`); deepen `renderCore(tagged=false)` | byte-input | |
-| 17 | `pdf_writer.zig` | low-level Writer — escape + indirect refs | none | |
+| 17 | `pdf_writer.zig` | low-level Writer — escape + indirect refs | iter-4 done — 3 default-gate round-trip targets via DocumentBuilder ↔ Document; no findings | ✅ iter 4 |
 | 18 | `pdf_resources.zig` | resource registry (font/image/colorspace handles) | none | |
 | 19 | `pagetree.zig` | balanced page-tree assembly | none | |
 | 20 | `outline.zig` | bookmarks tree | none | |
@@ -127,7 +127,7 @@ the raw-bytes boundary and only deeper-API or stateful fuzzing remains.
 | 1 | 2026-05-05 | decompress.zig | decompress_ascii_hex_random · decompress_runlength_random · decompress_ascii85_roundtrip (aggressive) | **YES — Finding 005**: u32 overflow in `decodeASCII85` at src/decompress.zig:386. Aggressive-gated; default-gate clean. | within noise (full bench rerun pending; per-target wall ASCIIHex 9.9 s, RunLength 11.2 s at 100k — close to subagent's 10.0/11.5 s) | #76 |
 | 2 | 2026-05-05 | parser.zig (Parser.parseObject / parseIndirectObject / initAt) | parser_object_pdfish · parser_indirect_object_random · parser_init_at_offset_random | none — all three targets clean at 100k iters in ReleaseSafe | parser targets at 100k iters: pdfish 155 ms, indirect 16 ms, initAt 4 ms (full bench rerun pending) | #76 |
 | 3 | 2026-05-05 | interpreter.zig (content-stream operators) | interpreter_random_ops · interpreter_bdc_emc_nesting | **YES — Finding 006**: `ContentInterpreter(Writer)` is 0.16-stale (managed-ArrayList API at interpreter.zig:103 + 172). Compile-time only; no user-reachable runtime impact (the type is public surface but unused — extractContentStream drives ContentLexer directly). | iter-3 targets at 100k: random_ops 6.0 s, bdc_emc 17.0 s | #76 |
-| 4 | TBD | tier-3 round-trip on a v1.6 module not yet at tier 3 | TBD | TBD | TBD | TBD |
+| 4 | 2026-05-05 | pdf_writer / DocumentBuilder ↔ Document round-trip (tier 3) | writer_drawtext_roundtrip · writer_multipage_count · writer_text_escape_roundtrip | none — all 3 default-gate targets clean at 100k iters in ReleaseSafe | iter-4 targets at 100k: drawtext_roundtrip 12.2 s · multipage_count 53.6 s · text_escape_roundtrip 8.3 s | #76 |
 
 ## Rules the loop must obey
 
