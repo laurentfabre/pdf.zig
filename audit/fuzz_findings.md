@@ -71,26 +71,46 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 
 ---
 
-## Default-gate clean targets (11 / 11 at 200k iters, 1M run in progress)
+## Default-gate clean targets (23 / 23 at 1M iters — v1.6 closeout pass, 2026-05-05)
 
-| Target | 200k iters wall time |
-|---|---|
-| tokenizer_count | 4.1 s |
-| stream_json_string | 26.8 s |
-| stream_envelope_meta | 1.1 s |
-| stream_envelope_page | 12.2 s |
-| chunk_break_finder | 31.9 s |
-| cli_parse_args | 21 ms |
-| cli_page_range | 30 ms |
-| pdf_open_random | 155 ms |
-| pdf_open_magic_prefix | 155 ms |
-| pdf_extract_seed_repeat | 1.2 s |
-| tokenizer_realistic_md | 3.1 s |
-| **Total** | **80.7 s** |
+23 default-gated targets clean at 1M iterations each. Full sweep: **43 min 36 s wall** on macOS arm64 / Debug build, base seed `0x19df6d9ca62`, no panics, no invariant violations.
+
+| Target | 1M iters wall time | Notes |
+|---|---|---|
+| tokenizer_count | 44.0 s | streaming layer |
+| stream_json_string | 505.2 s | streaming layer |
+| stream_envelope_meta | 23.8 s | streaming layer |
+| stream_envelope_page | 178.8 s | streaming layer |
+| chunk_break_finder | 606.2 s | streaming layer |
+| cli_parse_args | 0.7 s | CLI |
+| cli_page_range | 2.0 s | CLI |
+| pdf_open_random | 5.2 s | parser |
+| pdf_open_magic_prefix | 5.2 s | parser |
+| pdf_extract_seed_repeat | 104.2 s | parser, seed-rotated |
+| tokenizer_realistic_md | 195.4 s | tokenizer + chunk |
+| lattice_content_random | 59.5 s | lattice Pass B (Form XObject) |
+| lattice_form_xobject_mutation | 65.8 s | lattice Pass B mutation |
+| tagged_table_mutation | 7.6 s | Pass A (tagged-table cells via MCID) |
+| link_continuations_random | 2.0 s | Pass D continuation-link bbox |
+| lattice_pass_b_spans | 22.3 s | Pass B (lattice cells via glyph-center ∩ bbox) |
+| **xmp_escape_xml** | **89.0 s** | **v1.6 PR-W10a — XML escape post-conditions** |
+| **xmp_emit_random** | **40.8 s** | **v1.6 PR-W10a — XMP packet structural invariants** |
+| **encrypt_roundtrip_rc4** | **251.6 s** | **v1.6 PR-W9 — RC4-128 encrypt/decrypt round-trip** |
+| **encrypt_roundtrip_aes** | **273.6 s** | **v1.6 PR-W9 — AES-128 encrypt/decrypt round-trip + IV/padding shape** |
+| **markdown_render_tagged** | **118.6 s** | **v1.6 PR-W10d — renderTagged → reopen-via-parser round-trip** |
+| **truetype_parse_random** | **7.4 s** | **v1.6 PR-W7 — TTF parser robustness on adversarial bytes** |
+| **jpeg_meta_random** | **7.3 s** | **v1.6 PR-W8 — JPEG SOF/SOI parser robustness** |
+| **Total** | **2616.3 s (43 min 36 s)** | |
 
 Aggressive-mode targets (`PDFZIG_FUZZ_AGGRESSIVE=1`):
 - `pdf_open_mutation` — 50k iters, 1.7 s, clean
-- `pdf_extract_mutation` — 50k iters, 1.8 s, clean
+- `pdf_extract_mutation` — 50k iters, 1.8 s, clean (`seed_pool[0]`-pinned per Finding 004)
+
+The seven **bold** targets were added during the v1.6 closeout fuzz pass (2026-05-05) to cover writer-side modules introduced in PR-W7…W10 + PR-W10d (font embedder, image XObject + JPEG metadata, encryption, XMP /Metadata, markdown auto-tagging). The structtree / a11y_emitter / attr_flattener / mcid_resolver / struct_writer surfaces are exercised end-to-end by `pdf_extract_seed_repeat` over the 4-PDF seed pool — they consume parsed `StructElement` graphs rather than raw bytes, so byte-level fuzzing offers no incremental signal beyond the existing unit tests + FailingAllocator sweeps.
+
+### Discoveries during the v1.6 fuzz pass
+
+- **`markdown_render_tagged` v1 false-positive (resolved in-pass).** First draft of the harness counted raw `BDC` / `EMC` substring occurrences in the emitted PDF and asserted parity. PR-W4 (FlateDecode on content streams) makes those substrings appear inside compressed bytes, so 72 / 100k iters tripped a structural-mismatch invariant that was actually noise. Replaced with a stronger `Document.openFromMemory` + `pageCount > 0` round-trip check; the parser is the authoritative validator of the emitted bytes' structure.
 
 ---
 

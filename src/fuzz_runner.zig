@@ -25,6 +25,11 @@ const tokenizer = @import("tokenizer.zig");
 const cli = @import("cli_pdfzig.zig");
 const lattice = @import("lattice.zig");
 const layout = @import("layout.zig");
+const xmp_writer = @import("xmp_writer.zig");
+const encrypt_writer = @import("encrypt_writer.zig");
+const markdown_to_pdf = @import("markdown_to_pdf.zig");
+const truetype = @import("truetype.zig");
+const jpeg_meta = @import("jpeg_meta.zig");
 
 // ============================================================================
 // Target registry
@@ -64,6 +69,14 @@ const TARGETS = [_]Target{
     .{ .name = "tagged_table_mutation", .run = fuzzTaggedTableMutation },
     .{ .name = "link_continuations_random", .run = fuzzLinkContinuationsRandom },
     .{ .name = "lattice_pass_b_spans", .run = fuzzLatticePassBSpans },
+    // v1.6 module surface (writer + a11y).
+    .{ .name = "xmp_escape_xml", .run = fuzzXmpEscapeXml },
+    .{ .name = "xmp_emit_random", .run = fuzzXmpEmitRandom },
+    .{ .name = "encrypt_roundtrip_rc4", .run = fuzzEncryptRoundtripRc4 },
+    .{ .name = "encrypt_roundtrip_aes", .run = fuzzEncryptRoundtripAes },
+    .{ .name = "markdown_render_tagged", .run = fuzzMarkdownRenderTagged },
+    .{ .name = "truetype_parse_random", .run = fuzzTruetypeParseRandom },
+    .{ .name = "jpeg_meta_random", .run = fuzzJpegMetaRandom },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -731,6 +744,249 @@ fn fuzzLatticePassBSpans(rng: std.Random, allocator: std.mem.Allocator, scratch:
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// Targets — v1.6 module surface (xmp_writer / encrypt_writer / markdown_to_pdf
+// / truetype / jpeg_meta)
+// ============================================================================
+
+fn fuzzXmpEscapeXml(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const len = rng.intRangeAtMost(usize, 0, scratch.len);
+    rng.bytes(scratch[0..len]);
+
+    const out = try xmp_writer.escapeXml(allocator, scratch[0..len]);
+    defer allocator.free(out);
+
+    // Postcondition (per xmp_writer.zig docstring): no unescaped predefined
+    // entities and no forbidden C0 controls. CR (0x0D), LF (0x0A), TAB
+    // (0x09) are the only sub-0x20 bytes that may pass through.
+    for (out) |c| switch (c) {
+        '<', '>', '"', '\'' => return error.XmpEscapeLeakedMetachar,
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => return error.XmpEscapeLeakedC0,
+        else => {},
+    };
+
+    // `&` is legal in output only as part of a `&entity;` sequence. Any bare
+    // `&` not followed by [a-z]+; signals a missed escape.
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, out, i, '&')) |pos| {
+        const tail = out[pos..];
+        const valid_entities = [_][]const u8{ "&amp;", "&lt;", "&gt;", "&quot;", "&apos;" };
+        var matched = false;
+        for (valid_entities) |e| {
+            if (std.mem.startsWith(u8, tail, e)) {
+                matched = true;
+                i = pos + e.len;
+                break;
+            }
+        }
+        if (!matched) return error.XmpEscapeBareAmpersand;
+    }
+}
+
+fn fuzzXmpEmitRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // Pick a tag. 75% of the time bias toward a valid PDF/A level so the
+    // bulk of iters exercise `emit()` rather than the levelView early-bail;
+    // the other 25% feed adversarial bytes to keep `levelView` covered.
+    var tag_buf: [3]u8 = undefined;
+    const view = blk: {
+        if (rng.float(f32) < 0.75) {
+            tag_buf[0] = "abu"[rng.intRangeAtMost(usize, 0, 2)];
+            tag_buf[1] = "123"[rng.intRangeAtMost(usize, 0, 2)];
+            break :blk xmp_writer.levelView(tag_buf[0..2]) catch unreachable;
+        }
+        const tag_len = rng.intRangeAtMost(usize, 0, tag_buf.len);
+        rng.bytes(tag_buf[0..tag_len]);
+        break :blk xmp_writer.levelView(tag_buf[0..tag_len]) catch return;
+    };
+
+    // Carve scratch into three field slices (some may be null). Each is
+    // sized within MAX_FIELD_BYTES so we exercise both bounded and over-
+    // sized lengths.
+    const half = scratch.len / 2;
+    const title_len = rng.intRangeAtMost(usize, 0, half);
+    const author_len = rng.intRangeAtMost(usize, 0, half - half / 2);
+    const subject_len = rng.intRangeAtMost(usize, 0, scratch.len - title_len - author_len);
+    rng.bytes(scratch[0 .. title_len + author_len + subject_len]);
+
+    const title: ?[]const u8 = if (rng.boolean()) scratch[0..title_len] else null;
+    const author: ?[]const u8 = if (rng.boolean()) scratch[title_len .. title_len + author_len] else null;
+    const subject: ?[]const u8 = if (rng.boolean()) scratch[title_len + author_len .. title_len + author_len + subject_len] else null;
+
+    const bytes = xmp_writer.emit(allocator, view, .{
+        .title = title,
+        .author = author,
+        .subject = subject,
+    }) catch |e| switch (e) {
+        error.OutOfMemory, error.XmpPacketTooLarge => return,
+    };
+    defer allocator.free(bytes);
+
+    if (bytes.len > xmp_writer.MAX_PACKET_BYTES) return error.XmpPacketExceedsCap;
+    if (!std.mem.startsWith(u8, bytes, "<?xpacket begin=")) return error.XmpMissingPacketBegin;
+    if (!std.mem.endsWith(u8, bytes, "<?xpacket end=\"w\"?>")) return error.XmpMissingPacketEnd;
+    if (std.mem.indexOf(u8, bytes, "<pdfaid:part>") == null) return error.XmpMissingPdfAidPart;
+    if (std.mem.indexOf(u8, bytes, "<pdfaid:conformance>") == null) return error.XmpMissingPdfAidConformance;
+}
+
+fn fuzzEncryptRoundtripRc4(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    return encryptRoundtripCommon(rng, allocator, scratch, seed_pdf, .rc4_v2_r3_128);
+}
+
+fn fuzzEncryptRoundtripAes(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    return encryptRoundtripCommon(rng, allocator, scratch, seed_pdf, .aes_v4_r4_128);
+}
+
+fn encryptRoundtripCommon(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+    algorithm: encrypt_writer.Algorithm,
+) anyerror!void {
+    _ = seed_pdf;
+
+    // 32-byte cap on user/owner passwords matches the PDF spec — the algo
+    // pads or truncates internally, but we still want fuzzed lengths.
+    var user_pw_buf: [40]u8 = undefined;
+    var owner_pw_buf: [40]u8 = undefined;
+    const user_pw_len = rng.intRangeAtMost(usize, 0, user_pw_buf.len);
+    const owner_pw_len = rng.intRangeAtMost(usize, 0, owner_pw_buf.len);
+    rng.bytes(user_pw_buf[0..user_pw_len]);
+    rng.bytes(owner_pw_buf[0..owner_pw_len]);
+
+    var file_id: [16]u8 = undefined;
+    rng.bytes(&file_id);
+
+    var ctx = try encrypt_writer.EncryptionContext.deriveFromPasswords(
+        allocator,
+        algorithm,
+        user_pw_buf[0..user_pw_len],
+        owner_pw_buf[0..owner_pw_len],
+        .{},
+        file_id,
+        rng,
+    );
+    defer ctx.deinit();
+
+    // Random plaintext — sometimes empty, sometimes a non-trivial run.
+    const plaintext_len = rng.intRangeAtMost(usize, 0, scratch.len);
+    rng.bytes(scratch[0..plaintext_len]);
+    const plaintext = scratch[0..plaintext_len];
+
+    // Random object/generation pair — these affect the per-object key.
+    const obj_num = rng.int(u32);
+    const gen = rng.int(u16);
+
+    const ciphertext = try ctx.encryptString(obj_num, gen, plaintext, allocator);
+    defer allocator.free(ciphertext);
+
+    const recovered = try ctx.decryptString(obj_num, gen, ciphertext, allocator);
+    defer allocator.free(recovered);
+
+    if (!std.mem.eql(u8, plaintext, recovered)) return error.EncryptRoundtripMismatch;
+
+    // RC4: ciphertext length must match plaintext length (no IV/padding).
+    // AES: ciphertext = 16-byte IV + PKCS#7-padded plaintext, multiple of 16.
+    switch (algorithm) {
+        .rc4_v2_r3_128 => {
+            if (ciphertext.len != plaintext.len) return error.EncryptRc4LengthChanged;
+        },
+        .aes_v4_r4_128 => {
+            if (ciphertext.len < 16) return error.EncryptAesShortCiphertext;
+            if ((ciphertext.len - 16) % 16 != 0) return error.EncryptAesUnpaddedCiphertext;
+        },
+    }
+}
+
+fn fuzzMarkdownRenderTagged(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // Cap input at 2 KiB — renderTagged synthesises one PDF page per
+    // newline in the worst case, so unbounded markdown blows past the
+    // page-tree depth budget without surfacing fresh bugs.
+    const len = rng.intRangeAtMost(usize, 0, @min(scratch.len, 2048));
+    rng.bytes(scratch[0..len]);
+
+    const bytes = markdown_to_pdf.renderTagged(allocator, null, scratch[0..len]) catch |e| switch (e) {
+        error.OutOfMemory => return,
+        else => return e,
+    };
+    defer allocator.free(bytes);
+
+    if (!std.mem.startsWith(u8, bytes, "%PDF-")) return error.MarkdownRenderMissingMagic;
+    if (std.mem.indexOf(u8, bytes, "%%EOF") == null) return error.MarkdownRenderMissingEof;
+
+    // Substring counts of "BDC"/"EMC" are unreliable since PR-W4 enabled
+    // FlateDecode on content streams (compressed bytes will incidentally
+    // hit those substrings). Stronger structural check: re-open the
+    // emitted bytes with the parser. A renderTagged output that the
+    // reader cannot open is a structural bug; an open with `pageCount > 0`
+    // is the round-trip property we want.
+    const doc = zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.default()) catch
+        return error.MarkdownRenderUnreadable;
+    defer doc.close();
+    if (doc.pageCount() == 0) return error.MarkdownRenderZeroPages;
+}
+
+fn fuzzTruetypeParseRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // A real TTF starts with a 4-byte sfnt version (0x00010000 or "OTTO").
+    // Half the time we plant one of those magics so the parser advances
+    // past the offset table; the other half stays fully random to
+    // exercise the early-bail path.
+    const len = rng.intRangeAtMost(usize, 0, scratch.len);
+    rng.bytes(scratch[0..len]);
+    if (len >= 4 and rng.boolean()) {
+        const magics = [_][4]u8{
+            .{ 0x00, 0x01, 0x00, 0x00 },
+            .{ 'O', 'T', 'T', 'O' },
+            .{ 't', 'r', 'u', 'e' },
+        };
+        const m = magics[rng.intRangeAtMost(usize, 0, magics.len - 1)];
+        @memcpy(scratch[0..4], &m);
+    }
+
+    var font = truetype.parse(allocator, scratch[0..len]) catch |e| switch (e) {
+        error.OutOfMemory => return,
+        else => return,
+    };
+    defer font.deinit(allocator);
+    // Surviving the parse is the invariant; the success path is exercised
+    // by truetype.zig's own tests on a real TTF fixture.
+}
+
+fn fuzzJpegMetaRandom(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = allocator;
+    _ = seed_pdf;
+
+    // JPEG SOI is FF D8 FF — half the time we plant it so the parser
+    // advances past the header.
+    const len = rng.intRangeAtMost(usize, 0, scratch.len);
+    rng.bytes(scratch[0..len]);
+    if (len >= 3 and rng.boolean()) {
+        scratch[0] = 0xFF;
+        scratch[1] = 0xD8;
+        scratch[2] = 0xFF;
+    }
+
+    const meta = jpeg_meta.parse(scratch[0..len]) catch return;
+
+    // On success: width/height must be > 0, bits_per_component in
+    // {1, 8, 12, 16}, color_space ∈ {gray, rgb, cmyk}.
+    if (meta.width == 0 or meta.height == 0) return error.JpegMetaZeroDim;
+    switch (meta.bits_per_component) {
+        1, 8, 12, 16 => {},
+        else => return error.JpegMetaUnknownBpc,
+    }
+    switch (meta.colorspace) {
+        .gray, .rgb, .cmyk => {},
     }
 }
 
