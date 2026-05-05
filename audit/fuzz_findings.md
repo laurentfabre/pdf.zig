@@ -522,6 +522,73 @@ Trips at iter ≤ 1k in Debug. Stack frame ordering: `start → main → fuzzIma
 
 ---
 
+## Finding 011 — `EncryptionContext.authenticateOwner` panics on adversarial owner-pw / file_id triples
+
+**Surfaced by:** iter-20 of the fuzz loop (`audit/fuzz_loop_state.md` row 9 deepen).
+**Target:** `encrypt_authenticate_owner_recovers_key` (gated `reproducer_only`).
+**Severity:** Medium — reachable via attacker-controlled writer-side inputs.
+
+### Behaviour
+
+`EncryptionContext.authenticateOwner` (src/encrypt_writer.zig:417) panics in
+ReleaseSafe / Debug with no MISMATCH error returned and no stack frame past
+the call. The panic happens on the `recovered_user_padded → authenticateUser`
+recursive path (lines 476-487 in `encrypt_writer.zig`), where the
+suffix-strip heuristic carves a `user_pwd_len ≤ 32` slice from the RC4-
+decrypted /O bytes and feeds it back into `authenticateUser`. The panic
+fires inside that recursive call before either error path can return.
+
+### Repro
+
+```sh
+PDFZIG_FUZZ_ITERS=4000 \
+PDFZIG_FUZZ_TARGET=encrypt_authenticate_owner_recovers_key \
+PDFZIG_FUZZ_SEED=0x1 \
+~/.zvm/bin/zig build fuzz
+```
+
+Trips between iter 3000 and iter 4000 deterministically at SEED=0x1 in Debug.
+The 7th call into the target body (the immediately-prior `[T2-call]` log
+line, stripped before commit) had inputs:
+
+- algorithm: `aes_v4_r4_128`
+- user_pw (11 B): `a6138bf0ac947bf6f99031`
+- owner_pw (14 B): `420ec58781b6b7370e1fae56b81f`
+- file_id: `29e4110dc2b9bb02101111d0923f1a99`
+- expected file_key: `86c056cb5465053812c2b750ff98f2ea`
+
+### Why `reproducer_only`
+
+The bug surfaces deterministically at modest iters; running it inside the
+default sweep would abort otherwise-clean PDFZIG_FUZZ_AGGRESSIVE=0 runs.
+The two sibling targets (`encrypt_authenticate_user_roundtrip`,
+`encrypt_authenticate_random_o_u`) are both 100k clean — the panic is
+isolated to the V/R3 owner-decrypt → recursive authenticateUser path.
+
+### User-facing impact
+
+The /O field comes from the PDF's /Encrypt dict — attacker-supplied. A
+crafted PDF that passes structural validation but carries a hostile /O
+can crash the reader at "open with owner password" time. pdf.zig today
+does not expose a CLI surface for owner-password authentication, so the
+end-user impact is limited to library callers; promote target back to
+default-gate after the panic site is fixed.
+
+### Recommended next steps (out of scope for iter-20)
+
+1. Add an internal `std.debug.print` bracket inside `authenticateOwner`
+   (around line 482's recursive call) to pinpoint the panicking line.
+2. Investigate length-confusion on the suffix-strip: when the decrypted
+   /O bytes happen to match PASSWORD_PAD's tail for many positions, the
+   carved password slice may walk into territory that triggers an
+   `@intCast` or pointer-arithmetic trap downstream.
+3. Add explicit `assert(user_pwd_len <= 32);` and
+   `assert(recovered.len == algorithm.keyLen());` near the recursive
+   authenticate call so the failure surfaces at the contract violation
+   site, not opaque-stack-frame.
+
+---
+
 ## Reproducer index
 
 - `audit/fuzz_corpus_crash_001.bin` — the 643-byte mutated PDF that initially caused the false-positive harness segfault. Kept as an interesting input even though the crash was harness-side; it is a useful smoke-test PDF for parser robustness (CLI handles it cleanly: `pdf.zig info audit/fuzz_corpus_crash_001.bin` → `pages: 0`).
