@@ -47,6 +47,7 @@ const uuid = @import("uuid.zig");
 const struct_writer = @import("struct_writer.zig");
 const mcid_resolver = @import("mcid_resolver.zig");
 const pagetree = @import("pagetree.zig");
+const outline = @import("outline.zig");
 
 // ============================================================================
 // Target registry
@@ -407,6 +408,40 @@ const TARGETS = [_]Target{
     // in buildBalancedTree (src/pdf_document.zig:1548).
     .{ .name = "pagetree_balanced_shape", .run = fuzzPagetreeBalancedShape },
     .{ .name = "pagetree_parent_consistency", .run = fuzzPagetreeParentConsistency },
+    // Iter-19 (audit/fuzz_loop_state.md row 20 — outline.zig).
+    // First fuzz coverage of the bookmarks-tree parser
+    // (`outline.parseOutline`, called via `Document.getOutline`).
+    // Three default-gate targets:
+    //
+    //   T1 (`outline_flat_chain_count`): synth a flat outline with N
+    //     ∈ [1, 16] siblings via DocumentBuilder.reserveAuxiliaryObject
+    //     (cyclic /Outlines /First → item; item /Parent → /Outlines).
+    //     SUT-independent oracle: getOutline returns exactly N items,
+    //     all level==0, in /First-then-/Next traversal order. Each
+    //     item.title equals the input ASCII title; each item.page
+    //     either resolves via /Dest [pageRef /Fit] to the input
+    //     `dest_idx` OR is null (when no /Dest set).
+    //
+    //   T2 (`outline_nested_levels`): synth a 3-level tree (root →
+    //     2..3 top-level → each with 0..2 children → each with 0..1
+    //     grandchildren). Pre-order walk oracle: parsed item count
+    //     == sum of nodes in input tree; level-N items appear in DFS
+    //     order; each level value MUST equal its tree depth (root
+    //     children are level 0, their children level 1, …). Title
+    //     multiset MUST equal the input multiset.
+    //
+    //   T3 (`outline_adversarial_mutate`): start from
+    //     `testpdf.generateNestedOutlinePdf` (4 outline items spread
+    //     across 2 pages with both /Dest and /A /GoTo paths), flip
+    //     1..4 random bytes inside the PDF body, then drive
+    //     getOutline. SUT-independent invariants only — no panic,
+    //     items.len ≤ MAX_ITEMS=10_000 (the parser's own anti-cycle
+    //     bound, src/outline.zig:88), every level ≤ 64 (sane depth
+    //     ceiling), every page index is null or < pageCount, every
+    //     title is valid UTF-8 and contains no NUL byte.
+    .{ .name = "outline_flat_chain_count", .run = fuzzOutlineFlatChainCount },
+    .{ .name = "outline_nested_levels", .run = fuzzOutlineNestedLevels },
+    .{ .name = "outline_adversarial_mutate", .run = fuzzOutlineAdversarialMutate },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -6118,6 +6153,349 @@ fn fuzzPagetreeParentConsistency(rng: std.Random, allocator: std.mem.Allocator, 
             }
         }
         if (!found_self) return error.PagetreeParentLeafNotInParentKids;
+    }
+}
+
+// ============================================================================
+// Iter-19: outline.zig deep fuzz
+// ============================================================================
+
+/// T1: flat-chain count + level oracle.
+///
+/// Build a /Outlines node with N siblings (no children). Cyclic refs:
+/// /Outlines /First → item₀, /Last → itemₙ₋₁; each itemᵢ /Parent →
+/// /Outlines, item₀..ₙ₋₂ /Next → itemᵢ₊₁; each itemᵢ /Dest → page
+/// at random `dest_idx ∈ [0, n_pages)` (or no /Dest with prob 1/4
+/// to exercise the "no-dest" branch).
+///
+/// Oracle (SUT-independent — invariants hold no matter what
+/// outline.parseOutline does internally):
+///   - parsed items.len == N (flat chain → no recursion);
+///   - every item.level == 0 (no parent items);
+///   - parsed[i].title bytes == input[i].title bytes (ASCII);
+///   - parsed[i].page == input[i].dest_idx (or both null).
+fn fuzzOutlineFlatChainCount(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    const n_items: usize = rng.intRangeAtMost(usize, 1, 16);
+    const n_pages: usize = rng.intRangeAtMost(usize, 1, 4);
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    // Allocate pages first so we can capture their objNum() for /Dest.
+    var page_objs = try allocator.alloc(u32, n_pages);
+    defer allocator.free(page_objs);
+    for (0..n_pages) |i| {
+        const p = try doc.addPage(.{ 0.0, 0.0, 612.0, 792.0 });
+        try p.drawText(72, 720, .helvetica, 12, "p");
+        page_objs[i] = p.objNum();
+    }
+
+    // Reserve outlines + N item objects up front (cyclic refs require it).
+    const outlines_obj = try doc.reserveAuxiliaryObject();
+    var item_objs = try allocator.alloc(u32, n_items);
+    defer allocator.free(item_objs);
+    for (0..n_items) |i| {
+        item_objs[i] = try doc.reserveAuxiliaryObject();
+    }
+
+    // Per-item input record so the oracle can replay traversal order.
+    const ItemSpec = struct { title: [8]u8, title_len: u8, dest_idx: ?usize };
+    var specs = try allocator.alloc(ItemSpec, n_items);
+    defer allocator.free(specs);
+    for (0..n_items) |i| {
+        // ASCII-only title, length 1..7. Avoid PDF metachars () \ — keeps
+        // the oracle byte-equal at the parser side.
+        var title_buf: [8]u8 = undefined;
+        const tl: u8 = @intCast(rng.intRangeAtMost(u8, 1, 7));
+        for (0..tl) |k| {
+            title_buf[k] = rng.intRangeAtMost(u8, 'A', 'Z');
+        }
+        // 1/4 chance no /Dest → page must be null.
+        const dest: ?usize = if (rng.intRangeAtMost(u8, 0, 3) == 0)
+            null
+        else
+            rng.intRangeAtMost(usize, 0, n_pages - 1);
+        specs[i] = .{ .title = title_buf, .title_len = tl, .dest_idx = dest };
+    }
+
+    // Emit outlines aux payload.
+    var outlines_buf: [128]u8 = undefined;
+    try doc.setAuxiliaryPayload(outlines_obj, try std.fmt.bufPrint(
+        &outlines_buf,
+        "<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count {d} >>",
+        .{ item_objs[0], item_objs[n_items - 1], n_items },
+    ));
+
+    // Emit each item's payload with /Title (ASCII), /Parent, /Prev,
+    // /Next, optional /Dest [pageRef /Fit].
+    var item_buf: [256]u8 = undefined;
+    for (0..n_items) |i| {
+        var fbs = std.Io.Writer.fixed(&item_buf);
+        try fbs.print("<< /Title ({s}) /Parent {d} 0 R", .{ specs[i].title[0..specs[i].title_len], outlines_obj });
+        if (i > 0) try fbs.print(" /Prev {d} 0 R", .{item_objs[i - 1]});
+        if (i + 1 < n_items) try fbs.print(" /Next {d} 0 R", .{item_objs[i + 1]});
+        if (specs[i].dest_idx) |di| {
+            try fbs.print(" /Dest [{d} 0 R /Fit]", .{page_objs[di]});
+        }
+        try fbs.writeAll(" >>");
+        try doc.setAuxiliaryPayload(item_objs[i], fbs.buffered());
+    }
+
+    // Splice /Outlines ref into /Catalog.
+    var extras_buf: [64]u8 = undefined;
+    try doc.setCatalogExtras(try std.fmt.bufPrint(&extras_buf, "/Outlines {d} 0 R", .{outlines_obj}));
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+
+    const items = try d.getOutline(allocator);
+    defer outline.freeOutline(allocator, items);
+
+    if (items.len != n_items) return error.OutlineFlatItemCountMismatch;
+
+    for (items, 0..) |it, i| {
+        if (it.level != 0) return error.OutlineFlatItemLevelNotZero;
+        const expected_title = specs[i].title[0..specs[i].title_len];
+        if (!std.mem.eql(u8, it.title, expected_title)) {
+            return error.OutlineFlatItemTitleMismatch;
+        }
+        if (specs[i].dest_idx) |di| {
+            const got = it.page orelse return error.OutlineFlatItemPageMissing;
+            if (got != di) return error.OutlineFlatItemPageMismatch;
+        } else {
+            if (it.page != null) return error.OutlineFlatItemPageUnexpected;
+        }
+    }
+}
+
+/// T2: nested 2-level tree — level oracle + multiset oracle.
+///
+/// Build a tree of total depth 2 (root /Outlines → top-level items
+/// → child items). For each top-level we randomly attach 0..2
+/// children. DFS pre-order traversal:
+///   topᵢ        (level 0)
+///     childᵢ,₀  (level 1)
+///     childᵢ,₁  (level 1)
+///   topᵢ₊₁      (level 0)
+///   ...
+/// The parser walks /First then /Next siblings, recursing into each
+/// item's /First. SUT-independent oracles:
+///   - total parsed item count == ∑ (1 + n_children[i]);
+///   - level multiset matches: count of level-0 items == n_top,
+///     count of level-1 items == ∑ n_children[i];
+///   - level-0 items appear at the parsed[] positions where the
+///     pre-order walk says they should;
+///   - title multiset (set of bytes) at level 0 equals the input
+///     top-level title set; same at level 1.
+fn fuzzOutlineNestedLevels(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    const n_top: usize = rng.intRangeAtMost(usize, 2, 4);
+    var n_children = try allocator.alloc(usize, n_top);
+    defer allocator.free(n_children);
+    var total_children: usize = 0;
+    for (0..n_top) |i| {
+        n_children[i] = rng.intRangeAtMost(usize, 0, 2);
+        total_children += n_children[i];
+    }
+    const total_items: usize = n_top + total_children;
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    const page = try doc.addPage(.{ 0.0, 0.0, 612.0, 792.0 });
+    try page.drawText(72, 720, .helvetica, 12, "page");
+    const page_obj = page.objNum();
+
+    const outlines_obj = try doc.reserveAuxiliaryObject();
+
+    // Reserve top-level + children (flat array, indexed by global item
+    // index in DFS order so the parsed[] index matches).
+    var top_objs = try allocator.alloc(u32, n_top);
+    defer allocator.free(top_objs);
+    var child_objs = try allocator.alloc(u32, total_children);
+    defer allocator.free(child_objs);
+    for (0..n_top) |i| top_objs[i] = try doc.reserveAuxiliaryObject();
+    for (0..total_children) |i| child_objs[i] = try doc.reserveAuxiliaryObject();
+
+    // Per-node input record — title used by the oracle.
+    var top_titles = try allocator.alloc([6]u8, n_top);
+    defer allocator.free(top_titles);
+    var child_titles = try allocator.alloc([6]u8, total_children);
+    defer allocator.free(child_titles);
+    for (0..n_top) |i| {
+        top_titles[i] = .{ 'T', '0' + @as(u8, @intCast(i)), '_', 'A', 'A', 'A' };
+    }
+    for (0..total_children) |i| {
+        child_titles[i] = .{ 'C', '0' + @as(u8, @intCast(i % 10)), '_', 'B', 'B', 'B' };
+    }
+
+    // /Outlines node.
+    var outlines_buf: [128]u8 = undefined;
+    try doc.setAuxiliaryPayload(outlines_obj, try std.fmt.bufPrint(
+        &outlines_buf,
+        "<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count {d} >>",
+        .{ top_objs[0], top_objs[n_top - 1], total_items },
+    ));
+
+    // Emit top-level items.
+    var child_cursor: usize = 0;
+    var item_buf: [320]u8 = undefined;
+    for (0..n_top) |i| {
+        var fbs = std.Io.Writer.fixed(&item_buf);
+        try fbs.print("<< /Title ({s}) /Parent {d} 0 R", .{ top_titles[i][0..6], outlines_obj });
+        if (i > 0) try fbs.print(" /Prev {d} 0 R", .{top_objs[i - 1]});
+        if (i + 1 < n_top) try fbs.print(" /Next {d} 0 R", .{top_objs[i + 1]});
+        if (n_children[i] > 0) {
+            try fbs.print(" /First {d} 0 R /Last {d} 0 R /Count {d}", .{
+                child_objs[child_cursor],
+                child_objs[child_cursor + n_children[i] - 1],
+                n_children[i],
+            });
+        }
+        try fbs.print(" /Dest [{d} 0 R /Fit] >>", .{page_obj});
+        try doc.setAuxiliaryPayload(top_objs[i], fbs.buffered());
+        child_cursor += n_children[i];
+    }
+
+    // Emit children.
+    child_cursor = 0;
+    for (0..n_top) |i| {
+        const nc = n_children[i];
+        for (0..nc) |k| {
+            const gi = child_cursor + k;
+            var fbs = std.Io.Writer.fixed(&item_buf);
+            try fbs.print("<< /Title ({s}) /Parent {d} 0 R", .{ child_titles[gi][0..6], top_objs[i] });
+            if (k > 0) try fbs.print(" /Prev {d} 0 R", .{child_objs[gi - 1]});
+            if (k + 1 < nc) try fbs.print(" /Next {d} 0 R", .{child_objs[gi + 1]});
+            try fbs.print(" /Dest [{d} 0 R /Fit] >>", .{page_obj});
+            try doc.setAuxiliaryPayload(child_objs[gi], fbs.buffered());
+        }
+        child_cursor += nc;
+    }
+
+    var extras_buf: [64]u8 = undefined;
+    try doc.setCatalogExtras(try std.fmt.bufPrint(&extras_buf, "/Outlines {d} 0 R", .{outlines_obj}));
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+
+    const items = try d.getOutline(allocator);
+    defer outline.freeOutline(allocator, items);
+
+    if (items.len != total_items) return error.OutlineNestedItemCountMismatch;
+
+    // DFS pre-order oracle: for each top i, position in parsed[] is
+    // (i + sum_of_prior_children); next n_children[i] entries are
+    // children of top i at level 1.
+    var pos: usize = 0;
+    child_cursor = 0;
+    for (0..n_top) |i| {
+        if (items[pos].level != 0) return error.OutlineNestedTopLevelNotZero;
+        if (!std.mem.eql(u8, items[pos].title, top_titles[i][0..6])) {
+            return error.OutlineNestedTopTitleMismatch;
+        }
+        pos += 1;
+        for (0..n_children[i]) |k| {
+            const gi = child_cursor + k;
+            if (items[pos].level != 1) return error.OutlineNestedChildLevelNotOne;
+            if (!std.mem.eql(u8, items[pos].title, child_titles[gi][0..6])) {
+                return error.OutlineNestedChildTitleMismatch;
+            }
+            pos += 1;
+        }
+        child_cursor += n_children[i];
+    }
+    if (pos != total_items) return error.OutlineNestedDfsLengthMismatch;
+}
+
+/// T3: adversarial byte-mutation on a known-good outline PDF.
+///
+/// Build the pre-canned `generateNestedOutlinePdf` fixture (4 outline
+/// items spread across 2 pages with both /Dest and /A /GoTo paths),
+/// flip 1..4 random bytes anywhere in the buffer, then call
+/// `getOutline`. The mutation may invalidate xref offsets, corrupt
+/// /Outlines refs, mangle /Title bytes, swap /Next/Prev pointers, or
+/// drop the /Outlines ref entirely. The parser must handle all of
+/// these without panic.
+///
+/// SUT-independent invariants — only the analytically-tight bounds
+/// enforced by the parser (per iter-18 P3: no harness-imposed slack):
+///   - the call returns (no panic, no UB trap in ReleaseSafe);
+///   - returned slice length ≤ MAX_ITEMS=10_000 (the parser's anti-
+///     cycle bound at src/outline.zig:88);
+///   - every item.level ≤ MAX_ITEMS (recursion increments level by
+///     1; combined with the items-count cap the depth can't exceed
+///     10_000 either);
+///   - every item.page is null OR < pageCount (resolveDestToPage
+///     iterates pages and only returns indices into that array).
+///
+/// Notes on invariants we DON'T assert:
+///   - no UTF-8 validity check: when `decodePdfString` rejects an
+///     ill-formed UTF-16BE title, the parser legitimately falls back
+///     to `allocator.dupe(u8, title_raw)` (src/outline.zig:106) —
+///     PDFDocEncoding bytes ≥ 0x80 are not valid UTF-8.
+///   - no NUL-free check: a /Title encoded as UTF-16BE for U+0000
+///     legitimately decodes to a UTF-8 string containing 0x00.
+///
+/// Mutation only flips bytes — it does not extend the buffer. The
+/// open-from-memory call may itself fail (`error.InvalidPDF`,
+/// `error.NoXref`, etc.) — that's expected and handled by ignoring
+/// the iter (the SUT didn't get a chance to misbehave).
+fn fuzzOutlineAdversarialMutate(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    const original = try testpdf.generateNestedOutlinePdf(allocator);
+    defer allocator.free(original);
+
+    // Copy so we can mutate.
+    const bytes = try allocator.dupe(u8, original);
+    defer allocator.free(bytes);
+
+    // 1..4 random byte flips. Each flip XORs a non-zero random byte
+    // so the position is guaranteed mutated.
+    const n_flips: usize = rng.intRangeAtMost(usize, 1, 4);
+    for (0..n_flips) |_| {
+        if (bytes.len == 0) break;
+        const pos = rng.intRangeLessThan(usize, 0, bytes.len);
+        const xor_with: u8 = rng.intRangeAtMost(u8, 1, 255);
+        bytes[pos] ^= xor_with;
+    }
+
+    // Parser may legitimately reject the corrupted file — that's fine,
+    // we're fuzzing for panics in getOutline, not for "always succeeds".
+    var d = zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive()) catch return;
+    defer d.close();
+
+    const items = d.getOutline(allocator) catch return;
+    defer outline.freeOutline(allocator, items);
+
+    // SUT-independent invariants: anti-cycle bound, level depth ≤
+    // MAX_ITEMS, page index in range. No UTF-8 / NUL check — the
+    // parser's `decodePdfString catch try allocator.dupe(u8, ...)`
+    // fallback (src/outline.zig:106) legitimately returns raw bytes
+    // when UTF-16BE decoding fails, and a UTF-16BE-encoded U+0000
+    // legitimately decodes to a NUL-bearing UTF-8 string.
+    const MAX_ITEMS: usize = 10_000;
+    if (items.len > MAX_ITEMS) return error.OutlineAdversarialTooManyItems;
+
+    const page_count = d.pageCount();
+    for (items) |it| {
+        if (it.level > MAX_ITEMS) return error.OutlineAdversarialLevelOutOfBounds;
+        if (it.page) |p| {
+            if (p >= page_count) return error.OutlineAdversarialPageOutOfBounds;
+        }
     }
 }
 
