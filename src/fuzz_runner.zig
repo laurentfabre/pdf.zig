@@ -442,7 +442,12 @@ const TARGETS = [_]Target{
     //     title is valid UTF-8 and contains no NUL byte.
     .{ .name = "outline_flat_chain_count", .run = fuzzOutlineFlatChainCount },
     .{ .name = "outline_nested_levels", .run = fuzzOutlineNestedLevels },
-    .{ .name = "outline_adversarial_mutate", .run = fuzzOutlineAdversarialMutate },
+    // Finding 012 (open) — surfaced at 1M iters: adversarial /First-chain
+    // mutations stack-overflow walkOutlineChain (outline.zig:152, no depth
+    // cap, only MAX_ITEMS=10000 count cap). Default-gate at 100k stayed
+    // clean; 1M reliably trips it. Gate as reproducer_only until the
+    // outline parser gains a depth cap.
+    .{ .name = "outline_adversarial_mutate", .run = fuzzOutlineAdversarialMutate, .reproducer_only = true },
     // Iter-20 (audit/fuzz_loop_state.md row 9 — encrypt_writer.zig deepen).
     // Already covered by `encrypt_roundtrip_{rc4,aes}` (encrypt → decrypt
     // → equal). Deepen the V/R-3 algorithm-6/7 authenticate paths

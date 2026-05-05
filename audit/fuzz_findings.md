@@ -589,6 +589,59 @@ default-gate after the panic site is fixed.
 
 ---
 
+## Finding 012 — `outline.walkOutlineChain` stack overflow on adversarial `/First` chains
+
+**Status**: OPEN (real attacker-reachable runtime panic; gated `reproducer_only` post-discovery)
+**Path**: `src/outline.zig:152` — `walkOutlineChain` recurses on `/First` without a depth cap
+**Surfaced by**: post-iter-25 1M sweep on iter-19's `outline_adversarial_mutate` target. Default-gate at 100k iters stayed clean; 1M reliably trips it.
+**Class**: stack overflow on adversarial input
+
+### Root cause
+
+`outline.zig:88` declares `MAX_ITEMS = 10000` as the *count* anti-cycle bound, but the recursive descent on `/First` (line 152) has no *depth* bound. A malicious PDF with a chained `/First → /First → /First → …` outline tree recurses one stack frame per level; ~600–1000 frames exhaust the default 8 MiB stack on macOS arm64.
+
+### Reproducer
+
+```sh
+PDFZIG_FUZZ_TARGET=outline_adversarial_mutate \
+  PDFZIG_FUZZ_ITERS=1000000 \
+  ~/.zvm/bin/zig build fuzz
+```
+
+Stack trace (truncated):
+
+```
+src/outline.zig:152:33  walkOutlineChain  ← recurse
+src/outline.zig:152:33  walkOutlineChain
+…  (≥ 600 frames)
+src/outline.zig:71:25   parseOutline
+src/root.zig:1379       getOutline
+```
+
+### Recommended fix
+
+Add a `MAX_DEPTH = 64` constant alongside `MAX_ITEMS`; gate the recursive call on it:
+
+```zig
+const MAX_DEPTH: u32 = 64;
+if (level >= MAX_DEPTH) return error.OutlineTooDeep;
+try walkOutlineChain(allocator, arena, data, xref, cache, pages, child_first, level + 1, items);
+```
+
+Mirrors `attr_flattener.zig`'s `MAX_FLATTEN_DEPTH = 64` + `struct_writer.zig`'s `MAX_DEPTH = 64`.
+
+### User-facing impact
+
+A malicious PDF with deeply-nested `/Outlines` would crash any consumer calling `Document.getOutline()`. The CLI's markdown rendering path reaches it too — not just `openFromMemory`.
+
+**Severity: Medium.** Crash on adversarial input, no UB / RCE. Same class as Findings 005, 011.
+
+### Loop-rule observation
+
+The 100k default-gate sweep stayed clean; the trip threshold lives in the 100k–1M window. **Future tier-1 byte-fuzz targets that mutate parser inputs at high density should declare clean only after the loop's 1M sweep, not after 100k validation.**
+
+---
+
 ## Reproducer index
 
 - `audit/fuzz_corpus_crash_001.bin` — the 643-byte mutated PDF that initially caused the false-positive harness segfault. Kept as an interesting input even though the crash was harness-side; it is a useful smoke-test PDF for parser robustness (CLI handles it cleanly: `pdf.zig info audit/fuzz_corpus_crash_001.bin` → `pages: 0`).

@@ -23,7 +23,11 @@
   100k-clean at SEED=0x1 in ReleaseSafe; the four headline modules
   (`decompress`, `parser`, `interpreter`, `pdf_writer`) re-confirmed at
   1M iters.
-- **8 numbered findings** opened (005-011 + an upstream toolchain bug).
+- **9 numbered findings** opened (005-012 + an upstream toolchain bug).
+  Finding 012 was surfaced post-iter-25 by the 1M sweep on iter-19's
+  `outline_adversarial_mutate` target — stack overflow in
+  `outline.walkOutlineChain` from unbounded `/First` recursion. Same
+  class as Findings 005 + 011 (attacker-reachable runtime panic).
   Three findings are runtime panics / OOB-on-attacker-input on parser
   surfaces (Findings 005, 008a/b, 010, 011); one is dead-code 0.16-stale
   hygiene (006); one is a design asymmetry (009); one is an upstream Zig
