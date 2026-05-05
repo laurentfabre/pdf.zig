@@ -442,6 +442,45 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run the Week-4 fuzz harness (PDFZIG_FUZZ_ITERS overrides 1M default)");
     fuzz_step.dependOn(&run_fuzz.step);
 
+    // Coverage-guided + seed-corpus fuzz harness — iter-6 of
+    // `audit/fuzz_loop_state.md` (tier 6).
+    //
+    // Wiring detail (Zig 0.16.0 stable):
+    //   The new `std.testing.fuzz` API is the forward-portable shape for
+    //   coverage-guided fuzz, but in 0.16.0 a `.fuzz = true` test binary
+    //   segfaults during the build runner's `run_test` discovery pass:
+    //   `mainServer` calls each test once before `start_fuzzing`, and
+    //   inside that call `std.testing.fuzz` invokes `fuzzer_start_test`
+    //   on uninitialised fuzzer state. Reproduced locally on 2026-05-05
+    //   with `~/.zvm/bin/zig build fuzz-cov [--fuzz]` (segfault at
+    //   `fuzzer.zig:904 ensureCorpusLoaded`).
+    //
+    //   Pivot per the iter-6 brief: keep the API-correct harnesses in
+    //   `src/fuzz_cov.zig`, but **omit `.fuzz = true`** so the test runs
+    //   in the corpus-only branch of `std.testing.fuzz` (test_runner.zig
+    //   line 596+). This delivers the brief's named alternative —
+    //   "*seed corpus support* … rotate fixture PDFs in instead of pure
+    //   random bytes" — using the new API rather than bolting it onto
+    //   `fuzz_runner.zig`. Flip `.fuzz = true` once the 0.16.x discovery
+    //   pass is fixed; the harness bodies need no edits.
+    //
+    //   ~/.zvm/bin/zig build fuzz-cov         # run seed corpus once (~1 s)
+    //
+    // Why ReleaseSafe: same posture as `fuzz_runner.zig` — UB sanitizer,
+    // integer overflow, and optional-null traps must trip the runtime
+    // for the harnesses to surface bugs.
+    const fuzz_cov_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_cov.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            // .fuzz intentionally unset — see comment above.
+        }),
+    });
+    const run_fuzz_cov = b.addRunArtifact(fuzz_cov_test);
+    const fuzz_cov_step = b.step("fuzz-cov", "Seed-corpus fuzz on parser + decompress (iter-6, audit/fuzz_loop_state.md)");
+    fuzz_cov_step.dependOn(&run_fuzz_cov.step);
+
     // Benchmark
     const bench = b.addExecutable(.{
         .name = "bench",
