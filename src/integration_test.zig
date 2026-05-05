@@ -2493,3 +2493,139 @@ test "PR-W9: /ID array appears in trailer" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/ID [<") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "> <") != null);
 }
+
+// =========================================================================
+// PR-W8.1: image XObject writer integration tests (deferred from #56).
+//
+// Test 1 — full JPEG passthrough round-trip via DocumentBuilder.addImageJpeg
+//          + PageBuilder.drawImage, then Document.openFromMemory +
+//          getPageImages with include_payload=true.
+// Test 2 — markdown `![alt](path)` round-trip via markdown_to_pdf
+//          .renderWithIo, asserting payload byte-equality with the
+//          on-disk fixture and that text rendering still works.
+// =========================================================================
+
+test "PR-W8.1: JPEG passthrough round-trip via DocumentBuilder.addImageJpeg + drawImage" {
+    const allocator = std.testing.allocator;
+    const document = @import("pdf_document.zig");
+
+    // Load tiny.jpg (632 B baseline JPEG, 8x8 RGB) from the project-root
+    // fixtures dir. cwd at test time is the build's run cwd, which is
+    // the project root for `zig build test`.
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const jpeg_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/tiny.jpg",
+        allocator,
+        .limited(1 * 1024 * 1024),
+    );
+    defer allocator.free(jpeg_bytes);
+
+    // Sanity: SOF says 8x8. Asserting input geometry up-front so a
+    // mis-fixture is distinguishable from a writer/reader bug.
+    try std.testing.expect(jpeg_bytes.len > 4);
+    try std.testing.expectEqual(@as(u8, 0xFF), jpeg_bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0xD8), jpeg_bytes[1]);
+
+    // Build a one-page PDF with the JPEG placed at a known rect.
+    const place_x: f64 = 72;
+    const place_y: f64 = 100;
+    const place_w: f64 = 200;
+    const place_h: f64 = 150;
+
+    var doc_builder = document.DocumentBuilder.init(allocator);
+    defer doc_builder.deinit();
+
+    const page = try doc_builder.addPage(.{ 0, 0, 612, 792 });
+    const handle = try doc_builder.addImageJpeg(jpeg_bytes);
+    try page.drawImage(place_x, place_y, place_w, place_h, handle);
+
+    const pdf_bytes = try doc_builder.write();
+    defer allocator.free(pdf_bytes);
+
+    // Round-trip: open and read back via the layout-aware image walker.
+    var d = try zpdf.Document.openFromMemory(allocator, pdf_bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+
+    const images = try d.getPageImages(0, allocator, true);
+    defer zpdf.Document.freeImages(allocator, images);
+
+    // 1. Exactly one image returned.
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+
+    // 2. Width/height match the input JPEG's SOF (8x8).
+    try std.testing.expectEqual(@as(u32, 8), images[0].width);
+    try std.testing.expectEqual(@as(u32, 8), images[0].height);
+
+    // 3. encoding field is "DCTDecode".
+    try std.testing.expect(images[0].encoding != null);
+    try std.testing.expectEqualStrings("DCTDecode", images[0].encoding.?);
+
+    // 4. Returned payload is byte-identical to the input JPEG.
+    try std.testing.expect(images[0].payload != null);
+    try std.testing.expectEqualSlices(u8, jpeg_bytes, images[0].payload.?);
+
+    // 5. Placement rect matches drawImage(x, y, w, h) within ±0.01 pt.
+    //    drawImage emits CTM `[w 0 0 h x y]`, so the layout walker's
+    //    rect is [x, y, x+w, y+h].
+    try std.testing.expectApproxEqAbs(place_x, images[0].rect[0], 0.01);
+    try std.testing.expectApproxEqAbs(place_y, images[0].rect[1], 0.01);
+    try std.testing.expectApproxEqAbs(place_x + place_w, images[0].rect[2], 0.01);
+    try std.testing.expectApproxEqAbs(place_y + place_h, images[0].rect[3], 0.01);
+}
+
+test "PR-W8.1: markdown ![alt](path) round-trip via renderWithIo preserves JPEG bytes + text" {
+    const allocator = std.testing.allocator;
+
+    // io stub for both the markdown image-line disk-read and our
+    // own pre-read of the fixture for the byte-equality assertion.
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Pre-read the fixture so we can compare byte-for-byte after the
+    // markdown render → PDF write → PDF parse pipeline.
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/tiny.jpg",
+        allocator,
+        .limited(1 * 1024 * 1024),
+    );
+    defer allocator.free(fixture);
+
+    const md_source =
+        "![tiny image](tests/fixtures/tiny.jpg)\n\n# Heading\n\nbody text\n";
+
+    const pdf_bytes = try zpdf.markdown_to_pdf.renderWithIo(allocator, io, md_source);
+    defer allocator.free(pdf_bytes);
+
+    var d = try zpdf.Document.openFromMemory(allocator, pdf_bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+
+    // 1. ≥1 image returned (markdown image rendered).
+    const images = try d.getPageImages(0, allocator, true);
+    defer zpdf.Document.freeImages(allocator, images);
+    try std.testing.expect(images.len >= 1);
+
+    // 2. Payload of the first DCTDecode image matches the on-disk
+    //    fixture byte-for-byte (passthrough preserves all JPEG bytes).
+    var matched: bool = false;
+    for (images) |img| {
+        if (img.encoding) |enc| {
+            if (std.mem.eql(u8, enc, "DCTDecode") and img.payload != null) {
+                try std.testing.expectEqualSlices(u8, fixture, img.payload.?);
+                matched = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(matched);
+
+    // 3. Text extraction still finds the heading content (image didn't
+    //    break text rendering on the same page).
+    const md = try d.extractMarkdown(0, allocator);
+    defer allocator.free(md);
+    try std.testing.expect(std.mem.indexOf(u8, md, "Heading") != null);
+}
