@@ -2854,3 +2854,157 @@ test "PR-22d: pathological /Lang (control bytes) is rejected, not propagated" {
     try std.testing.expect(elem_p.lang != null);
     try std.testing.expectEqualStrings("en-US", elem_p.lang.?);
 }
+
+test "PR-22e: parsed Figure-with-/Alt fixture validates clean" {
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateFigureWithAltPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const tree = try doc.getStructTree();
+    try std.testing.expect(tree.root != null);
+
+    // The /Alt string survives parsing.
+    try std.testing.expect(tree.root.?.alt_text != null);
+
+    // Validator says clean.
+    try zpdf.structtree.validateAltText(&tree);
+    try zpdf.structtree.validateAll(&tree);
+}
+
+test "PR-22e: parsed Figure-missing-/Alt fixture trips the validator" {
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateFigureMissingAltPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const tree = try doc.getStructTree();
+    try std.testing.expect(tree.root != null);
+    try std.testing.expect(tree.root.?.alt_text == null);
+    try std.testing.expect(tree.root.?.actual_text == null);
+
+    try std.testing.expectError(error.MissingAltTextOnFigure, zpdf.structtree.validateAltText(&tree));
+    try std.testing.expectError(error.MissingAltTextOnFigure, zpdf.structtree.validateAll(&tree));
+}
+
+test "PR-22e: extractMarkdown does NOT run the validator (bad fixture is still extractable)" {
+    // Defensive gate: reader-side parse must never invoke the
+    // validator — adversarial PDFs would otherwise refuse to open.
+    // Confirm a Figure-without-/Alt document still produces text via
+    // the regular extraction path.
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateFigureMissingAltPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const md = try doc.extractMarkdown(0, allocator);
+    defer allocator.free(md);
+    // The page renders the placeholder text "Img" inside the Figure
+    // BDC bracket. We don't pin the exact bytes (markdown wrapping
+    // varies); just assert it's non-empty.
+    try std.testing.expect(md.len > 0);
+}
+
+test "PR-22e CLI: --validate-pdfua on bad fixture exits non-zero + emits validation record" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write the bad fixture to disk so Document.open can read it.
+    const pdf_data = try testpdf.generateFigureMissingAltPdf(allocator);
+    defer allocator.free(pdf_data);
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad.pdf", .data = pdf_data });
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    const tmp_path = try std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_path);
+
+    const in_path = try std.fs.path.join(allocator, &.{ tmp_path, "bad.pdf" });
+    defer allocator.free(in_path);
+    const out_path = try std.fs.path.join(allocator, &.{ tmp_path, "out.ndjson" });
+    defer allocator.free(out_path);
+
+    const args: cli.ExtractArgs = .{
+        .input = in_path,
+        .output_path = out_path,
+        .output_mode = .ndjson,
+        .validate_pdfua = true,
+    };
+    const ec = try cli.runExtract(allocator, io, args);
+    try std.testing.expectEqual(cli.ExitCode.arg_error, ec);
+
+    // The output NDJSON must contain a validation record naming the rule.
+    const out_data = try tmp.dir.readFileAlloc(io, "out.ndjson", allocator, .limited(64 * 1024));
+    defer allocator.free(out_data);
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"kind\":\"validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"severity\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"rule\":\"alt_required_on_figure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"element\":\"Figure\"") != null);
+}
+
+test "PR-22e CLI: --validate-pdfua on good fixture exits zero" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pdf_data = try testpdf.generateFigureWithAltPdf(allocator);
+    defer allocator.free(pdf_data);
+    try tmp.dir.writeFile(io, .{ .sub_path = "good.pdf", .data = pdf_data });
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    const tmp_path = try std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_path);
+
+    const in_path = try std.fs.path.join(allocator, &.{ tmp_path, "good.pdf" });
+    defer allocator.free(in_path);
+    const out_path = try std.fs.path.join(allocator, &.{ tmp_path, "out.ndjson" });
+    defer allocator.free(out_path);
+
+    const args: cli.ExtractArgs = .{
+        .input = in_path,
+        .output_path = out_path,
+        .output_mode = .ndjson,
+        .validate_pdfua = true,
+    };
+    const ec = try cli.runExtract(allocator, io, args);
+    try std.testing.expectEqual(cli.ExitCode.ok, ec);
+
+    // No validation record on a clean document.
+    const out_data = try tmp.dir.readFileAlloc(io, "out.ndjson", allocator, .limited(64 * 1024));
+    defer allocator.free(out_data);
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"kind\":\"validation\"") == null);
+}
+
+test "PR-22e: ActualText satisfies the alt requirement when /Alt is absent" {
+    // Build a tree by hand: a Figure with /ActualText and no /Alt
+    // must validate clean (PDF/UA-1 §7.3 + ISO 32000-1 §14.9.4).
+    var fig: zpdf.structtree.StructElement = .{
+        .struct_type = "Figure",
+        .actual_text = "A photograph",
+        .children = &.{},
+    };
+    const tree: zpdf.structtree.StructTree = .{
+        .root = &fig,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try zpdf.structtree.validateAltText(&tree);
+}

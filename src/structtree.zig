@@ -40,6 +40,14 @@ pub const StructElement = struct {
     /// Title/alt text if present
     title: ?[]const u8 = null,
     alt_text: ?[]const u8 = null,
+    /// PR-22e: `/ActualText` content. Per ISO 32000-1 §14.9.4
+    /// `/ActualText` substitutes the natural-language string a screen
+    /// reader should announce in place of the structure's marked
+    /// content. PDF/UA-1 §7.3 accepts `/ActualText` as a valid
+    /// substitute for `/Alt` on Figure/Formula/Form. Today only
+    /// populated by parseStructElement / parseKids when present on
+    /// the source dict; the validator accepts either field.
+    actual_text: ?[]const u8 = null,
     /// Children: either more elements or MCIDs
     children: []const StructChild,
     /// Page reference (if this element is on a specific page)
@@ -430,14 +438,73 @@ fn propagateLangWalk(
     }
 }
 
-/// PR-SX1 stub. PR-22e will fill in: scan `tree`, return
-/// `error.MissingAltTextOnFigure` if any `/Figure`, `/Formula`, or
-/// `/Form` element lacks `/Alt` (per PDF/UA-1 §7.3).
+/// PR-22e: PDF/UA-1 §7.3 alt-text validator.
 ///
-/// Today: returns success.
+/// Walks the structure tree depth-first. Returns
+///   - `error.MissingAltTextOnFigure`  for /Figure
+///   - `error.MissingAltTextOnFormula` for /Formula
+///   - `error.MissingAltTextOnForm`    for /Form
+/// when the corresponding element lacks BOTH `/Alt` AND `/ActualText`.
+/// `/ActualText` is accepted as a substitute per ISO 32000-1 §14.9.4
+/// and PDF/UA-1 §7.3 (a screen reader will announce it in place of
+/// the marked content).
+///
+/// `resolved_role` is honored when non-null: a custom role mapped via
+/// `/RoleMap` to one of the gated standard types is treated as that
+/// type for validation purposes (PR-22b populates this slot; today
+/// it's always null and the test path goes through `struct_type`).
+///
+/// Recursion is bounded by `MAX_VALIDATE_DEPTH = 64`; deeper trees
+/// are silently truncated rather than asserting (an adversarial PDF
+/// must not be able to crash the validator). The validator is OFF
+/// by default — callers (writer-side struct-tree builder, the
+/// `--validate-pdfua` CLI flag) invoke it explicitly. Reader-side
+/// parse never invokes it.
 pub fn validateAltText(tree: *const StructTree) !void {
-    _ = tree;
-    // PR-22e: walk tree, validate /Alt presence on Figure/Formula/Form.
+    const root = tree.root orelse return;
+    try validateAltTextRec(root, 0);
+}
+
+/// PR-22e: depth bound for the alt-text walker. PDF/UA-1 documents
+/// in the wild rarely nest beyond depth 12; 64 is the same ceiling
+/// used elsewhere in the parser for adversarial input.
+pub const MAX_VALIDATE_DEPTH: u32 = 64;
+
+fn validateAltTextRec(elem: *const StructElement, depth: u32) error{
+    MissingAltTextOnFigure,
+    MissingAltTextOnFormula,
+    MissingAltTextOnForm,
+}!void {
+    if (depth >= MAX_VALIDATE_DEPTH) return;
+
+    // Pick the effective tag: a /RoleMap-resolved role overrides the
+    // raw struct_type (a custom "MyFig" mapped to "Figure" still
+    // requires /Alt). PR-22b populates resolved_role; today null.
+    const tag = elem.resolved_role orelse elem.struct_type;
+
+    const has_alt = elem.alt_text != null or elem.actual_text != null;
+    if (!has_alt) {
+        if (std.mem.eql(u8, tag, "Figure")) return error.MissingAltTextOnFigure;
+        if (std.mem.eql(u8, tag, "Formula")) return error.MissingAltTextOnFormula;
+        if (std.mem.eql(u8, tag, "Form")) return error.MissingAltTextOnForm;
+    }
+
+    for (elem.children) |child| {
+        switch (child) {
+            .element => |sub| try validateAltTextRec(sub, depth + 1),
+            .mcid => {},
+        }
+    }
+}
+
+/// PR-22e: PDF/UA-1 umbrella validator. Today runs only the alt-text
+/// rule (§7.3); slots are reserved here for the other §7.18.x rules
+/// (heading order, tab order, table-summary) that follow-up PRs will
+/// add. Callers who want one-call PDF/UA conformance should prefer
+/// this over `validateAltText` directly.
+pub fn validateAll(tree: *const StructTree) !void {
+    try validateAltText(tree);
+    // PR-22f+: validateHeadingOrder, validateTabOrder, validateTableSummary…
 }
 
 /// PR-SX1 stub. PR-23a will fill in: given a `Document` and a
@@ -665,6 +732,7 @@ fn parseStructElement(
             const struct_type = dict.getName("S") orelse "Unknown";
             const title = dict.getString("T");
             const alt = dict.getString("Alt");
+            const actual = dict.getString("ActualText");
             // PR-22d: optional `/Lang` (BCP-47) on this element. Only
             // adopt it when it passes the bounded sanity check; a
             // pathological 1MB or control-byte-laden value falls back
@@ -699,6 +767,7 @@ fn parseStructElement(
                 .struct_type = struct_type,
                 .title = title,
                 .alt_text = alt,
+                .actual_text = actual,
                 .children = children_slice,
                 .page_ref = page_ref,
                 .lang = lang_attr,
@@ -772,6 +841,7 @@ fn parseKids(
                 const struct_type = dict.getName("S") orelse return;
                 const title = dict.getString("T");
                 const alt = dict.getString("Alt");
+                const actual = dict.getString("ActualText");
                 // PR-22d: per-element /Lang (see parseStructElement).
                 const lang_attr: ?[]const u8 = blk: {
                     const raw = dict.getString("Lang") orelse break :blk null;
@@ -799,6 +869,7 @@ fn parseKids(
                     .struct_type = struct_type,
                     .title = title,
                     .alt_text = alt,
+                    .actual_text = actual,
                     .children = sub_children_slice,
                     .page_ref = page_ref,
                     .lang = lang_attr,
@@ -941,6 +1012,7 @@ test "PR-SX1: StructElement extension fields default to null" {
     // Sanity: existing nullable fields are also null by default.
     try std.testing.expect(elem.title == null);
     try std.testing.expect(elem.alt_text == null);
+    try std.testing.expect(elem.actual_text == null);
     try std.testing.expect(elem.page_ref == null);
 }
 
@@ -1218,4 +1290,170 @@ test "PR-22b: emitElementJson omits resolved_role when null" {
     try emitElementJson(&elem, &aw.writer, 0);
 
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "resolved_role") == null);
+}
+
+// =====================================================================
+// PR-22e tests: alt-text validator unit coverage
+// ---------------------------------------------------------------------
+// These exercise validateAltText directly against synthetic trees so
+// they don't depend on parser fidelity. Acceptance-gate fixtures live
+// in `testpdf.zig` + `integration_test.zig` and exercise the full
+// parse → validate path.
+// =====================================================================
+
+test "PR-22e: Figure with /Alt validates clean" {
+    var fig: StructElement = .{
+        .struct_type = "Figure",
+        .alt_text = "A photograph of a sunset",
+        .children = &.{},
+    };
+    var root: StructElement = .{
+        .struct_type = "Document",
+        .children = &[_]StructChild{.{ .element = &fig }},
+    };
+    const tree: StructTree = .{
+        .root = &root,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try validateAltText(&tree);
+}
+
+test "PR-22e: Figure with /ActualText (no /Alt) validates clean" {
+    // PDF/UA-1 §7.3 + ISO 32000-1 §14.9.4: /ActualText is an
+    // acceptable substitute for /Alt.
+    var fig: StructElement = .{
+        .struct_type = "Figure",
+        .actual_text = "Sunset over the ocean",
+        .children = &.{},
+    };
+    var root: StructElement = .{
+        .struct_type = "Document",
+        .children = &[_]StructChild{.{ .element = &fig }},
+    };
+    const tree: StructTree = .{
+        .root = &root,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try validateAltText(&tree);
+}
+
+test "PR-22e: Figure missing /Alt and /ActualText → MissingAltTextOnFigure" {
+    var fig: StructElement = .{
+        .struct_type = "Figure",
+        .children = &.{},
+    };
+    var root: StructElement = .{
+        .struct_type = "Document",
+        .children = &[_]StructChild{.{ .element = &fig }},
+    };
+    const tree: StructTree = .{
+        .root = &root,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(error.MissingAltTextOnFigure, validateAltText(&tree));
+}
+
+test "PR-22e: Formula without alt → MissingAltTextOnFormula" {
+    var fml: StructElement = .{ .struct_type = "Formula", .children = &.{} };
+    const tree: StructTree = .{
+        .root = &fml,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(error.MissingAltTextOnFormula, validateAltText(&tree));
+}
+
+test "PR-22e: Form without alt → MissingAltTextOnForm" {
+    var form: StructElement = .{ .struct_type = "Form", .children = &.{} };
+    const tree: StructTree = .{
+        .root = &form,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(error.MissingAltTextOnForm, validateAltText(&tree));
+}
+
+test "PR-22e: P element without alt is fine (rule is type-gated)" {
+    var p: StructElement = .{ .struct_type = "P", .children = &.{} };
+    const tree: StructTree = .{
+        .root = &p,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try validateAltText(&tree);
+}
+
+test "PR-22e: resolved_role overrides struct_type for the rule" {
+    // /RoleMap mapping "MyFig" → "Figure" (PR-22b populates
+    // resolved_role). The validator must catch the missing /Alt.
+    var fig: StructElement = .{
+        .struct_type = "MyFig",
+        .resolved_role = "Figure",
+        .children = &.{},
+    };
+    const tree: StructTree = .{
+        .root = &fig,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(error.MissingAltTextOnFigure, validateAltText(&tree));
+}
+
+test "PR-22e: empty tree validates clean" {
+    const tree: StructTree = .{
+        .root = null,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try validateAltText(&tree);
+}
+
+test "PR-22e: validateAll umbrella delegates to validateAltText today" {
+    var fig: StructElement = .{ .struct_type = "Figure", .children = &.{} };
+    const tree: StructTree = .{
+        .root = &fig,
+        .elements = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(error.MissingAltTextOnFigure, validateAll(&tree));
+}
+
+test "PR-22e: deeply nested tree honours MAX_VALIDATE_DEPTH" {
+    // Build a chain of 80 P elements with a Figure-without-Alt at the
+    // bottom. The validator must NOT find it (depth-bounded), proving
+    // the bound exists. A real document would never nest this deep.
+    const allocator = std.testing.allocator;
+    const N: usize = 80;
+    var chain = try allocator.alloc(StructElement, N);
+    defer allocator.free(chain);
+    var children = try allocator.alloc(StructChild, N);
+    defer allocator.free(children);
+
+    var bad_fig: StructElement = .{ .struct_type = "Figure", .children = &.{} };
+
+    // Build bottom-up: chain[N-1] holds the Figure; each parent holds
+    // a single-element child slice pointing at the next.
+    var i: usize = N;
+    while (i > 0) {
+        i -= 1;
+        if (i == N - 1) {
+            children[i] = .{ .element = &bad_fig };
+        } else {
+            children[i] = .{ .element = &chain[i + 1] };
+        }
+        chain[i] = .{
+            .struct_type = "P",
+            .children = children[i .. i + 1],
+        };
+    }
+    const tree: StructTree = .{
+        .root = &chain[0],
+        .elements = &.{},
+        .allocator = allocator,
+    };
+    // Depth 64 < N=80 → the Figure is past the cap, so no error.
+    try validateAltText(&tree);
 }
