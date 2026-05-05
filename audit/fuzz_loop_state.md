@@ -96,7 +96,7 @@ the raw-bytes boundary and only deeper-API or stateful fuzzing remains.
 |---:|---|---|---|---:|
 | 1 | `decompress.zig` | FlateDecode / RunLengthDecode / ASCIIHex / ASCII85 streams | iter-1 done — 2 default + 1 aggressive-gate; ASCII85 u32 overflow surfaced (Finding 005) | ✅ iter 1 |
 | 2 | `parser.zig` | tokenizer, name-tree, dict, stream-len | iter-2 done — 3 default-gate targets reaching `parseObject`, `parseIndirectObject`, and `initAt` directly; no findings | ✅ iter 2 |
-| 3 | `interpreter.zig` | content-stream operators (q/Q, cm, Tj, BDC/EMC, Do…) | only via `lattice_content_random` | |
+| 3 | `interpreter.zig` | content-stream operators (q/Q, cm, Tj, BDC/EMC, Do…) | iter-3 done — 2 default-gate targets (lexer + BDC/EMC nesting via DocumentBuilder); 3rd target dropped due to Finding 006 (ContentInterpreter bit-rot) | ✅ iter 3 |
 | 4 | `bidi.zig` | UAX #9 Level-1 resolution | none | |
 | 5 | `cff.zig` | CFF Type 2 glyph parsing (used in font_embedder fallback) | none | |
 | 6 | `truetype.zig` | already byte-fuzzed (`truetype_parse_random`); add `subset()` deep fuzz | byte-input | |
@@ -126,7 +126,8 @@ the raw-bytes boundary and only deeper-API or stateful fuzzing remains.
 | 0 | 2026-05-05 | seven v1.6 modules | xmp_escape_xml · xmp_emit_random · encrypt_roundtrip_{rc4,aes} · markdown_render_tagged · truetype_parse_random · jpeg_meta_random | n/a (initial pass) | baseline | #76 |
 | 1 | 2026-05-05 | decompress.zig | decompress_ascii_hex_random · decompress_runlength_random · decompress_ascii85_roundtrip (aggressive) | **YES — Finding 005**: u32 overflow in `decodeASCII85` at src/decompress.zig:386. Aggressive-gated; default-gate clean. | within noise (full bench rerun pending; per-target wall ASCIIHex 9.9 s, RunLength 11.2 s at 100k — close to subagent's 10.0/11.5 s) | #76 |
 | 2 | 2026-05-05 | parser.zig (Parser.parseObject / parseIndirectObject / initAt) | parser_object_pdfish · parser_indirect_object_random · parser_init_at_offset_random | none — all three targets clean at 100k iters in ReleaseSafe | parser targets at 100k iters: pdfish 155 ms, indirect 16 ms, initAt 4 ms (full bench rerun pending) | #76 |
-| 3 | TBD | interpreter.zig (content-stream operators) | TBD | TBD | TBD | TBD |
+| 3 | 2026-05-05 | interpreter.zig (content-stream operators) | interpreter_random_ops · interpreter_bdc_emc_nesting | **YES — Finding 006**: `ContentInterpreter(Writer)` is 0.16-stale (managed-ArrayList API at interpreter.zig:103 + 172). Compile-time only; no user-reachable runtime impact (the type is public surface but unused — extractContentStream drives ContentLexer directly). | iter-3 targets at 100k: random_ops 6.0 s, bdc_emc 17.0 s | #76 |
+| 4 | TBD | tier-3 round-trip on a v1.6 module not yet at tier 3 | TBD | TBD | TBD | TBD |
 
 ## Rules the loop must obey
 

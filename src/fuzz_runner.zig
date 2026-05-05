@@ -110,6 +110,12 @@ const TARGETS = [_]Target{
     .{ .name = "parser_object_pdfish", .run = fuzzParserObjectPdfish },
     .{ .name = "parser_indirect_object_random", .run = fuzzParserIndirectObjectRandom },
     .{ .name = "parser_init_at_offset_random", .run = fuzzParserInitAtOffsetRandom },
+    // Iter-3 (audit/fuzz_loop_state.md tier 4 — stateful sequence fuzz) —
+    // content-stream operator dispatch in src/interpreter.zig. Reaches the
+    // production lexer + the BDC/EMC tag-stack in root.zig::extractContentStream
+    // directly, instead of going through the lattice geometry layer.
+    .{ .name = "interpreter_random_ops", .run = fuzzInterpreterRandomOps },
+    .{ .name = "interpreter_bdc_emc_nesting", .run = fuzzInterpreterBdcEmcNesting },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -1572,6 +1578,281 @@ fn validateObjectShape(obj: parser.Object, depth: usize) anyerror!void {
         },
     }
 }
+
+
+// ============================================================================
+// Targets — interpreter.zig (content-stream operator dispatch, iter-3)
+// ============================================================================
+//
+// Coverage map. The two targets layer in increasing depth:
+//
+//   1. `interpreter_random_ops`         — drives `ContentLexer.next()` over
+//      raw + COS-operator-biased bytes. This is the actual production lexer
+//      surface (`extractContentStream` calls it directly). Floor: no panic,
+//      `pos` advances monotonically, returned slices are inside `data`.
+//
+//   2. `interpreter_bdc_emc_nesting`    — synthesises a minimal valid PDF
+//      whose page content stream is a procedurally-generated cocktail of
+//      random operators (BMC/BDC/EMC up to depth ~200, plus Tj) and drives
+//      the *production* `extractMarkdown` path end-to-end. This is the
+//      only target that exercises root.zig's `extractContentStream`
+//      dispatch (BDC/EMC tag stack with MAX_MC_DEPTH=64, artifact-skip
+//      gate, font lookup) at hostile depth. Floor: depth cap silently
+//      degrades (per the comment at root.zig:2913); no panic.
+//
+// A planned third target — `interpreter_q_stack_dispatch` — would have
+// driven the public `ContentInterpreter(Writer).process()` with
+// adversarial q/Q runs to stress its `state_stack` resize path. Building
+// it surfaced **Finding 006** (interpreter.zig:103, :172 stale 0.15
+// `ArrayList(...).init()` / `.append(item)` API in production), so the
+// target is omitted pending the prod-side migration. The
+// `ContentInterpreter` type is public surface but unused in production
+// today (extractContentStream calls `ContentLexer` directly with its own
+// dispatch), which is why the rot stayed hidden until iter-3. Re-add a
+// q/Q-stack target when the type compiles again.
+//
+// Pitfall avoided (Codex round-2 on iter-2): biased-input fuzzers must
+// place biased tokens at offset 0, not at random offsets, because the
+// SUT starts parsing from pos=0. `interpreter_random_ops` uses
+// `biasContentToken` which always plants the first token at offset 0.
+
+/// Bias a chosen window of `buf` toward PDF content-stream tokens. The
+/// first chosen token always lands at offset 0 (so the lexer reaches it
+/// after `skipWhitespaceAndComments`); a second copy may land at a random
+/// later offset to keep the partial-overwrite + adjacent-noise coverage.
+fn biasContentToken(rng: std.Random, buf: []u8) void {
+    if (buf.len == 0) return;
+    // Mix of: text operators, graphics-state operators, marked-content,
+    // xobject paint, inline-image marker, hex string, name tokens, common
+    // adversarial shapes (unbalanced parens, deeply nested arrays, BMC
+    // without an EMC, etc.).
+    const tokens = [_][]const u8{
+        "BT /F1 12 Tf (Hello) Tj ET",
+        "q 1 0 0 1 50 50 cm /Im1 Do Q",
+        "/Span <</MCID 0>> BDC (text) Tj EMC",
+        "/Artifact BMC (header) Tj EMC",
+        "[(a) -200 (b) 50 (c)] TJ",
+        "<48656C6C6F> Tj",
+        "/F1 12 Tf",
+        "100 200 Td 300 400 TD",
+        "1 0 0 1 0 0 Tm",
+        "T* ' \" Tc Tw TL Tz Ts Tr",
+        "q Q q Q q Q",                  // shallow balanced
+        "q q q q q q q q q q q q",      // deep unbalanced (push only)
+        "Q Q Q Q Q Q Q Q Q Q Q Q",      // pop without push
+        "BMC EMC BMC EMC",              // unbracketed BMC, no name operand
+        "BDC BDC BDC EMC",              // missing EMCs
+        "BI /W 1 /H 1 ID \xAA\xBB EI", // inline image
+        "(unterminated string",         // open paren never closes
+        "<8765",                         // open hex never closes
+        "/Name#20Spaces",
+        "%comment line\n",
+        "[<<<<<<<<<<<<<<<<>>>>>>>>>>>>]", // pathological array
+        "10 0 R Do",                       // resolve-then-paint
+        "0.5 0.5 0.5 rg 0 0 0 RG",        // colour set
+        "/CS1 cs /CS1 CS",                 // colourspace ops
+        "/GS1 gs",                          // ExtGState ref
+    };
+    const choice = rng.intRangeAtMost(usize, 0, tokens.len - 1);
+    const tok = tokens[choice];
+    if (tok.len > buf.len) return;
+    @memcpy(buf[0..tok.len], tok);
+    if (buf.len > 2 * tok.len and rng.boolean()) {
+        const max_off = buf.len - 2 * tok.len;
+        const off = tok.len + rng.intRangeAtMost(usize, 0, max_off);
+        const tok2 = tokens[rng.intRangeAtMost(usize, 0, tokens.len - 1)];
+        if (off + tok2.len <= buf.len) @memcpy(buf[off..][0..tok2.len], tok2);
+    }
+}
+
+/// Iter-3 #1 — random + biased bytes through `ContentLexer.next()`.
+///
+/// Half the iters are pure random ASCII; the other half are biased toward
+/// PDF operator tokens (planted at offset 0 so they survive
+/// `skipWhitespaceAndComments`). Drives the lexer until EOF or first
+/// error, asserting the float-parse / hex-string / parens-balance /
+/// inline-image-skip branches don't panic.
+///
+/// Invariants:
+///   - no panic
+///   - lexer pos never exceeds data.len
+///   - pos is monotonically non-decreasing (next() always advances or
+///     terminates; a fixpoint of (pos, EOF=false) would loop forever)
+///   - returned `string` / `hex_string` / `name` / `operator` slices are
+///     either empty or pointers into `data` / arena-owned memory
+///   - returned numbers are finite (NaN/Inf would mean simd.parseFloat
+///     leaked an arithmetic edge through)
+fn fuzzInterpreterRandomOps(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+    const len = rng.intRangeAtMost(usize, 0, @min(scratch.len, 8192));
+    rng.bytes(scratch[0..len]);
+
+    // Half the iters: bias scratch toward content-stream operator tokens.
+    if (rng.boolean() and len > 0) {
+        const n_inserts = rng.intRangeAtMost(usize, 1, 8);
+        for (0..n_inserts) |_| biasContentToken(rng, scratch[0..len]);
+    }
+
+    // ContentLexer's scanString / scanHexString allocate via the supplied
+    // allocator. Use an arena so a successful run's heap-promoted overflow
+    // buffers are freed in one shot, matching the iter-2 pattern.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var lex = interpreter.ContentLexer.init(aa, scratch[0..len]);
+
+    var prev_pos: usize = 0;
+    // Bound the per-iter token count. A pathological scratch could produce
+    // up to ~len tokens (every byte its own delimiter); 4× len is a safe
+    // ceiling that still catches infinite-loop regressions.
+    const max_tokens = len * 4 + 16;
+    var token_count: usize = 0;
+
+    while (try lex.next()) |tok| {
+        token_count += 1;
+        if (token_count > max_tokens) return error.LexerTokenCountExceededBound;
+        if (lex.pos > lex.data.len) return error.LexerPosBeyondData;
+        // Strict monotonicity: every yielded token must consume ≥1 byte.
+        // (Lexer skips whitespace before yielding, so equal-pos two-in-a-row
+        // would mean a zero-width token — an infinite-loop bug.)
+        if (lex.pos <= prev_pos) return error.LexerDidNotAdvance;
+        prev_pos = lex.pos;
+
+        switch (tok) {
+            .number => |n| {
+                if (!std.math.isFinite(n)) return error.LexerNumberNonFinite;
+            },
+            .string, .hex_string, .name, .operator => {
+                // Slices may be either pointers into `data` (name, operator)
+                // or arena-owned (string, hex_string after escape decode).
+                // No structural check beyond "didn't crash to get here."
+            },
+            .array => |arr| {
+                // The array buffer is a fixed `[512]Operand` inside the
+                // lexer; its length must respect that cap.
+                if (arr.len > 512) return error.LexerArrayLenExceedsCap;
+                for (arr) |op| switch (op) {
+                    .number => |n| if (!std.math.isFinite(n)) return error.LexerArrayNumberNonFinite,
+                    else => {},
+                };
+            },
+        }
+    }
+
+    if (lex.pos > lex.data.len) return error.LexerPosBeyondDataAtEof;
+}
+
+/// Iter-3 #2 — random BMC/BDC/EMC nesting through the *production*
+/// `Document.extractMarkdown` path.
+///
+/// Synthesises a minimal valid PDF whose single page's content stream is
+/// the iter's procedurally-generated operator soup. The pdf_document
+/// builder handles header, xref, trailer, font resources for us; we
+/// `appendContent(stream)` to plant our raw bytes verbatim.
+///
+/// What this exercises that the lexer-only and ContentInterpreter targets
+/// don't: root.zig::`extractContentStream` BDC/BMC tag-stack tracking
+/// with `MAX_MC_DEPTH=64` (silent depth-cap degradation), artifact-skip
+/// gate, and the full font-cache lookup path during Tj decoding.
+///
+/// Invariants:
+///   - openFromMemory + extractMarkdown succeed OR return a domain error
+///     (the synthesised PDF is structurally valid; the content stream
+///     may be adversarial, but the parser tolerates malformed content
+///     streams up to its lexer limits)
+///   - no panic at any depth — even when the stream contains 200 BDCs
+///     in a row (well past MAX_MC_DEPTH)
+///   - returned markdown is valid UTF-8
+fn fuzzInterpreterBdcEmcNesting(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = seed_pdf;
+
+    // Build the content stream into `scratch`. We target up to 200 BDC/BMC
+    // pushes interleaved with EMC pops, plus a few text operators so the
+    // markdown extraction path is exercised, not just the marked-content
+    // tracker.
+    var aw = std.Io.Writer.fixed(scratch);
+
+    // Need a font reference for Tj — we'll get the resource name back from
+    // markFontUsed below. Prefix the stream with `BT /<font> 12 Tf 100 700 Td`
+    // so the page renders something even if all the BDCs do nothing.
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    const page = doc.addPage(.{ 0, 0, 612, 792 }) catch return;
+    const font_name = page.markFontUsed(.helvetica) catch return;
+
+    aw.print("BT\n{s} 12 Tf\n100 700 Td\n", .{font_name}) catch return;
+
+    const n_ops = rng.intRangeAtMost(usize, 0, 256);
+
+    for (0..n_ops) |_| {
+        const r = rng.intRangeAtMost(u8, 0, 99);
+        if (r < 30) {
+            // BDC with name + dict (with optional MCID)
+            const mcid = rng.int(u16);
+            aw.print("/Span <</MCID {d}>> BDC ", .{mcid}) catch break;
+        } else if (r < 50) {
+            // BMC (tag-only)
+            const tag_choice = rng.intRangeAtMost(u8, 0, 3);
+            const tag = switch (tag_choice) {
+                0 => "/Span",
+                1 => "/Artifact", // exercises artifact-skip gate
+                2 => "/P",
+                else => "/Unknown",
+            };
+            aw.print("{s} BMC ", .{tag}) catch break;
+        } else if (r < 80) {
+            // EMC — even when there's no matching open bracket
+            // (adversarial). The dispatch tolerates this (production code
+            // at root.zig:2980 just decrements when depth > 0).
+            aw.writeAll("EMC ") catch break;
+        } else if (r < 90) {
+            // Plain Tj — exercises the text path inside whatever bracket
+            // we're currently in (artifact suppression depends on this).
+            aw.writeAll("(t) Tj ") catch break;
+        } else if (r < 95) {
+            // BDC with malformed properties (no /MCID — exercises the
+            // root.zig defensive sentinel-push branch at 2944–2952).
+            aw.writeAll("/X <<>> BDC ") catch break;
+        } else {
+            // BDC with NO name operand at all — the truly hostile case
+            // for the depth tracker, since the dispatch must still keep
+            // the stack invariant when no /Tag was provided.
+            aw.writeAll("BDC ") catch break;
+        }
+    }
+
+    aw.writeAll("ET\n") catch {};
+    const stream_len = aw.end;
+
+    page.appendContent(scratch[0..stream_len]) catch return;
+
+    // Note on substring-count invariants: per audit/fuzz_loop_state.md
+    // pitfall list, counting `BDC`/`EMC` in the emitted bytes is
+    // unreliable when content streams are FlateDecode'd. Our synthesised
+    // PDF here goes through DocumentBuilder which (as of v1.6) does NOT
+    // compress page content streams by default, so a direct substring
+    // probe *would* work — but we still avoid it: the invariant we care
+    // about is "no panic across hostile depth," and that's covered by
+    // the round-trip Document.extractMarkdown call below. A grep on
+    // `pdf_buf` for raw operator bytes would catch a future regression
+    // where the builder gains FlateDecode-by-default and silently
+    // breaks the content-shape assumption.
+    const pdf_buf = doc.write() catch return;
+    defer allocator.free(pdf_buf);
+
+    var d = zpdf.Document.openFromMemory(allocator, pdf_buf, zpdf.ErrorConfig.permissive()) catch return;
+    defer d.close();
+
+    if (d.pageCount() == 0) return;
+    const md = d.extractMarkdown(0, allocator) catch return;
+    defer allocator.free(md);
+
+    if (!std.unicode.utf8ValidateSlice(md)) return error.InterpreterMarkdownInvalidUtf8;
+}
+
+// ============================================================================
+// Driver
 
 // ============================================================================
 // Driver

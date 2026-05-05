@@ -105,7 +105,9 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 | **parser_object_pdfish** | **8.2 s** ⚠️ | **iter-2 — biased COS-syntax bytes; 1M ran on pre-fb2bdca harness (biased-degrades-to-random; rerun pending)** |
 | **parser_indirect_object_random** | **1.5 s** | **iter-2 — synthetic `N M obj … endobj` frames + `/Length` boundary cases through `Parser.parseIndirectObject`** |
 | **parser_init_at_offset_random** | **0.3 s** | **iter-2 — random byte-offsets into seed-pool PDFs through `Parser.initAt`** |
-| **Total** | **2925.7 s (48 min 46 s) at 1M (post-iter-2 pre-Codex-fix) — 28/28 clean, base seed `0x19df7687339`; rerun pending after iter-3 lands** | |
+| **interpreter_random_ops** | TBD (1M not yet rerun; 6.0 s / 100k) | **iter-3 — biased COS-operator bytes through `ContentLexer.next()`** |
+| **interpreter_bdc_emc_nesting** | TBD (1M not yet rerun; 17.0 s / 100k) | **iter-3 — synthesised PDFs with hostile BDC/EMC nesting through `Document.extractMarkdown`** |
+| **Total** | **2925.7 s at 1M (post-iter-2 pre-Codex-fix); iter-3 1M rerun pending** | |
 
 The aggressive-gated `decompress_ascii85_roundtrip` is `reproducer_only` and skipped from the default + aggressive sweeps; deterministically reproduces Finding 005 below.
 
@@ -177,6 +179,52 @@ Option 2 is simpler and probably faster (one cmp instead of one cmp + one div pe
 A malicious PDF with an `/ASCII85Decode` filtered stream containing a 5-tuple whose intermediate accumulator overflows would crash any pdf.zig consumer running in `Debug` or `ReleaseSafe` (panic) and silently produce wrong decoded bytes in `ReleaseFast`. The CLI's primary path is `Document.open(path)` over trusted PDFs; `openFromMemory` over attacker-controlled bytes is reachable through the embedding API and the C / WASM consumers.
 
 **Severity: Medium.** Crash on adversarial input. No OOB read, no RCE.
+
+---
+
+## Finding 006 — `interpreter.ContentInterpreter` is 0.16-stale and uncompilable
+
+**Status**: OPEN (compile-time, not runtime — surfaces only when an external caller instantiates the type)
+**Path**: `src/interpreter.zig:103` and `src/interpreter.zig:172`
+**Surfaced by**: iter-3 of the autonomous fuzz loop. The planned `interpreter_q_stack_dispatch` target tried to instantiate `interpreter.ContentInterpreter(*std.Io.Writer)` to drive adversarial q/Q runs against the graphics-state stack; build failed with three compile errors before any iter executed.
+**Class**: stale 0.15 stdlib API in production source — a Writergate / `ArrayList`-unmanaged migration miss
+
+### Reproducer
+
+```zig
+const interpreter = @import("interpreter.zig");
+test "ContentInterpreter compiles in 0.16" {
+    const Interp = interpreter.ContentInterpreter(*std.Io.Writer);
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var i = Interp.init(std.testing.allocator, &w, "", null, undefined);
+    defer i.deinit();
+}
+```
+
+### Root cause
+
+`ContentInterpreter.init` (interpreter.zig:103) calls `std.ArrayList(GraphicsState).init(allocator)` — the **managed** ArrayList constructor, removed in 0.16. `executeOperator` (interpreter.zig:172) then calls `state_stack.append(self.state)` — also the managed signature. Both surfaces need the unmanaged-style migration the rest of the codebase has already received: `.empty` initialiser + explicit allocator on `append(allocator, item)`.
+
+The reason this stayed hidden is that `ContentInterpreter` is **public surface but unused in production**. The actual content-stream dispatch path is `extractContentStream` in `root.zig`, which drives `interpreter.ContentLexer` directly with its own operator-by-operator switch. The only would-be callers were the iter-3 fuzz harnesses.
+
+### Recommended fix
+
+Two-line patch:
+
+```zig
+// src/interpreter.zig:103
+.state_stack = .empty,
+
+// src/interpreter.zig:172
+try self.state_stack.append(self.allocator, self.state);
+```
+
+Alternative: delete `ContentInterpreter` entirely and trim the public surface — `extractContentStream` is the canonical dispatch, so the type is genuinely dead.
+
+### User-facing impact
+
+**None.** The dead-but-public type is never instantiated in any user-reachable path. The fuzz coverage gap (no q/Q-stack-stress target) is the only externally-visible consequence. Severity: **Low** (documentation / dead-code hygiene; not a runtime bug).
 
 ---
 
