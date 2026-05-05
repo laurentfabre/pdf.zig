@@ -3996,14 +3996,19 @@ fn fuzzMarkdownToPdfUntagged(rng: std.Random, allocator: std.mem.Allocator, scra
     defer doc.close();
     if (doc.pageCount() == 0) return error.MarkdownUntaggedZeroPages;
 
-    // Negative-space check (iter-10 P2 — probe each transition's
-    // post-condition explicitly). The untagged path must NOT emit a
-    // /StructTreeRoot dictionary. A bare substring search is OK here
-    // because content streams are not flate-compressed at this tier
-    // for the StructTree dict itself (only page content streams are).
-    if (std.mem.indexOf(u8, bytes, "/StructTreeRoot")) |_| {
-        return error.MarkdownUntaggedHasStructTreeRoot;
-    }
+    // Codex review of e9a0581 [P2]: the original draft of this
+    // target asserted `no /StructTreeRoot` via a substring scan of
+    // the emitted PDF bytes. That's the same false-positive class
+    // we hit with markdown_render_tagged's BDC/EMC count check in
+    // v1.6 — `drawText` emits literal-string content verbatim into
+    // an uncompressed page stream, so a markdown input line
+    // containing the literal text "/StructTreeRoot" produces a
+    // valid untagged PDF that the substring check would falsely
+    // flag. The positive invariants above (`%PDF-` magic, `%%EOF`,
+    // reparse-via-Document succeeds with pageCount > 0) are the
+    // strong correctness check. A negative-space catalog probe
+    // would need a parsed-object-graph inspection (deferred —
+    // we'd want a `Document.hasStructTree()` helper or similar).
 }
 
 // ============================================================================
