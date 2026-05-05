@@ -3353,6 +3353,20 @@ fn fuzzPdfResourcesImageRegisterAssign(rng: std.Random, allocator: std.mem.Alloc
             if (nums[p] == nums[q]) return error.PdfResourcesImageObjNumDup;
         }
     }
+
+    // Codex review of 25f3c0e [P2]: probe the post-assign image
+    // lifecycle. Per pdf_resources.zig:378, `assignImageObjectNumbers`
+    // does NOT flip the registry freeze flag (unlike `assign
+    // FontObjectNumbers`); image re-assigns are intended to succeed
+    // even after the first call. This asymmetric-with-fonts contract
+    // is documented as Finding 009 (LOW) in audit/fuzz_findings.md.
+    // Pin the *current* behaviour: if a future change makes images
+    // freeze symmetrically with fonts, this assertion trips and
+    // forces the audit doc to be re-examined.
+    reg.assignImageObjectNumbers(&w) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.PdfResourcesImageReassignNowRejected,
+    };
 }
 
 /// T3 — freeze-after-assign negative-space invariant. Register some

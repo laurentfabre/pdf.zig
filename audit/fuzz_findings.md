@@ -410,6 +410,57 @@ There is no constrained-input variant that exercises the parser surface meaningf
 
 ---
 
+## Finding 009 — `assignImageObjectNumbers` doesn't flip the registry freeze flag (asymmetric with fonts)
+
+**Status**: OPEN (design asymmetry; possibly intentional)
+**Path**: `src/pdf_resources.zig:378`
+**Surfaced by**: Codex review of iter-10's `pdf_resources_image_register_assign` target. The subagent originally noted the asymmetry and decided it was intent (per the comment at line 378). Codex flagged the harness for not actually probing it — silently passing on an asymmetric contract is the same as rubber-stamping a possible bug.
+**Class**: design-level lifecycle gap (not a runtime panic)
+
+### Behaviour
+
+`assignFontObjectNumbers` sets the registry-wide `object_nums_assigned = true` flag, which then causes:
+
+- `registerFontBuiltin` post-assign → `error.ObjectNumbersAlreadyAssigned`
+- `registerImage` post-assign → `error.ObjectNumbersAlreadyAssigned`
+- `assignFontObjectNumbers` again → `error.ObjectNumbersAlreadyAssigned`
+
+`assignImageObjectNumbers` does **not** flip the flag, so:
+
+- `registerImage` post-image-assign → succeeds (mutates frozen-ish registry)
+- `assignImageObjectNumbers` again → succeeds (re-assigns object numbers to the same images)
+
+The `assignFontObjectNumbers` flag-flip means the **font** path is locked, but the **image** path remains mutable until the font path locks it (or never, if no fonts are registered).
+
+### Why this matters
+
+`DocumentBuilder.write()` calls both assigns in sequence — currently safe because the writer drives a deterministic order. But a future caller (or a refactor) could:
+
+1. Call `assignImageObjectNumbers` early, then add more images, then re-call → silent re-assign of object numbers, breaking xref-table layout.
+2. Call `assignImageObjectNumbers` after `assignFontObjectNumbers` → succeeds (font path is frozen but image path isn't), so a partial-flow caller gets unexpectedly inconsistent state.
+
+The font path's freeze contract is the safe-by-default; image path's lack-of-freeze is the divergence.
+
+### Recommended fix
+
+One-line patch at `src/pdf_resources.zig` (the assignImageObjectNumbers body):
+
+```zig
+if (self.object_nums_assigned) return error.ObjectNumbersAlreadyAssigned;
+// … existing body …
+self.object_nums_assigned = true;
+```
+
+Mirror the font path. If the asymmetry was intentional (some legitimate use case for re-assigning image obj nums), document it explicitly at line 378 + add a regression test asserting the expected `assignImageObjectNumbers` × 2 success. Otherwise, lock the path.
+
+### User-facing impact
+
+**None today.** The single in-tree caller (`DocumentBuilder.write()`) drives the registry through one well-defined path. Severity: **Low** — design hygiene, not a runtime bug.
+
+The iter-10 `pdf_resources_image_register_assign` target now pins the *current* (asymmetric) behaviour as the harness contract: a re-assign call must succeed. If the production code is later "fixed" to mirror the font path, that target will trip and force this audit entry to be re-examined.
+
+---
+
 ## Reproducer index
 
 - `audit/fuzz_corpus_crash_001.bin` — the 643-byte mutated PDF that initially caused the false-positive harness segfault. Kept as an interesting input even though the crash was harness-side; it is a useful smoke-test PDF for parser robustness (CLI handles it cleanly: `pdf.zig info audit/fuzz_corpus_crash_001.bin` → `pages: 0`).
