@@ -2576,6 +2576,20 @@ fn fuzzPdfOfPdfRoundtrip(
         //     canonicalisation MUST match this filtered view, not
         //     the pre-filter mutated text. Recompute by re-parsing
         //     the freshly-emitted PDF — that's the contract.
+        //
+        // CAVEAT (Codex review of 6ed0045 [P2]): this oracle is
+        // materially weaker than the harness docstring claims.
+        // Storing the *re-parsed* canon as the next stage's expected
+        // value detects **parser non-determinism** (still a real bug
+        // class — useful) but NOT the writer↔reader serialise/parse
+        // asymmetry the tier-7 brief targets. A `drawText` escape
+        // bug that drops a `\` would be silently absorbed at stage
+        // N (the post-loss canon becomes "expected") → no drift at
+        // stage N+1. A stronger oracle (deferred to a follow-up
+        // iter) would apply pdf_writer's WinAnsi filter to the
+        // *mutated* canon BEFORE drawText and use that prediction
+        // as the expected value — either factor the filter into a
+        // public helper or duplicate its logic in the harness.
         const verify_doc = zpdf.Document.openFromMemory(allocator, current_pdf, zpdf.ErrorConfig.default()) catch |e| {
             dumpReproducer("pdf_of_pdf_roundtrip", current_pdf);
             return e;
