@@ -167,6 +167,66 @@ iter-23+ regression flags.
 All other 23 inherited targets remain within ±5 % — no further
 regressions flagged.
 
+### iter-23 root-cause investigation — `tokenizer_count` regression refuted
+
+**TL;DR — the 1.17× regression is bench-environment drift, not code drift.
+The iter-22 binary is in fact 2.5 % FASTER than the iter-1 binary when
+both are run head-to-head on the same hardware in the same session.**
+
+Methodology:
+
+1. `git worktree add /tmp/iter-1-bench d247c6e --detach` (the post-iter-1
+   baseline commit that produced the original 1 901 ms number).
+2. `md5 src/tokenizer.zig` — byte-identical between `d247c6e` and `4ae96c3`
+   (`47a571a205cc90036f5e0ee879ef8521`), confirming `tokenizer.zig` itself
+   has not changed.
+3. Build the iter-1 fuzz binary (`PDFZIG_FUZZ_TARGET=tokenizer_count
+   PDFZIG_FUZZ_ITERS=1 PDFZIG_FUZZ_SEED=0x19df75b03c3 zig build fuzz`) and
+   the iter-22 fuzz binary the same way; copy each to `/tmp/fuzz_iter1`
+   and `/tmp/fuzz_iter22`. Same Zig 0.16.0, same Debug mode.
+4. Run both binaries on the same hardware in the same shell, same seed,
+   same iter count — **5 runs of 50 000 iters** then **3 runs of 200 000
+   iters** for jitter denoising.
+
+Results — 50 000 iters, 5 runs each, `tokenizer_count` only:
+
+| Binary       | run-1 | run-2 | run-3 | run-4 | run-5 | mean |
+|---|---:|---:|---:|---:|---:|---:|
+| iter-1  (28 targets, 4.95 MB) | 2 220 | 2 224 | 2 228 | 2 217 | 2 271 | **2 232** |
+| iter-22 (80 targets, 5.55 MB) | 2 217 | 2 154 | 2 368 | 2 309 | 2 219 | **2 253** |
+
+Results — 200 000 iters, 3 runs each (4× more samples → tighter CI):
+
+| Binary       | run-1 | run-2 | run-3 | mean |
+|---|---:|---:|---:|---:|
+| iter-1  | 9 402 | 8 885 | 8 891 | **9 059** |
+| iter-22 | 8 869 | 8 815 | 8 811 | **8 832** |
+
+iter-22 is **−2.5 %** at the 200k denoise level vs iter-1 (8 832 / 9 059).
+
+**Conclusion — accept and move on.** The "1.17× the original baseline"
+claim conflated two different machine states. The `1 901 ms` original
+measurement was taken on a less-loaded machine on 2026-04-26; both
+binaries today land in the 2 100-2 400 ms band. Hypothesis 1 (binary-
+bloat / cache pressure) and Hypothesis 2 (build-config drift) are
+**refuted** — the iter-22 binary is the same speed as, or faster than,
+the iter-1 binary on identical hardware. Hypothesis 3 (thermal
+throttling / cumulative system load between Apr 26 and May 5) is the
+surviving explanation.
+
+**Recommendation**: drop the `tokenizer_count ⚠️` flag. The post-iter-22
+`2 097 ms` line in the per-target table above is the live anchor; the
+"1.103× vs 1 901 ms" comparison crossed measurement environments and
+should not be treated as a regression. For future iters' regression
+flags, only compare numbers measured in the same machine state (same
+session, same load, same thermal envelope). When refreshing baselines
+across sessions, rerun the prior baseline binary in the new session
+to recalibrate before flagging any per-target ratio.
+
+Investigation artifacts — both binaries preserved at `/tmp/fuzz_iter1`
+(28 targets, 4 948 616 B, MD5'd `tokenizer.zig`) and `/tmp/fuzz_iter22`
+(80 targets, 5 546 184 B, same `tokenizer.zig`) for follow-up audits.
+
 ### Pre-iter-1 baseline (historical) — base seed `0x19df7152cc1`, 126 472 ms total
 
 23 default-gated targets, 50 000 iters each. Identical methodology;
