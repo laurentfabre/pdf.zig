@@ -563,7 +563,7 @@ updated: 2026-05-04
 - [x] **PR-23a · feat: MCID → text resolver** — `src/mcid_resolver.zig` (new ~150 LOC), `src/structtree.zig` (≤20 lines).
 - [x] **PR-23b · feat: inherited-attribute flattener** — `src/attr_flattener.zig` (new ~80 LOC). Depends on 23a + 22d.
 - [x] **PR-23c · feat: a11y_tree NDJSON emitter** — `src/a11y_emitter.zig` (new ~120 LOC), `src/stream.zig` (≤20 lines new RecordKind).
-- [ ] **PR-23d · feat: --a11y-tree CLI flag** — `src/cli_pdfzig.zig` (≤30 lines), `src/integration_test.zig` (≤40 lines). _PR #74 open + CI pending as of 2026-05-05._
+- [x] **PR-23d · feat: --a11y-tree CLI flag** — `src/cli_pdfzig.zig` (≤30 lines), `src/integration_test.zig` (≤40 lines).
 
 ---
 

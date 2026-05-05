@@ -108,14 +108,13 @@ binary_kb:: 647
 | #73 | PR-23c a11y_tree NDJSON emitter | `a11y_emitter.zig` (new), `stream.zig` (new RecordKind.a11y_tree) |
 | #59 | PR-SX1 structtree.zig wave-3.2 field stubs | `structtree.zig` |
 | #60 | PR-WX1 typed catalog setters + beginTag/endTag | `pdf_document.zig` |
-| #74 | PR-23d `--a11y-tree` CLI flag | `cli_pdfzig.zig`, `integration_test.zig` _(open + CI pending at checkpoint)_ |
+| #74 | PR-23d `--a11y-tree` CLI flag | `cli_pdfzig.zig`, `integration_test.zig` |
 
 **What's next on the roadmap:**
 
-1. **Merge #74** once CI passes (the v1.6 closer).
-2. **Extensive fuzz testing pass** across all targets until clean — the explicit follow-up the user requested. Approach: run `zig build alloc-failure-test` (already passing as a baseline), then add fuzz harnesses for the new writer modules (xmp_writer, struct_writer, image_writer, font_embedder, encrypt_writer, mcid_resolver, attr_flattener, a11y_emitter) if not yet present, then `zig build fuzz` for ≥1M iters per target. Address findings until clean.
-3. **Tighten qpdf-check** (PR-22a) baseline from ≥80% to ≥95% once W10a/b's emitted PDFs are in the corpus and intentional-malformed fixtures are excluded.
-4. **Roadmap below v1.6 is empty** — needs decomposition before `/next-pr` works. Candidate next milestones: v1.7 streaming improvements, v2.0 GA validator (`validateAll` umbrella), Tier 3 writer features (incremental updates, signatures, linearization).
+1. **Extensive fuzz testing pass** across all targets until clean — the explicit follow-up the user requested. Approach: run `zig build alloc-failure-test` (already passing as a baseline), then add fuzz harnesses for the new writer modules (xmp_writer, struct_writer, image_writer, font_embedder, encrypt_writer, mcid_resolver, attr_flattener, a11y_emitter) if not yet present, then `zig build fuzz` for ≥1M iters per target. Address findings until clean.
+2. **Tighten qpdf-check** (PR-22a) baseline from ≥80% to ≥95% once W10a/b's emitted PDFs are in the corpus and intentional-malformed fixtures are excluded.
+3. **Roadmap below v1.6 is empty** — needs decomposition before `/next-pr` works. Candidate next milestones: v1.7 streaming improvements, v2.0 GA validator (`validateAll` umbrella), Tier 3 writer features (incremental updates, signatures, linearization).
 
 **Caveats for fresh context:**
 
