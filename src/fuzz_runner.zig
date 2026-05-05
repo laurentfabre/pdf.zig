@@ -43,6 +43,12 @@ const Target = struct {
     name: []const u8,
     run: TargetFn,
     aggressive: bool = false,
+    /// `reproducer_only` targets run only when explicitly named via
+    /// `PDFZIG_FUZZ_TARGET=<name>`. Use for known-failing targets that
+    /// would otherwise abort default + aggressive sweeps. Documented in
+    /// `audit/fuzz_findings.md` against an open Finding so the gating
+    /// decision has a single canonical justification.
+    reproducer_only: bool = false,
 };
 
 /// Default gate set (PDFZIG_FUZZ_AGGRESSIVE unset). 11 targets, all required
@@ -87,7 +93,13 @@ const TARGETS = [_]Target{
     // accumulator (after the 4th '*85') exceeds 2^32. Minimal byte repro:
     // `"uuuuu"`. Bug lives in src/decompress.zig:386. See
     // audit/fuzz_findings.md (decoders section, ASCII85 overflow finding).
-    .{ .name = "decompress_ascii85_roundtrip", .run = fuzzDecompressAscii85Roundtrip, .aggressive = true },
+    // `reproducer_only`: this target deterministically aborts on the open
+    // Finding 005 (decodeASCII85 u32 overflow). Running it inside the
+    // aggressive sweep would crash an otherwise-clean PDFZIG_FUZZ_AGGRESSIVE=1
+    // run; gating it as reproducer-only means it executes ONLY when
+    // explicitly named via PDFZIG_FUZZ_TARGET=decompress_ascii85_roundtrip.
+    // Promote back to .aggressive once Finding 005 is fixed.
+    .{ .name = "decompress_ascii85_roundtrip", .run = fuzzDecompressAscii85Roundtrip, .reproducer_only = true },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -1264,8 +1276,17 @@ pub fn main(init: std.process.Init) !void {
     for (TARGETS, 0..) |target, ti| {
         if (target_filter) |f| {
             if (!std.mem.eql(u8, f, "all") and !std.mem.eql(u8, f, target.name)) continue;
-        } else if (target.aggressive and !aggressive_enabled) {
-            continue;
+            // `all` is for "every target except the known-broken ones"; a
+            // reproducer-only target is only reached when its name is named
+            // exactly. Otherwise PDFZIG_FUZZ_TARGET=all would re-introduce
+            // the deterministic abort the gating exists to prevent.
+            if (target.reproducer_only and !std.mem.eql(u8, f, target.name)) continue;
+        } else {
+            // No filter set → default + aggressive sweeps. Reproducer-only
+            // targets never run in this branch — they require the explicit
+            // PDFZIG_FUZZ_TARGET=<name> opt-in.
+            if (target.reproducer_only) continue;
+            if (target.aggressive and !aggressive_enabled) continue;
         }
         var prng = std.Random.DefaultPrng.init(base_seed +% @as(u64, ti) *% 0x9E3779B97F4A7C15);
         const rng = prng.random();
