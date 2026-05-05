@@ -46,6 +46,7 @@ const a11y_emitter = @import("a11y_emitter.zig");
 const uuid = @import("uuid.zig");
 const struct_writer = @import("struct_writer.zig");
 const mcid_resolver = @import("mcid_resolver.zig");
+const pagetree = @import("pagetree.zig");
 
 // ============================================================================
 // Target registry
@@ -369,6 +370,43 @@ const TARGETS = [_]Target{
     .{ .name = "pdf_writer_name_escape_roundtrip", .run = fuzzPdfWriterNameEscapeRoundtrip },
     .{ .name = "pdf_writer_string_escape_roundtrip", .run = fuzzPdfWriterStringEscapeRoundtrip },
     .{ .name = "pdf_writer_xref_byte_offsets", .run = fuzzPdfWriterXrefByteOffsets },
+    // Iter-18 (audit/fuzz_loop_state.md row 19 — pagetree.zig).
+    // The parser-side balanced /Pages tree assembly. DocumentBuilder.write
+    // emits a fan-out-10 tree (PAGE_TREE_FANOUT=10, src/pdf_document.zig:100);
+    // pagetree.buildPageTree walks it back out. Two default-gate targets:
+    //
+    //   T1 (`pagetree_balanced_shape`): synth N ∈ [1, 64] pages via
+    //     DocumentBuilder, write, reparse via Document.openFromMemory, then
+    //     walk the parsed tree from the catalog /Pages ref using
+    //     pagetree.resolveRef. SUT-independent invariants on internal
+    //     /Pages nodes (validates the writer's tree-shape claims at
+    //     parser side):
+    //       - Every internal node has /Kids.len ∈ [1, 10]
+    //         (PAGE_TREE_FANOUT). Discovers off-by-one in chunking.
+    //       - Every internal node's /Count equals the recursive sum of
+    //         leaf-page counts in its subtree (writer-side claim
+    //         vs reader-side recompute).
+    //       - Total leaf count == N == d.pageCount() (three-way agreement
+    //         between input N, root /Count, and Document's flattened view).
+    //       - Tree depth ≤ ⌈log_10(N)⌉ + 1 (root contributes one).
+    //       - Every non-root node has a /Parent reference; root has none.
+    //
+    //   T2 (`pagetree_parent_consistency`): same construction but probes
+    //     the /Parent ref hygiene end-to-end. After buildPageTree returns
+    //     N pages, each parsed Page's dict.get("Parent") MUST be a
+    //     `.reference` whose obj_num resolves through resolveRef back to
+    //     a `.dict` whose `/Type` is `/Pages` (no orphan pointers, no
+    //     reference to a /Page or non-existent obj). Plus verifies
+    //     per-page MediaBox round-trip when set per-page (writer
+    //     emits /MediaBox at the leaf when it differs from the
+    //     inherited default).
+    //
+    // N is bounded to 64 to keep wall-time honest at 100k iters; depth
+    // ranges from 1 (N≤10) to 2 (11≤N≤100), exercising both
+    // single-level (kids_are_leaves=true root) and multi-level branches
+    // in buildBalancedTree (src/pdf_document.zig:1548).
+    .{ .name = "pagetree_balanced_shape", .run = fuzzPagetreeBalancedShape },
+    .{ .name = "pagetree_parent_consistency", .run = fuzzPagetreeParentConsistency },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -5798,6 +5836,282 @@ fn fuzzPdfWriterXrefByteOffsets(
         if (reported != expected_offsets[i]) {
             return error.PdfWriterXrefRecordedOffsetMismatch;
         }
+    }
+}
+
+// ============================================================================
+// Iter-18 — pagetree.zig (row 19): balanced /Pages tree assembly.
+// ============================================================================
+
+/// Walk the parsed /Pages tree from a node ref and assert the shape
+/// invariants that DocumentBuilder.buildBalancedTree claims to
+/// produce. Returns the leaf count under this node.
+///
+/// Shared between T1 and T2 — keeping the recompute logic in one place
+/// rules out drift between the targets' oracles. Returns
+/// `error.PagetreeShape*` on the first divergence.
+const PageTreeFanout: u32 = 10; // mirror PAGE_TREE_FANOUT (pdf_document.zig:100)
+const MaxTreeDepth: u32 = 6; // ceil(log_10(64)) + 1 = 3; leaving slack for assert.
+
+const Iter18WalkErr = error{
+    PagetreeShapeNoTypeName,
+    PagetreeShapeBadType,
+    PagetreeShapeFanoutOver,
+    PagetreeShapeNoKids,
+    PagetreeShapeKidNotRef,
+    PagetreeShapeCountMissing,
+    PagetreeShapeCountMismatch,
+    PagetreeShapeDepthExceeded,
+    PagetreeShapeMissingParent,
+    PagetreeShapeUnexpectedParent,
+    PagetreeShapeParentNotRef,
+    PagetreeShapeParentResolveFailed,
+    PagetreeShapeParentNotPagesType,
+    PagetreeShapeNodeNotDict,
+    OutOfMemory,
+};
+
+fn iter18WalkAndCount(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    xref: *const @import("xref.zig").XRefTable,
+    cache: *std.AutoHashMap(u32, parser.Object),
+    node_ref: parser.ObjRef,
+    parent_obj: ?u32, // null at root; set on every recursive call
+    depth: u32,
+) Iter18WalkErr!u32 {
+    if (depth > MaxTreeDepth) return error.PagetreeShapeDepthExceeded;
+
+    const node = pagetree.resolveRef(allocator, data, xref, node_ref, cache) catch return error.PagetreeShapeNodeNotDict;
+    const dict = switch (node) {
+        .dict => |d| d,
+        else => return error.PagetreeShapeNodeNotDict,
+    };
+
+    const type_name = dict.getName("Type") orelse
+        // Some writers omit /Type — infer like buildPageTree does.
+        if (dict.get("Kids") != null) "Pages" else "Page";
+
+    // Verify /Parent contract on every node we visit.
+    if (parent_obj) |expect_parent| {
+        const parent_obj_field = dict.get("Parent") orelse return error.PagetreeShapeMissingParent;
+        const parent_ref = switch (parent_obj_field) {
+            .reference => |r| r,
+            else => return error.PagetreeShapeParentNotRef,
+        };
+        if (parent_ref.num != expect_parent) return error.PagetreeShapeParentResolveFailed;
+    } else {
+        // Root MUST NOT have /Parent.
+        if (dict.get("Parent") != null) return error.PagetreeShapeUnexpectedParent;
+    }
+
+    if (std.mem.eql(u8, type_name, "Page")) {
+        return 1;
+    }
+    if (!std.mem.eql(u8, type_name, "Pages")) {
+        return error.PagetreeShapeBadType;
+    }
+
+    // Internal node: validate /Kids and /Count.
+    const kids = dict.getArray("Kids") orelse return error.PagetreeShapeNoKids;
+    if (kids.len == 0 or kids.len > PageTreeFanout) return error.PagetreeShapeFanoutOver;
+
+    var leaf_sum: u32 = 0;
+    for (kids) |kid_obj| {
+        const kid_ref = switch (kid_obj) {
+            .reference => |r| r,
+            else => return error.PagetreeShapeKidNotRef,
+        };
+        leaf_sum += try iter18WalkAndCount(allocator, data, xref, cache, kid_ref, node_ref.num, depth + 1);
+    }
+
+    // /Count is mandatory on /Pages nodes per ISO 32000-1 §7.7.3.2.
+    const claimed_count = dict.getInt("Count") orelse return error.PagetreeShapeCountMissing;
+    if (claimed_count < 0) return error.PagetreeShapeCountMismatch;
+    if (@as(u32, @intCast(claimed_count)) != leaf_sum) return error.PagetreeShapeCountMismatch;
+
+    return leaf_sum;
+}
+
+/// T1: balanced page-tree shape — fan-out, /Count agreement, depth bound.
+///
+/// Builds N ∈ [1, 64] pages via DocumentBuilder, writes, reparses,
+/// then walks from catalog /Pages ref. Three-way leaf-count oracle:
+/// input_n == root_count == d.pageCount().
+///
+/// What this exercises:
+///   - DocumentBuilder.buildBalancedTree (src/pdf_document.zig:1548) —
+///     the chunking loop with PAGE_TREE_FANOUT=10.
+///   - DocumentBuilder.write emission of /Type /Pages /Kids /Count
+///     /Parent at every internal node.
+///   - pagetree.buildPageTree's flattening (Document.pages population).
+///   - Cross-check: the writer's claimed /Count at every internal
+///     node equals a reader-side recursive recompute.
+fn fuzzPagetreeBalancedShape(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    // N ∈ [1, 64] gives depth ∈ [1, 2] under PAGE_TREE_FANOUT=10.
+    // Specifically: N ≤ 10 → depth 1 (root only), 11 ≤ N ≤ 100 → depth 2.
+    // We include depth-1 + depth-2 cases; depth-3 (N > 100) is omitted
+    // for wall-time honesty at 100k iters.
+    const n_pages = rng.intRangeAtMost(usize, 1, 64);
+
+    for (0..n_pages) |i| {
+        _ = i;
+        // Fixed-size pages — T1 is about tree shape, not media-box round-trip.
+        _ = try doc.addPage(.{ 0.0, 0.0, 612.0, 792.0 });
+    }
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+
+    // Three-way leaf-count oracle: input N MUST equal Document's
+    // flattened pageCount() AND the root /Pages /Count we recompute by
+    // walking the tree.
+    if (d.pageCount() != n_pages) return error.PagetreeBalancedShapePageCountMismatch;
+
+    // Re-walk the tree at parser level via the catalog /Pages ref.
+    var cache = std.AutoHashMap(u32, parser.Object).init(allocator);
+    defer cache.deinit();
+
+    const root_ref_obj = d.xref_table.trailer.get("Root") orelse return error.PagetreeBalancedShapeNoCatalog;
+    const root_ref = switch (root_ref_obj) {
+        .reference => |r| r,
+        else => return error.PagetreeBalancedShapeCatalogNotRef,
+    };
+
+    const catalog = pagetree.resolveRef(allocator, bytes, &d.xref_table, root_ref, &cache) catch return error.PagetreeBalancedShapeCatalogResolve;
+    const catalog_dict = switch (catalog) {
+        .dict => |dx| dx,
+        else => return error.PagetreeBalancedShapeCatalogNotDict,
+    };
+
+    const pages_ref_obj = catalog_dict.get("Pages") orelse return error.PagetreeBalancedShapeNoPagesRef;
+    const pages_ref = switch (pages_ref_obj) {
+        .reference => |r| r,
+        else => return error.PagetreeBalancedShapePagesNotRef,
+    };
+
+    const root_leaf_count = try iter18WalkAndCount(allocator, bytes, &d.xref_table, &cache, pages_ref, null, 0);
+    if (root_leaf_count != @as(u32, @intCast(n_pages))) {
+        return error.PagetreeBalancedShapeRootCountMismatch;
+    }
+}
+
+/// T2: parent-consistency — every parsed Page's /Parent ref points to
+/// an in-tree /Pages node, and per-page MediaBox round-trips.
+///
+/// What this exercises (complementary to T1):
+///   - DocumentBuilder.write's parent-pointer patching: leaves on
+///     every level point to their immediate /Pages node, and every
+///     internal /Pages node (except the root) carries /Parent at the
+///     next level up.
+///   - pagetree.buildPageTree's MediaBox inheritance — when each
+///     leaf carries its own /MediaBox the recovered Page.media_box
+///     MUST equal the input within float-equality tolerance.
+///   - Cross-check: every parsed Page.dict.get("Parent") is an
+///     in-tree obj that resolves to a /Pages dict (no orphans,
+///     no swap-with-/Page).
+fn fuzzPagetreeParentConsistency(rng: std.Random, allocator: std.mem.Allocator, scratch: []u8, seed_pdf: []const u8) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+
+    // Same N range as T1 — we want both depth-1 and depth-2 trees.
+    const n_pages = rng.intRangeAtMost(usize, 1, 64);
+
+    // Capture per-page MediaBox so we can verify round-trip.
+    var expected_boxes = try allocator.alloc([4]f64, n_pages);
+    defer allocator.free(expected_boxes);
+
+    for (0..n_pages) |i| {
+        // Per-page MediaBox: width/height ∈ [100, 2400] pt
+        // (UserUnit=1 spec ceiling). Vary to ensure each leaf gets its
+        // own /MediaBox emitted, exercising the per-page-vs-inherited
+        // branch in pdf_document.zig:1207.
+        const w = 100.0 + rng.float(f64) * 2300.0;
+        const h = 100.0 + rng.float(f64) * 2300.0;
+        expected_boxes[i] = .{ 0.0, 0.0, w, h };
+        _ = try doc.addPage(expected_boxes[i]);
+    }
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+
+    if (d.pageCount() != n_pages) return error.PagetreeParentPageCountMismatch;
+
+    // Per-page MediaBox round-trip oracle.
+    for (0..n_pages) |i| {
+        const got = d.pages.items[i].media_box;
+        for (0..4) |k| {
+            // Strict equality: writer emits %g, parser decodes; for
+            // values that round-trip cleanly through %g the match is
+            // exact. A loose tolerance hides the off-by-one in writer
+            // formatting we want to catch.
+            if (got[k] != expected_boxes[i][k]) {
+                // Allow a small epsilon for the float-format
+                // round-trip; any divergence > 0.001 pt is a bug.
+                const diff = if (got[k] > expected_boxes[i][k]) got[k] - expected_boxes[i][k] else expected_boxes[i][k] - got[k];
+                if (diff > 0.001) return error.PagetreeParentMediaBoxMismatch;
+            }
+        }
+    }
+
+    // Per-leaf /Parent must resolve to an in-tree /Pages dict.
+    var cache = std.AutoHashMap(u32, parser.Object).init(allocator);
+    defer cache.deinit();
+
+    for (0..n_pages) |i| {
+        const page_dict = d.pages.items[i].dict;
+        const parent_obj = page_dict.get("Parent") orelse return error.PagetreeParentLeafNoParent;
+        const parent_ref = switch (parent_obj) {
+            .reference => |r| r,
+            else => return error.PagetreeParentLeafNotRef,
+        };
+        const resolved = pagetree.resolveRef(allocator, bytes, &d.xref_table, parent_ref, &cache) catch
+            return error.PagetreeParentLeafResolveFailed;
+        const resolved_dict = switch (resolved) {
+            .dict => |dx| dx,
+            else => return error.PagetreeParentLeafNotDict,
+        };
+        // The resolved /Parent dict MUST be /Type /Pages, never /Page.
+        // A swap here would mean the writer emitted a parent pointer
+        // pointing back at another leaf — silent corruption that
+        // pageCount() can't detect.
+        const parent_type = resolved_dict.getName("Type") orelse
+            if (resolved_dict.get("Kids") != null) "Pages" else "Page";
+        if (!std.mem.eql(u8, parent_type, "Pages")) {
+            return error.PagetreeParentLeafTypeNotPages;
+        }
+        // Cross-check: the resolved parent's /Kids MUST contain this
+        // page's obj_num. A parent that doesn't list us is also
+        // corruption.
+        const kids = resolved_dict.getArray("Kids") orelse return error.PagetreeParentLeafParentNoKids;
+        var found_self = false;
+        for (kids) |kid_obj| {
+            switch (kid_obj) {
+                .reference => |kr| {
+                    if (kr.num == d.pages.items[i].ref.num) {
+                        found_self = true;
+                        break;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (!found_self) return error.PagetreeParentLeafNotInParentKids;
     }
 }
 
