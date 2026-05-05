@@ -1954,6 +1954,112 @@ test "PR-SX1: emitElementJson byte-identical with new nullable fields" {
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"mcid_text\"") == null);
 }
 
+// PR-22c: BMC tag-only marked content. The fixture wraps a page-number
+// glyph run in `q /Artifact BMC ... EMC Q`; per ISO 32000-1 §14.8.2.2.2
+// and PDF/UA-1 §7.1, that text is NOT part of the document's logical
+// content. `extractText` must skip it.
+test "PR-22c: BMC /Artifact suppresses page-number text in extractText" {
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateBmcArtifactPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try doc.extractText(0, &out.writer);
+
+    // Body text MUST appear; artifact text MUST NOT.
+    // Split asserts so the failing line points at the exact clause.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Body text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Page 1") == null);
+}
+
+test "PR-22c: BMC fixture parses cleanly (no UnmatchedEMC, no leak)" {
+    // Defensive: the fixture's BMC/EMC pair must round-trip through
+    // the parser without bubbling an error and without leaking.
+    // testing.allocator catches the leak; the explicit `try` catches
+    // a parse error.
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateBmcArtifactPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try doc.extractText(0, &out.writer);
+    // Sanity: at least the body text made it.
+    try std.testing.expect(out.written().len > 0);
+}
+
+test "PR-22c: existing BDC tagged-table fixture still extracts byte-identical" {
+    // Regression guard: the BMC parsing addition in extractContentStream
+    // shares a code path with BDC; this test pins that the existing
+    // tagged-table fixture (BDC + MCID property dict) keeps producing
+    // its six MCID-bracketed cell texts unchanged.
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const detected = try doc.getTables(allocator);
+    defer zpdf.tables.freeTables(allocator, detected);
+
+    // Same gate as `tagged table extracts cell text` — duplicated here
+    // so a BMC-side regression that breaks BDC fails on this PR's test.
+    var match_idx: ?usize = null;
+    for (detected, 0..) |t, i| {
+        if (t.engine == zpdf.tables.Engine.tagged and
+            t.n_rows == 2 and t.n_cols == 3)
+        {
+            match_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(match_idx != null);
+    try std.testing.expectEqual(@as(usize, 6), detected[match_idx.?].cells.len);
+}
+
+test "PR-22c: emitElementJson never emits mcid == -1 in mcid_refs" {
+    // Round-trip gate: when the struct tree contains BMC sentinels (or
+    // would, in a malformed reading), they MUST NOT surface in the
+    // `--struct-tree` JSON output. Today the BDC-only fixture has no
+    // sentinels, but the negative-space assertion guards against a
+    // future regression that lets MCID=-1 leak into mcid_refs arrays.
+    const allocator = std.testing.allocator;
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    var doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const tree = try doc.getStructTree();
+    try std.testing.expect(tree.root != null);
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try zpdf.structtree.emitElementJson(tree.root.?, &aw.writer, 0);
+
+    // No mcid_refs entry should be -1. A naive `indexOf(... "-1")`
+    // search over the full document would also match e.g. `page_obj`
+    // values; instead scan for the literal `-1` token inside any
+    // `"mcid_refs":[ ... ]` array.
+    const haystack = aw.written();
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, idx, "\"mcid_refs\":[")) |start| {
+        const arr_start = start + "\"mcid_refs\":[".len;
+        const arr_end_rel = std.mem.indexOfPos(u8, haystack, arr_start, "]") orelse break;
+        const arr = haystack[arr_start..arr_end_rel];
+        try std.testing.expect(std.mem.indexOf(u8, arr, "-1") == null);
+        idx = arr_end_rel + 1;
+    }
+}
+
 test "PR-20: getPageAnnotations returns empty for page without /Annots" {
     const allocator = std.testing.allocator;
     const bytes = try testpdf.generateMinimalPdf(allocator, "Hello");

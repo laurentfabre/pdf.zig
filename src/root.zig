@@ -2830,14 +2830,57 @@ fn extractContentStream(
     var text_buf: [MCID_TEXT_BUF_SIZE]u8 = undefined;
     var text_pos: usize = 0;
 
+    // PR-22c: marked-content tag stack for `.stream` mode.
+    // PDF spec §14.7 wraps every BMC/BDC ... EMC pair around an
+    // optional /Tag. When the innermost tag is `/Artifact` (page
+    // numbers, headers, decorations) the bracketed text is NOT part
+    // of the document's logical content and `extractText` must skip
+    // it (PDF/UA-1 §7.1, ISO 32000-1 §14.8.2.2.2).
+    //
+    // Bounded by MAX_MC_DEPTH so adversarial / corrupt streams cannot
+    // exhaust memory; deeper nesting silently degrades to a no-op
+    // (the stream still parses, the artifact gate just stops biting).
+    const MAX_MC_DEPTH: u8 = 64;
+    var mc_tag_stack: [MAX_MC_DEPTH][]const u8 = undefined;
+    var mc_depth: u8 = 0;
+
     while (try lexer.next()) |token| {
         if (pushOperand(&operands, &operand_count, token)) continue;
 
         // token is an operator
         const op = token.operator;
+
+        // PR-22c: in `.stream` mode, suppress text emission while the
+        // innermost marked-content tag is `/Artifact`. The flag is
+        // recomputed each iteration from the top of the stack so the
+        // text-emit branches below can do a cheap boolean check.
+        const in_artifact = mode == .stream and mc_depth > 0 and
+            std.mem.eql(u8, mc_tag_stack[mc_depth - 1], "Artifact");
+
         if (op.len > 0) switch (op[0]) {
             'B' => switch (mode) {
-                .stream => if (op.len == 2 and op[1] == 'T') {},
+                .stream => {
+                    if (op.len == 2 and op[1] == 'T') {
+                        // BT — text-object begin, no marked-content effect.
+                    } else if (std.mem.eql(u8, op, "BDC") or std.mem.eql(u8, op, "BMC")) {
+                        // PR-22c: track marked-content nesting in
+                        // `.stream` mode. Both BMC and BDC begin a
+                        // bracket; their first operand is the /Tag.
+                        // The optional property dict (BDC only) is
+                        // not needed here — only the tag drives the
+                        // artifact-skip gate.
+                        if (operand_count >= 1 and operands[0] == .name and mc_depth < MAX_MC_DEPTH) {
+                            mc_tag_stack[mc_depth] = operands[0].name;
+                            mc_depth += 1;
+                        } else if (mc_depth < MAX_MC_DEPTH) {
+                            // Defensive: no name operand (corrupt stream)
+                            // — push a sentinel so EMC still pairs cleanly
+                            // and the depth invariant holds.
+                            mc_tag_stack[mc_depth] = "";
+                            mc_depth += 1;
+                        }
+                    }
+                },
                 .bounds => {},
                 .structured => |extractor| {
                     if (std.mem.eql(u8, op, "BDC")) {
@@ -2847,15 +2890,31 @@ fn extractContentStream(
                             try extractor.beginMarkedContent(tag, mcid);
                         }
                     } else if (std.mem.eql(u8, op, "BMC")) {
-                        if (operand_count >= 1) {
-                            const tag = operands[0].asName() orelse "Unknown";
-                            try extractor.beginMarkedContent(tag, null);
+                        // PR-22c: BMC is the tag-only variant — a name
+                        // operand and nothing else. mcid = null pushes
+                        // the -1 sentinel onto the extractor's stack so
+                        // an artifact bracket leaves no MCID artefacts
+                        // behind, and EMC still pops cleanly.
+                        if (operand_count >= 1 and operands[0] == .name) {
+                            try extractor.beginMarkedContent(operands[0].name, null);
                         }
                     }
                 },
             },
             'E' => switch (mode) {
-                .stream => if (op.len == 2 and op[1] == 'T') {},
+                .stream => {
+                    if (op.len == 2 and op[1] == 'T') {
+                        // ET — text-object end.
+                    } else if (std.mem.eql(u8, op, "EMC")) {
+                        // PR-22c: pop the marked-content tag stack.
+                        // Spec-compliant streams pair every BMC/BDC
+                        // with EMC; we silently tolerate underflow
+                        // (mc_depth == 0) rather than aborting because
+                        // the existing extraction pipeline is
+                        // permissive — see ErrorConfig.permissive.
+                        if (mc_depth > 0) mc_depth -= 1;
+                    }
+                },
                 .bounds => {},
                 .structured => |extractor| {
                     if (std.mem.eql(u8, op, "EMC")) {
@@ -2957,8 +3016,11 @@ fn extractContentStream(
                 'j' => if (operand_count >= 1) {
                     switch (mode) {
                         .stream => {
-                            try writeTextWithFont(operands[0], current_font, writer);
-                            last_text_font_size = font_size;
+                            // PR-22c: skip Tj while bracketed by /Artifact BMC/BDC.
+                            if (!in_artifact) {
+                                try writeTextWithFont(operands[0], current_font, writer);
+                                last_text_font_size = font_size;
+                            }
                         },
                         .bounds => |collector| try writeTextWithFont(operands[0], current_font, collector),
                         .structured => |extractor| {
@@ -2971,8 +3033,11 @@ fn extractContentStream(
                 'J' => if (operand_count >= 1) {
                     switch (mode) {
                         .stream => {
-                            try writeTJArrayWithFont(operands[0], current_font, writer);
-                            last_text_font_size = font_size;
+                            // PR-22c: skip TJ while bracketed by /Artifact BMC/BDC.
+                            if (!in_artifact) {
+                                try writeTJArrayWithFont(operands[0], current_font, writer);
+                                last_text_font_size = font_size;
+                            }
                         },
                         .bounds => |collector| try writeTJArrayToCollector(operands[0], current_font, collector),
                         .structured => |extractor| {
@@ -2987,9 +3052,12 @@ fn extractContentStream(
             '\'' => if (operand_count >= 1) {
                 switch (mode) {
                     .stream => {
-                        try writer.writeByte('\n');
-                        try writeTextWithFont(operands[0], current_font, writer);
-                        last_text_font_size = font_size;
+                        // PR-22c: skip ' (move-and-show) while bracketed by /Artifact.
+                        if (!in_artifact) {
+                            try writer.writeByte('\n');
+                            try writeTextWithFont(operands[0], current_font, writer);
+                            last_text_font_size = font_size;
+                        }
                     },
                     .bounds => |collector| {
                         try collector.flush();
@@ -3005,9 +3073,12 @@ fn extractContentStream(
             '"' => if (operand_count >= 3) {
                 switch (mode) {
                     .stream => {
-                        try writer.writeByte('\n');
-                        try writeTextWithFont(operands[2], current_font, writer);
-                        last_text_font_size = font_size;
+                        // PR-22c: skip " (set-spacing-and-show) while bracketed by /Artifact.
+                        if (!in_artifact) {
+                            try writer.writeByte('\n');
+                            try writeTextWithFont(operands[2], current_font, writer);
+                            last_text_font_size = font_size;
+                        }
                     },
                     .bounds => |collector| {
                         try collector.flush();

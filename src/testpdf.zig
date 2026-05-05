@@ -2853,6 +2853,93 @@ pub const cjk_fixtures = [_]CjkFixture{
     .{ .id = "ko-v-01", .lang = "ko", .wmode = 1, .utf8 = "세로" },
 };
 
+/// PR-22c: a single-page tagged PDF whose page-number text is wrapped
+/// in `q /Artifact BMC ... EMC Q`, while the body text uses an
+/// ordinary `BT ... ET` block. Per ISO 32000-1 §14.8.2.2.2 and
+/// PDF/UA-1 §7.1, `/Artifact` BMC brackets are NOT part of the
+/// document's logical content and `extractText` must skip them.
+///
+/// This is the BMC tag-only variant (no MCID property dict) — the
+/// PR-21 reader already handled BDC; this fixture exercises the new
+/// BMC parsing path in `extractContentStream`.
+///
+/// Object layout:
+///   1. Catalog
+///   2. Pages
+///   3. Page (no /StructParents — there's no struct tree here on
+///      purpose; the artifact gate is content-stream-only)
+///   4. Page content stream — body text + artifact-wrapped page number
+///   5. Font /F1 (Helvetica)
+///
+/// Body text:     "Body text"
+/// Artifact text: "Page 1"  (must NOT appear in extractText output)
+pub fn generateBmcArtifactPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf = std.Io.Writer.Allocating.init(allocator);
+    errdefer pdf.deinit();
+    const writer = &pdf.writer;
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.written().len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.written().len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.written().len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    // Body text in a normal BT/ET block; the artifact (page number) is
+    // wrapped in `/Artifact BMC ... EMC` outside the BT/ET.
+    //
+    // PDF spec §14.7.2: BMC takes a single name operand; no property
+    // dict (that's BDC). The text emitted between BMC and EMC must be
+    // suppressed by `extractText` (PDF/UA-1 §7.1).
+    const content =
+        \\BT
+        \\/F1 12 Tf
+        \\1 0 0 1 100 700 Tm
+        \\(Body text) Tj
+        \\ET
+        \\q
+        \\/Artifact BMC
+        \\BT
+        \\/F1 10 Tf
+        \\1 0 0 1 280 50 Tm
+        \\(Page 1) Tj
+        \\ET
+        \\EMC
+        \\Q
+        \\
+    ;
+    const obj4_offset = pdf.written().len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.len});
+    try writer.writeAll(content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.written().len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.writeAll("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    const xref_offset = pdf.written().len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return try pdf.toOwnedSlice();
+}
+
 test "generate CJK Identity-H PDF (Japanese)" {
     const pdf_data = try generateCjkPdfFromUtf8(std.testing.allocator, "日本語", 0);
     defer std.testing.allocator.free(pdf_data);

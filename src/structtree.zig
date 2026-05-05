@@ -411,7 +411,15 @@ fn collectMcidsInOrder(
 ) !void {
     if (depth >= MAX_STRUCT_DEPTH) return;
 
-    // Skip artifacts - they're not part of reading order
+    // PR-22c: skip artifacts. Two layers of artifact-suppression
+    // exist; this is the structure-tree side. /Artifact StructElems
+    // (PDF/UA-1 §7.1) are out-of-band: page numbers, headers, layout
+    // furniture. They never appear in the document's logical reading
+    // order, so we drop the entire subtree.
+    //
+    // The complementary content-stream gate lives in `extractContentStream`
+    // (root.zig) and skips text bracketed by `/Artifact BMC ... EMC`
+    // even when no struct tree is present.
     if (std.mem.eql(u8, elem.struct_type, "Artifact")) return;
 
     const current_page = elem.page_ref orelse parent_page;
@@ -422,6 +430,14 @@ fn collectMcidsInOrder(
                 try collectMcidsInOrder(sub_elem, result, allocator, current_page, depth + 1);
             },
             .mcid => |mcr| {
+                // PR-22c: skip BMC sentinel refs. `mcid == -1` is
+                // pushed by `MarkedContentExtractor.beginMarkedContent`
+                // when a tag-only `/Tag BMC ... EMC` bracket has no
+                // MCID property dict (PDF §14.7.2). Such refs never
+                // appear in `/StructParents` chains and have no page
+                // anchor — they MUST NOT enter reading order.
+                if (mcr.mcid < 0) continue;
+
                 const page_ref = mcr.page_ref orelse current_page;
                 if (page_ref) |pr| {
                     // Use object number as page index proxy (will be resolved later)
@@ -791,7 +807,16 @@ pub const MarkedContentExtractor = struct {
     }
 
     /// Get text for an MCID
+    ///
+    /// PR-22c: returns null on any negative MCID. `-1` is the BMC
+    /// sentinel (tag-only marked content with no property dict);
+    /// other negatives are illegal per PDF §14.7.2 (MCID is a
+    /// non-negative integer). Callers that walk `/StructParents`
+    /// arrays should never hand us a negative, but a corrupt tree
+    /// could — fail closed instead of indexing the hashmap with
+    /// a value that has no business being a key.
     pub fn getTextForMcid(self: *const MarkedContentExtractor, mcid: i32) ?[]const u8 {
+        if (mcid < 0) return null;
         if (self.content_by_mcid.get(mcid)) |buf| {
             return buf.items;
         }
