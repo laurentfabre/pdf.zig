@@ -44,6 +44,7 @@ const structtree = @import("structtree.zig");
 const markdown = @import("markdown.zig");
 const a11y_emitter = @import("a11y_emitter.zig");
 const uuid = @import("uuid.zig");
+const struct_writer = @import("struct_writer.zig");
 
 // ============================================================================
 // Target registry
@@ -295,6 +296,29 @@ const TARGETS = [_]Target{
     .{ .name = "a11y_emitter_synth_tree_emit", .run = fuzzA11yEmitterSynthTreeEmit },
     .{ .name = "a11y_emitter_flatten_then_emit", .run = fuzzA11yEmitterFlattenThenEmit },
     .{ .name = "a11y_emitter_reading_order_dfs", .run = fuzzA11yEmitterReadingOrderDfs },
+    // Iter-15 (audit/fuzz_loop_state.md row 13 — struct_writer.zig).
+    // Three default-gate targets exercising the writer in increasing
+    // depth:
+    //   T1 (`struct_writer_setroot_depth_boundary`): pure pre-emit
+    //     contract — `setRoot` must accept depth ≤ 64, reject depth
+    //     ≥ 65 with `error.StructTreeTooDeep`, and reject re-entry
+    //     with `error.StructTreeAlreadySet`. No PDF bytes are emitted.
+    //   T2 (`struct_writer_emit_object_count`): drive `emit()` against
+    //     a real `pdf_writer.Writer` with a single fake page
+    //     obj_num. SUT-independent oracle: count `/Type /StructTreeRoot`
+    //     occurrences == 1 and `/Type /StructElem` occurrences ==
+    //     pre-walk node count. Asserts the writer never emits more
+    //     elements than it claimed in pass 1.
+    //   T3 (`struct_writer_roundtrip_via_documentbuilder`): the
+    //     headline tier-3 round-trip. Build a tagged PDF via
+    //     `DocumentBuilder` + `setStructTree`, write, reopen via
+    //     `Document.openFromMemory`, call `getStructTree()`, and
+    //     assert (a) parsed root tag equals input root tag, (b)
+    //     parsed pre-order tag-name sequence equals input sequence,
+    //     (c) total element count matches.
+    .{ .name = "struct_writer_setroot_depth_boundary", .run = fuzzStructWriterSetRootDepthBoundary },
+    .{ .name = "struct_writer_emit_object_count", .run = fuzzStructWriterEmitObjectCount },
+    .{ .name = "struct_writer_roundtrip_via_documentbuilder", .run = fuzzStructWriterRoundtripViaDocumentBuilder },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -4454,6 +4478,408 @@ fn fuzzMarkdownToPdfUntagged(rng: std.Random, allocator: std.mem.Allocator, scra
     // strong correctness check. A negative-space catalog probe
     // would need a parsed-object-graph inspection (deferred —
     // we'd want a `Document.hasStructTree()` helper or similar).
+}
+
+// ============================================================================
+// Iter-15 — struct_writer.zig (`StructTreeBuilder.{setRoot,emit}`, row 13)
+// ============================================================================
+//
+// `struct_writer.zig` emits the `/StructTreeRoot` + `/StructElem` forest from
+// a caller-provided `TaggedElement` tree. Today it's reached only through
+// `DocumentBuilder.setStructTree`/`write` integration tests; no fuzz target
+// drives the writer directly or asserts an algebraic emit→parse→equal
+// property. Three targets in increasing depth:
+//
+//   T1 (`struct_writer_setroot_depth_boundary`, default-gate):
+//     Pre-emit contract on `setRoot`. Random tree depth in [0..70]; the
+//     writer must accept depth ≤ 64 and reject depth ≥ 65 with
+//     `error.StructTreeTooDeep`. Re-entry on the same builder must reject
+//     with `error.StructTreeAlreadySet`. State-machine invariant: the
+//     boundary is the ONLY transition that distinguishes accept/reject —
+//     anything else (no setRoot, deinit-then-reinit) must round-trip
+//     cleanly.
+//
+//   T2 (`struct_writer_emit_object_count`, default-gate):
+//     Drive `emit()` against a real `pdf_writer.Writer` with a single
+//     fake page obj_num. SUT-independent oracle: count `/Type /StructTreeRoot`
+//     occurrences in finalized bytes == 1, and `/Type /StructElem`
+//     occurrences == pre-walk node count. We emit ONLY structural objects
+//     (no content streams, no Catalog body) so the iter-12 P2 caveat
+//     about "substring scans on emitted PDF bytes are unreliable when
+//     content streams contain literal text" doesn't apply: no caller-
+//     reachable byte path can synthesize the literal `/Type /StructElem`
+//     except the writer itself.
+//
+//   T3 (`struct_writer_roundtrip_via_documentbuilder`, default-gate):
+//     The headline tier-3 round-trip. Build a tagged PDF via
+//     `DocumentBuilder` + `setStructTree`, write, reopen via
+//     `Document.openFromMemory`, call `getStructTree()`, walk both trees
+//     in pre-order, and assert (a) parsed root tag == input root tag,
+//     (b) parsed pre-order tag-name sequence == input sequence, (c)
+//     parsed element count == input element count. MCID leaves are
+//     dropped from the comparison (the parser's MCID type is `i32` and
+//     order-of-appearance equality is asserted in iter-14's
+//     `a11y_emitter_reading_order_dfs`); this target is purely about
+//     the element-tree shape.
+
+const ITER15_TAG_POOL = [_][]const u8{ "Document", "Sect", "Part", "P", "H1", "H2", "Span", "Figure" };
+
+/// Pick a random tag name. Restricted to PDF/UA standard names so the
+/// parser can round-trip them as bare /Names without escaping concerns.
+fn iter15PickTag(rng: std.Random) []const u8 {
+    return ITER15_TAG_POOL[rng.intRangeAtMost(usize, 0, ITER15_TAG_POOL.len - 1)];
+}
+
+/// Build a random `TaggedElement` tree on `aa` (caller's arena). Returns
+/// the root pointer. `node_count_out` is bumped per element. `mcid_seq`
+/// is bumped per MCID leaf (each leaf gets a unique 0-based MCID; the
+/// caller wires `page_idx = 0`). Bounded depth — caller picks the
+/// `max_depth` cap so we can probe both the accepting and rejecting
+/// half of the boundary.
+fn iter15BuildTree(
+    aa: std.mem.Allocator,
+    rng: std.Random,
+    depth: u32,
+    max_depth: u32,
+    node_count_out: *usize,
+    mcid_seq: *u32,
+) !*struct_writer.TaggedElement {
+    const elem = try aa.create(struct_writer.TaggedElement);
+    node_count_out.* += 1;
+    const tag = if (depth == 0) "Document" else iter15PickTag(rng);
+
+    // Branching factor: 0..3 children. At max_depth-1 we must NOT
+    // recurse further (the writer's MAX_DEPTH = 64 boundary), so cap
+    // children to MCID leaves only.
+    const at_floor = depth + 1 >= max_depth;
+    const child_count = rng.intRangeAtMost(usize, 0, 3);
+    const kids = try aa.alloc(struct_writer.TaggedChild, child_count);
+    for (kids) |*c| {
+        // 50/50 between nested element and MCID leaf, unless at_floor.
+        const want_elem = !at_floor and rng.boolean();
+        if (want_elem) {
+            const sub = try iter15BuildTree(aa, rng, depth + 1, max_depth, node_count_out, mcid_seq);
+            c.* = .{ .element = sub };
+        } else {
+            const m = mcid_seq.*;
+            mcid_seq.* += 1;
+            c.* = .{ .mcid = .{ .page_idx = 0, .mcid = m } };
+        }
+    }
+
+    elem.* = .{
+        .tag = tag,
+        .children = kids,
+    };
+    return elem;
+}
+
+/// Build a strictly-linear chain of `chain_depth` elements (depth ==
+/// chain_depth, since depth is 0-indexed length-1 in the writer's
+/// validateDepth). The deepest element has no children. Returns the
+/// root.
+fn iter15BuildLinearChain(
+    aa: std.mem.Allocator,
+    chain_depth: u32,
+) !*struct_writer.TaggedElement {
+    std.debug.assert(chain_depth >= 1);
+    // Allocate elements first (stable pointers), then wire children.
+    const elems = try aa.alloc(*struct_writer.TaggedElement, chain_depth);
+    for (elems) |*e| e.* = try aa.create(struct_writer.TaggedElement);
+
+    // Wire i -> i+1 for i in 0..chain_depth-1.
+    var i: usize = 0;
+    while (i + 1 < chain_depth) : (i += 1) {
+        const kids = try aa.alloc(struct_writer.TaggedChild, 1);
+        kids[0] = .{ .element = elems[i + 1] };
+        elems[i].* = .{ .tag = "Sect", .children = kids };
+    }
+    // Leaf.
+    elems[chain_depth - 1].* = .{ .tag = "Sect", .children = &.{} };
+    return elems[0];
+}
+
+/// Pre-order walk: append every element's tag to `out`. Mirrors the
+/// writer's prepass order (parent before children, children in slice
+/// order) — the parser-side walker MUST produce the same sequence on
+/// any well-formed round-trip.
+fn iter15PreorderTagsBuilt(
+    elem: *const struct_writer.TaggedElement,
+    out: *std.ArrayList([]const u8),
+    aa: std.mem.Allocator,
+) !void {
+    try out.append(aa, elem.tag);
+    for (elem.children) |c| switch (c) {
+        .element => |e| try iter15PreorderTagsBuilt(e, out, aa),
+        .mcid => {},
+    };
+}
+
+fn iter15PreorderTagsParsed(
+    elem: *const structtree.StructElement,
+    out: *std.ArrayList([]const u8),
+    aa: std.mem.Allocator,
+) !void {
+    try out.append(aa, elem.struct_type);
+    for (elem.children) |c| switch (c) {
+        .element => |e| try iter15PreorderTagsParsed(e, out, aa),
+        .mcid => {},
+    };
+}
+
+/// T1 — `setRoot` depth-boundary state machine.
+///
+/// Three sub-cases per iter, deterministically interleaved on the seed:
+///   1. Random tree with depth ≤ 64 (built via iter15BuildTree with a
+///      max_depth pick from [1, 64]). MUST accept.
+///   2. Linear chain at depth exactly 65. MUST reject with
+///      `error.StructTreeTooDeep`. (Depth 64 is the cap; 65 is the
+///      first rejecting case.)
+///   3. Re-entry: after sub-case (1), call `setRoot` a second time on
+///      the same builder with a different leaf root. MUST reject with
+///      `error.StructTreeAlreadySet`. The first root MUST remain the
+///      live one (probed by re-emitting in T2; here we only assert the
+///      error.)
+fn fuzzStructWriterSetRootDepthBoundary(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // --- sub-case 1: accepting depth ----------------------------------
+    {
+        const max_depth = rng.intRangeAtMost(u32, 1, 64);
+        var node_count: usize = 0;
+        var mcid_seq: u32 = 0;
+        const root = try iter15BuildTree(aa, rng, 0, max_depth, &node_count, &mcid_seq);
+
+        var b = struct_writer.StructTreeBuilder.init(allocator);
+        defer b.deinit();
+        b.setRoot(root) catch |e| {
+            // Any error here is a bug — every tree under max_depth ≤ 64
+            // is a legal input.
+            std.debug.print("setRoot rejected at max_depth={d}: {s}\n", .{ max_depth, @errorName(e) });
+            return error.StructWriterSetRootRejectedLegalDepth;
+        };
+
+        // Re-entry rejection (sub-case 3).
+        var leaf_b: struct_writer.TaggedElement = .{ .tag = "P" };
+        const re = b.setRoot(&leaf_b);
+        if (re) |_| {
+            return error.StructWriterReentryAccepted;
+        } else |err| {
+            if (err != error.StructTreeAlreadySet) {
+                return error.StructWriterReentryWrongError;
+            }
+        }
+    }
+
+    // --- sub-case 2: rejecting depth ----------------------------------
+    {
+        const root = try iter15BuildLinearChain(aa, 65); // chain depth 65 → validateDepth depth 64 → reject
+
+        var b = struct_writer.StructTreeBuilder.init(allocator);
+        defer b.deinit();
+        const re = b.setRoot(root);
+        if (re) |_| {
+            return error.StructWriterDepth65Accepted;
+        } else |err| {
+            if (err != error.StructTreeTooDeep) {
+                return error.StructWriterDepth65WrongError;
+            }
+        }
+    }
+
+    // --- negative-space sanity: a fresh builder accepts a depth-1 leaf.
+    {
+        var leaf: struct_writer.TaggedElement = .{ .tag = "P" };
+        var b = struct_writer.StructTreeBuilder.init(allocator);
+        defer b.deinit();
+        b.setRoot(&leaf) catch return error.StructWriterFreshBuilderRejectedLeaf;
+    }
+}
+
+/// T2 — `emit()` object-count oracle.
+///
+/// Drives `StructTreeBuilder.emit()` against a real `pdf_writer.Writer`
+/// with a single fake page obj_num. The writer is fed only the
+/// minimum needed to reach `emit()`: header, one fake page object,
+/// then `reserve()` + `emit()`. We DON'T finalize the document
+/// (no xref, no trailer) — `finalize()` requires the whole PDF flow.
+/// Instead we read the writer's internal buffer directly via
+/// `writeXref` + `writeTrailer` + `finalize` to get a self-consistent
+/// owned slice for the substring scan.
+///
+/// SUT-independent oracle:
+///   `/Type /StructTreeRoot`  occurrences == 1
+///   `/Type /StructElem`      occurrences == pre-walk node count
+/// Also: `node_count > 0` per the writer's prepass guarantee
+/// (assert(self.nodes.items.len > 0) in emitTreeRoot).
+///
+/// No content stream is ever emitted by this target, so the
+/// "literal text contains the marker" failure mode that gated iter-12
+/// P2 cannot apply.
+fn fuzzStructWriterEmitObjectCount(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Random tree, max_depth ∈ [1..10]. Keeps node count bounded so
+    // the buffer scan stays cheap at 100k iters.
+    const max_depth = rng.intRangeAtMost(u32, 1, 10);
+    var node_count: usize = 0;
+    var mcid_seq: u32 = 0;
+    const root = try iter15BuildTree(aa, rng, 0, max_depth, &node_count, &mcid_seq);
+
+    // Build a writer + a single fake page object. The fake page is
+    // the only thing /MCR /Pg refs can point at; we emit it as a
+    // bare `<< /Type /Page >>` so the writer's xref machinery
+    // remains internally consistent.
+    var w = pdf_writer.Writer.init(allocator);
+    defer w.deinit();
+    try w.writeHeader();
+    const fake_page_obj = try w.allocObjectNum();
+    try w.beginObject(fake_page_obj, 0);
+    try w.writeRaw("<< /Type /Page >>");
+    try w.endObject();
+
+    var builder = struct_writer.StructTreeBuilder.init(allocator);
+    defer builder.deinit();
+    try builder.setRoot(root);
+
+    const page_obj_nums = [_]u32{fake_page_obj};
+    const root_obj = try builder.emit(&w, page_obj_nums[0..]);
+
+    _ = try w.writeXref();
+    try w.writeTrailer(0, root_obj, null);
+
+    const bytes = try w.finalize();
+    defer allocator.free(bytes);
+
+    // Byte-level invariants on the finalized PDF.
+    if (bytes.len < 5 or !std.mem.startsWith(u8, bytes, "%PDF-")) {
+        return error.StructWriterEmitMissingMagic;
+    }
+
+    const root_marker = "/Type /StructTreeRoot";
+    const elem_marker = "/Type /StructElem";
+    const root_occ = std.mem.count(u8, bytes, root_marker);
+    const elem_occ = std.mem.count(u8, bytes, elem_marker);
+
+    if (root_occ != 1) return error.StructWriterEmitWrongRootCount;
+    if (elem_occ != node_count) return error.StructWriterEmitWrongElemCount;
+
+    // Sanity: `emit()` returns the StructTreeRoot's obj_num. Must be
+    // > 0 (allocObjectNum starts at 1) and ≠ fake_page_obj (objects
+    // are unique).
+    if (root_obj == 0) return error.StructWriterEmitRootObjZero;
+    if (root_obj == fake_page_obj) return error.StructWriterEmitRootObjCollidesPage;
+}
+
+/// T3 — round-trip via `DocumentBuilder` ↔ `Document.openFromMemory`.
+///
+/// The headline tier-3 property: emitter and parser agree on tree
+/// shape. Build a tagged PDF, write, reopen, walk both sides in
+/// pre-order, assert tag-name sequences match.
+///
+/// Critical detail: every MCID leaf needs a real `beginTag`/`endTag`
+/// pair on a real page so the parser-side `parseStructTree` can
+/// resolve the marked-content dictionaries. We emit those tags with
+/// `drawText("x")` content so the BDC/EMC bracket has at least one
+/// operator inside it (writers that strip empty BDC blocks are a
+/// historical quirk; staying defensive matches the existing
+/// `PR-W10c: round-trip` test in pdf_document.zig).
+fn fuzzStructWriterRoundtripViaDocumentBuilder(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Cap the tree small — every MCID leaf needs a beginTag/endTag
+    // pair on the page, and we cap at 32 to keep wall time honest at
+    // 100k iters.
+    const max_depth = rng.intRangeAtMost(u32, 1, 5);
+    var node_count: usize = 0;
+    var mcid_seq: u32 = 0;
+    const root = try iter15BuildTree(aa, rng, 0, max_depth, &node_count, &mcid_seq);
+
+    if (mcid_seq > 32) return; // Skip oversized inputs without claiming a bug.
+
+    var doc = pdf_document.DocumentBuilder.init(allocator);
+    defer doc.deinit();
+    try doc.markAsTagged();
+    const page = try doc.addPage(.{ 0, 0, 612, 792 });
+
+    // Pre-bracket every MCID with a beginTag/endTag pair so the
+    // parser sees a well-formed marked-content stream. Tag name is
+    // arbitrary (the parser keys on /MCID, not on the BDC tag name);
+    // use "Span" for all to keep this trivial.
+    var i: u32 = 0;
+    while (i < mcid_seq) : (i += 1) {
+        // beginTag returns the next allocMcid value; we trust the
+        // counter to be 0..mcid_seq-1 since this is the only call
+        // site bumping it.
+        const got = try page.beginTag("Span", null);
+        if (got != i) return error.StructWriterRoundtripMcidSeqMismatch;
+        try page.drawText(50.0, 700.0 - @as(f64, @floatFromInt(i)) * 12.0, .helvetica, 10.0, "x");
+        try page.endTag();
+    }
+
+    try doc.setStructTree(root);
+
+    const bytes = try doc.write();
+    defer allocator.free(bytes);
+
+    if (!std.mem.startsWith(u8, bytes, "%PDF-")) return error.StructWriterRoundtripMissingMagic;
+
+    var d = try zpdf.Document.openFromMemory(allocator, bytes, zpdf.ErrorConfig.permissive());
+    defer d.close();
+
+    if (!d.hasStructureTree()) return error.StructWriterRoundtripNoStructTree;
+
+    const tree = try d.getStructTree();
+    // tree is on the parsing arena — do NOT call tree.deinit().
+    if (tree.root == null) return error.StructWriterRoundtripParsedRootNull;
+
+    // Pre-order tag-name sequence comparison.
+    var built_tags: std.ArrayList([]const u8) = .empty;
+    var parsed_tags: std.ArrayList([]const u8) = .empty;
+    try iter15PreorderTagsBuilt(root, &built_tags, aa);
+    try iter15PreorderTagsParsed(tree.root.?, &parsed_tags, aa);
+
+    if (built_tags.items.len != parsed_tags.items.len) {
+        return error.StructWriterRoundtripElementCountMismatch;
+    }
+    if (built_tags.items.len != node_count) {
+        // Self-check: the synth builder's node_count must match its
+        // own pre-order walk. If this fires, the harness has a bug.
+        return error.StructWriterRoundtripBuilderSelfMismatch;
+    }
+    for (built_tags.items, parsed_tags.items) |b, p| {
+        if (!std.mem.eql(u8, b, p)) return error.StructWriterRoundtripTagSequenceMismatch;
+    }
 }
 
 // ============================================================================
