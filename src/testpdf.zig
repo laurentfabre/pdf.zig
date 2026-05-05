@@ -2288,6 +2288,105 @@ pub fn generateLangPropagationPdf(allocator: std.mem.Allocator) ![]u8 {
     return try pdf.toOwnedSlice();
 }
 
+/// PR-22e: minimal tagged PDF with a single /Figure structure
+/// element. `with_alt = true` adds `/Alt (sunset)` so the doc is
+/// PDF/UA-1 §7.3 conformant; `with_alt = false` omits both /Alt and
+/// /ActualText so `validateAltText` returns
+/// `error.MissingAltTextOnFigure`.
+///
+/// The page itself contains one BDC/EMC bracket around a tiny text
+/// run so extractMarkdown still produces non-empty output (the
+/// validator must NOT run during normal extraction; this proves it).
+///
+/// Object layout (8 objs):
+///   1. Catalog          (/StructTreeRoot 6 0 R)
+///   2. Pages
+///   3. Page             (/StructParents 0)
+///   4. Content stream   (BT … /Figure BDC … EMC … ET)
+///   5. Font /F1
+///   6. StructTreeRoot   (/K 7 0 R)
+///   7. Figure element   (/S /Figure  [/Alt (...)]  /K [0])
+fn generateFigurePdf(allocator: std.mem.Allocator, with_alt: bool) ![]u8 {
+    var pdf = std.Io.Writer.Allocating.init(allocator);
+    errdefer pdf.deinit();
+    const writer = &pdf.writer;
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.written().len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.written().len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.written().len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> ");
+    try writer.writeAll("/StructParents 0 >>\n");
+    try writer.writeAll("endobj\n");
+
+    const content =
+        \\BT
+        \\/F1 12 Tf
+        \\/Figure <</MCID 0>> BDC
+        \\1 0 0 1 100 700 Tm
+        \\(Img) Tj
+        \\EMC
+        \\ET
+        \\
+    ;
+    const obj4_offset = pdf.written().len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.len});
+    try writer.writeAll(content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.written().len;
+    try writer.writeAll("5 0 obj\n");
+    try writer.writeAll("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    const obj6_offset = pdf.written().len;
+    try writer.writeAll("6 0 obj\n<< /Type /StructTreeRoot /K 7 0 R >>\nendobj\n");
+
+    const obj7_offset = pdf.written().len;
+    if (with_alt) {
+        try writer.writeAll(
+            "7 0 obj\n<< /S /Figure /P 6 0 R /Pg 3 0 R /Alt (sunset) /K [0] >>\nendobj\n",
+        );
+    } else {
+        try writer.writeAll(
+            "7 0 obj\n<< /S /Figure /P 6 0 R /Pg 3 0 R /K [0] >>\nendobj\n",
+        );
+    }
+
+    const xref_offset = pdf.written().len;
+    try writer.writeAll("xref\n0 8\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+
+    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return try pdf.toOwnedSlice();
+}
+
+/// PR-22e: PDF/UA-1 conformant — Figure element carries /Alt.
+pub fn generateFigureWithAltPdf(allocator: std.mem.Allocator) ![]u8 {
+    return generateFigurePdf(allocator, true);
+}
+
+/// PR-22e: PDF/UA-1 violation — Figure element lacks /Alt and /ActualText.
+pub fn generateFigureMissingAltPdf(allocator: std.mem.Allocator) ![]u8 {
+    return generateFigurePdf(allocator, false);
+}
+
 /// PR-2: a 2-page PDF with one ruled 3x3 table per page, BOTH placed
 /// in the vertical middle of their respective pages — neither sits
 /// near the page-boundary band that linkContinuations now requires.

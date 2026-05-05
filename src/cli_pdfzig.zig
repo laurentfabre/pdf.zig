@@ -74,6 +74,12 @@ pub const ExtractArgs = struct {
     /// document-level record carrying the full /StructTreeRoot walk
     /// as a JSON tree. Off by default (records can be very large).
     struct_tree: bool = false,
+    /// PR-22e [feat]: when true, run PDF/UA-1 validators
+    /// (`structtree.validateAll`) after parsing and emit one
+    /// `kind:"validation"` NDJSON record per finding. The CLI exits
+    /// non-zero if any error finding is emitted. Off by default —
+    /// adversarial PDFs would otherwise refuse to open.
+    validate_pdfua: bool = false,
 };
 
 pub const InfoArgs = struct {
@@ -202,6 +208,8 @@ fn parseExtract(args: []const []const u8) ArgError!ExtractArgs {
             return error.InvalidImagesMode;
         } else if (std.mem.eql(u8, a, "--struct-tree")) {
             out.struct_tree = true;
+        } else if (std.mem.eql(u8, a, "--validate-pdfua")) {
+            out.validate_pdfua = true;
         } else if (std.mem.eql(u8, a, "--scan-threshold")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -310,7 +318,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     };
 }
 
-fn runExtract(allocator: std.mem.Allocator, io: std.Io, args: ExtractArgs) !ExitCode {
+pub fn runExtract(allocator: std.mem.Allocator, io: std.Io, args: ExtractArgs) !ExitCode {
     try stream.registerSignalHandlers();
 
     var out_buf: [8192]u8 = undefined;
@@ -478,6 +486,39 @@ fn runExtract(allocator: std.mem.Allocator, io: std.Io, args: ExtractArgs) !Exit
             try writer.flush();
         },
         .md, .text, .chunks => {},
+    }
+
+    // PR-22e [feat]: PDF/UA validation. Runs in all output modes,
+    // but only emits NDJSON `kind:"validation"` records when the CLI
+    // is in NDJSON mode; otherwise we surface a one-line stderr
+    // diagnostic so non-NDJSON pipelines still get the failure
+    // signal via exit code + a human-readable message.
+    var pdfua_error_count: u32 = 0;
+    if (args.validate_pdfua) {
+        if (doc.getStructTree() catch null) |tree| {
+            zpdf.structtree.validateAll(&tree) catch |verr| {
+                pdfua_error_count += 1;
+                const finding = pdfuaFindingForError(verr);
+                if (args.output_mode == .ndjson) {
+                    env.emitValidation(
+                        "error",
+                        finding.rule,
+                        finding.element,
+                        null,
+                    ) catch |e| return mapWriteErr(e);
+                    writer.flush() catch |e| return mapWriteErr(e);
+                } else {
+                    var serr_buf: [256]u8 = undefined;
+                    var sbw = std.Io.File.stderr().writer(io, &serr_buf);
+                    const sw = &sbw.interface;
+                    sw.print(
+                        "pdf.zig: pdf/ua validation failed: {s} ({s})\n",
+                        .{ finding.rule, @errorName(verr) },
+                    ) catch {};
+                    sw.flush() catch {};
+                }
+            };
+        }
     }
 
     var pages_emitted: u32 = 0;
@@ -811,6 +852,12 @@ fn runExtract(allocator: std.mem.Allocator, io: std.Io, args: ExtractArgs) !Exit
         try writer.flush();
     }
 
+    // PR-22e: any pdf/ua validation error → exit 1. The arg-error
+    // code is reused (rather than a dedicated `validation_failed` exit)
+    // because the CLI already maps "user-visible failure with a clear
+    // pre-extraction signal" to `arg_error`. Pipeline consumers
+    // distinguish the cases via the kind:"validation" NDJSON record.
+    if (pdfua_error_count > 0) return .arg_error;
     return .ok;
 }
 
@@ -1088,6 +1135,22 @@ fn pageWarningFromError(err: anyerror) stream.Warning {
     };
 }
 
+/// PR-22e: map a `structtree.validateAll` error to a stable
+/// `(rule, element)` pair for the NDJSON `kind:"validation"` record.
+/// `rule` is intentionally short and stable so consumers can switch
+/// on it; `element` carries the human-friendly structure type that
+/// triggered the rule.
+const PdfuaFinding = struct { rule: []const u8, element: ?[]const u8 };
+
+fn pdfuaFindingForError(err: anyerror) PdfuaFinding {
+    return switch (err) {
+        error.MissingAltTextOnFigure => .{ .rule = "alt_required_on_figure", .element = "Figure" },
+        error.MissingAltTextOnFormula => .{ .rule = "alt_required_on_formula", .element = "Formula" },
+        error.MissingAltTextOnForm => .{ .rule = "alt_required_on_form", .element = "Form" },
+        else => .{ .rule = "unknown_pdfua_violation", .element = null },
+    };
+}
+
 /// Parse a page-range spec ("1-10", "1,3,5", "1-3,7,9-11") into 0-indexed
 /// page numbers. Returns an owned slice. `null` spec → all pages.
 pub fn resolvePageRange(allocator: std.mem.Allocator, spec: ?[]const u8, total: u32) ![]usize {
@@ -1221,6 +1284,7 @@ fn writeHelp(io: std.Io) !void {
         \\  --images=path               same + writes JPEG/JPEG-2000 images to --images-dir and emits `path`
         \\  --images-dir DIR            output directory for --images=path (default: cwd)
         \\  --struct-tree               emit kind:"struct_tree" with full PDF/UA structure tree (off by default; large)
+        \\  --validate-pdfua            run PDF/UA-1 validators; emit kind:"validation" findings, exit non-zero on any error
         \\
         \\New options:
         \\  -o, --output-file FILE      output PDF path (required)
@@ -1565,6 +1629,34 @@ test "PR-21: --struct-tree flag is accepted and defaults off" {
 
     const cmd_on = try parseArgs(&.{ "extract", "--struct-tree", "foo.pdf" });
     try std.testing.expect(cmd_on.extract.struct_tree);
+}
+
+test "PR-22e: --validate-pdfua flag is accepted and defaults off" {
+    const cmd_off = try parseArgs(&.{ "extract", "foo.pdf" });
+    try std.testing.expect(!cmd_off.extract.validate_pdfua);
+
+    const cmd_on = try parseArgs(&.{ "extract", "--validate-pdfua", "foo.pdf" });
+    try std.testing.expect(cmd_on.extract.validate_pdfua);
+}
+
+test "PR-22e: pdfuaFindingForError maps the three errors to stable rules" {
+    const f1 = pdfuaFindingForError(error.MissingAltTextOnFigure);
+    try std.testing.expectEqualStrings("alt_required_on_figure", f1.rule);
+    try std.testing.expectEqualStrings("Figure", f1.element.?);
+
+    const f2 = pdfuaFindingForError(error.MissingAltTextOnFormula);
+    try std.testing.expectEqualStrings("alt_required_on_formula", f2.rule);
+    try std.testing.expectEqualStrings("Formula", f2.element.?);
+
+    const f3 = pdfuaFindingForError(error.MissingAltTextOnForm);
+    try std.testing.expectEqualStrings("alt_required_on_form", f3.rule);
+    try std.testing.expectEqualStrings("Form", f3.element.?);
+
+    // Defensive: a future validator error not yet mapped falls back
+    // to a stable sentinel rather than panicking.
+    const fu = pdfuaFindingForError(error.OutOfMemory);
+    try std.testing.expectEqualStrings("unknown_pdfua_violation", fu.rule);
+    try std.testing.expect(fu.element == null);
 }
 
 test "page range: null spec → all pages" {

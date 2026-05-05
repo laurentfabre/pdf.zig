@@ -51,6 +51,13 @@ pub const RecordKind = enum {
     /// embedded `warnings:[]` array — currently
     /// `vertical_writing_unsupported` (§9 cases #10 + #12).
     warning,
+    /// PR-22e [feat]: PDF/UA-1 validator finding. Emitted only when
+    /// the caller explicitly opts in (`--validate-pdfua` CLI flag).
+    /// Schema: `{kind:"validation", severity, rule, [element], [page]}`
+    /// where `severity ∈ {"error","warning"}` and `rule` is a stable
+    /// short identifier (e.g. `alt_required_on_figure`). The CLI
+    /// exits non-zero if any record carries `severity:"error"`.
+    validation,
 
     pub fn asString(self: RecordKind) []const u8 {
         return switch (self) {
@@ -69,6 +76,7 @@ pub const RecordKind = enum {
             .image => "image",
             .struct_tree => "struct_tree",
             .warning => "warning",
+            .validation => "validation",
         };
     }
 };
@@ -661,6 +669,32 @@ pub const Envelope = struct {
         try writeJsonString(self.writer, code);
         try self.writeStringField("message", message);
         if (at_page) |p| try self.writer.print(",\"at_page\":{d}", .{p});
+        try self.endRecord();
+    }
+
+    /// PR-22e [feat]: emit a `kind:"validation"` finding. `severity`
+    /// is "error" for hard PDF/UA conformance failures and "warning"
+    /// for advisory checks. `rule` is a stable identifier matching
+    /// the spec section (e.g. `alt_required_on_figure` for §7.3).
+    /// `element` is the structure type or a tag-tree path; `page` is
+    /// the 1-based PDF page number when known.
+    pub fn emitValidation(
+        self: *Envelope,
+        severity: []const u8,
+        rule: []const u8,
+        element: ?[]const u8,
+        page: ?u32,
+    ) !void {
+        try self.beginRecord(.validation);
+        try self.writer.writeAll(",\"severity\":");
+        try writeJsonString(self.writer, severity);
+        try self.writer.writeAll(",\"rule\":");
+        try writeJsonString(self.writer, rule);
+        if (element) |e| {
+            try self.writer.writeAll(",\"element\":");
+            try writeJsonString(self.writer, e);
+        }
+        if (page) |p| try self.writer.print(",\"page\":{d}", .{p});
         try self.endRecord();
     }
 

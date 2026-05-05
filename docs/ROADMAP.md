@@ -556,7 +556,7 @@ updated: 2026-05-04
 - [ ] **PR-22b · feat: /RoleMap parser + writer emission** — `src/structtree.zig` (≤40 lines). Resolves custom roles to standard PDF/UA types.
 - [ ] **PR-22c · fix: BMC tag-only marked content** — `src/interpreter.zig` (≤30 lines), `src/structtree.zig` (≤10 lines).
 - [ ] **PR-22d · feat: /Lang propagation** — `src/structtree.zig` (≤50 lines). Tree-walk inheritance + JSON emission.
-- [ ] **PR-22e · feat: alt-text validator (Figure/Formula/Form)** — `src/structtree.zig` (≤30 lines). Hooks into PR-W10c writer.
+- [x] **PR-22e · feat: alt-text validator (Figure/Formula/Form)** — `src/structtree.zig` (validateAltText + validateAll), `src/cli_pdfzig.zig` (`--validate-pdfua` + `kind:"validation"`), `src/stream.zig` (new RecordKind), `src/testpdf.zig` (good/bad Figure fixtures). 17 new tests. Hooks into PR-W10c writer.
 
 ### PR-23 sub-PRs (accessibility tree, linear chain)
 
