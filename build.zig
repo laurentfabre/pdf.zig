@@ -330,6 +330,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_encrypt_writer_unit_tests = b.addRunArtifact(encrypt_writer_unit_tests);
 
+    // PR-23a [feat]: MCID → text resolver. Tests live in
+    // mcid_resolver.zig and exercise the public resolveOne / resolveBatch
+    // surface plus the structtree delegate. Wired in here because the
+    // module isn't (yet) re-exported through root.zig.
+    const mcid_resolver_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mcid_resolver.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_mcid_resolver_unit_tests = b.addRunArtifact(mcid_resolver_unit_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_simd_unit_tests.step);
@@ -350,6 +363,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_font_embedder_unit_tests.step);
     test_step.dependOn(&run_crypto_unit_tests.step);
     test_step.dependOn(&run_encrypt_writer_unit_tests.step);
+    test_step.dependOn(&run_mcid_resolver_unit_tests.step);
 
     // Allocation-failure tests — Week 4 of architecture.md §11.
     // Asserts the documented shape of upstream OOM behaviour (Findings 001–003
