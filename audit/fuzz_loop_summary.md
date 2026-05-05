@@ -87,16 +87,27 @@ of the iter-24 close; the user authorises fixes in follow-up work.
 7. **007** (upstream toolchain). Wait for 0.16.x or 0.17 fix; flip
    `.fuzz = true` in `build.zig` when it lands.
 
-After fixes 1-4 land, the registry collapses to **78 default-gate / 0
-reproducer-only / 2 aggressive** (the 2 aggressive entries are the
-pre-existing `pdf_open_mutation` + `pdf_extract_mutation`, gated by
-Finding 004 not by an iter-loop bug).
+After fixes 1-4 land, all 6 reproducer-only targets promote to
+default-gate (Finding 005 → `decompress_ascii85_roundtrip`; 008a/b →
+the 3 cff targets; 010 → `image_writer_emit_random_geom`; 011 →
+`encrypt_authenticate_owner_recovers_key`). The registry collapses
+to **79 default-gate / 0 reproducer-only / 2 aggressive** (the 2
+aggressive entries are the pre-existing `pdf_open_mutation` +
+`pdf_extract_mutation`, gated by Finding 004 not by an iter-loop bug).
 
 ---
 
 ## Module coverage matrix
 
-24 modules in the deepening inventory; every row touched at least once.
+24 modules in the deepening inventory; **23 of 24 rows have direct
+fuzz coverage**. The exception is `tables.zig` (row 22) which is
+covered indirectly through `lattice_pass_b_spans` /
+`tagged_table_mutation` / `link_continuations_random` — the lattice
+geometry pipeline drives `tables.detect()` end-to-end, so the
+detector logic itself is exercised, just not through a direct entry-
+point fuzzer. A direct `tables.detect()` target on adversarial
+TextSpan/Stroke arrays is listed in the open gaps below.
+
 Multi-iter rows = the four highest-attack-surface modules earned a
 second deeper pass.
 
