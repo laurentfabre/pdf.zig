@@ -34,6 +34,7 @@ const decompress = @import("decompress.zig");
 const parser = @import("parser.zig");
 const interpreter = @import("interpreter.zig");
 const pdf_document = @import("pdf_document.zig");
+const bidi = @import("bidi.zig");
 
 // ============================================================================
 // Target registry
@@ -122,6 +123,12 @@ const TARGETS = [_]Target{
     // Each iter walks 4 build → parse → canonicalise → mutate → re-emit
     // cycles. Drift between stages surfaces serialise/parse asymmetries.
     .{ .name = "pdf_of_pdf_roundtrip", .run = fuzzPdfOfPdfRoundtrip },
+    // Iter-8 (audit/fuzz_loop_state.md row 4 — bidi.zig). UAX #9 Level-1
+    // resolver. Three SUT-independent invariant targets: byte conservation,
+    // UTF-8 validity, multiset-equality reorder + format-char storm.
+    .{ .name = "bidi_resolve_random_codepoints", .run = fuzzBidiResolveRandomCodepoints },
+    .{ .name = "bidi_reorder_property", .run = fuzzBidiReorderProperty },
+    .{ .name = "bidi_format_character_storm", .run = fuzzBidiFormatCharacterStorm },
     // Iter-4 (audit/fuzz_loop_state.md tier 3 — round-trip / property fuzz)
     // — DocumentBuilder.write() ↔ Document.openFromMemory ↔ extractMarkdown
     // — exercises the full writer ↔ reader pipeline (xref, page tree,
@@ -2603,6 +2610,305 @@ fn fuzzPdfOfPdfRoundtrip(
         allocator.free(prev_canon.?);
         prev_canon = filtered_canon;
     }
+}
+
+// ============================================================================
+// Targets — bidi (UAX #9 Level-1 resolver + reorder, src/bidi.zig)
+// ============================================================================
+//
+// Iter-8 of the autonomous fuzz loop (audit/fuzz_loop_state.md): broaden
+// horizontal coverage to bidi.zig — a hand-written W1–W7 / N1–N2 / I1–I2 /
+// L1–L2 implementation reachable from extractText / extractMarkdown via
+// `bidi.processLines` (root.zig:760). Zero prior fuzz coverage.
+//
+// Floor invariants the SUT must hold for ANY input — independent of whether
+// the visual order is "right":
+//   - byte-multiset preservation: `process` partitions input bytes into
+//     non-overlapping (byte_off, byte_len) state slices and writes each
+//     state's slice exactly once under a permutation `order`, so the
+//     output is a byte-multiset rearrangement of the input.
+//   - no panic / no leak under arbitrary scalar mixes (incl. heavy bidi
+//     control density).
+//   - valid UTF-8 in → valid UTF-8 out (the implementation only ever
+//     copies whole input slices, never splits a multi-byte sequence).
+//
+// These three targets exercise the three hot regions identified in the
+// task spec: W/N/I rule transitions on random scalars (T1), reorder
+// permutation correctness (T2), and the format-character stress that the
+// UAX #9 spec is famously brittle around (T3).
+
+/// Shared scalar sampler — weighted bag covering ASCII, Hebrew (R),
+/// Arabic (AL/AN/NSM), CJK (L by default), bidi controls (LRM/RLM/ALM,
+/// LRE..PDF, FSI..PDI, BOM), neutrals, digits. Skips the surrogate range
+/// (utf8Encode would error). Caller controls the weight bias via `mode`.
+const ScalarMode = enum { uniform, format_heavy };
+
+fn sampleBidiScalar(rng: std.Random, mode: ScalarMode) u21 {
+    // Pick a category, then a code point inside it. Categories chosen to
+    // hit every BidiClass branch in `bidi.classify`:
+    //   0 LTR ASCII letter            → L
+    //   1 ASCII digit                 → EN
+    //   2 ASCII separator (+,-./:)    → ES/CS
+    //   3 ASCII ET ($,#,%,*)          → ET
+    //   4 ASCII whitespace / sep      → WS/B/S
+    //   5 Hebrew letter (U+05D0..)    → R
+    //   6 Hebrew NSM (U+05B7..)       → NSM
+    //   7 Arabic letter (U+0627..)    → AL
+    //   8 Arabic-Indic digit          → AN
+    //   9 Arabic NSM (U+064B..)       → NSM
+    //  10 CJK ideograph (U+4E00..)    → L (default branch)
+    //  11 LRM/RLM/ALM/BOM             → L/R/AL/BN
+    //  12 LRE..RLO + LRI..PDI         → ON (Level-1 fallback)
+    //  13 NBSP / typographic neutral  → CS/ON
+    //  14 Non-character / private use → L (default branch)
+    //  15 Misc Latin-1 supp ET/EN     → ET/EN
+    const total_cats: u32 = 16;
+    const heavy_threshold: u32 = 70; // % of samples that hit cat 11/12 in format_heavy mode
+    const cat: u32 = blk: {
+        if (mode == .format_heavy and rng.intRangeLessThan(u32, 0, 100) < heavy_threshold) {
+            // 50/50 between explicit format chars (12) and BD1 markers (11).
+            break :blk if (rng.boolean()) @as(u32, 11) else @as(u32, 12);
+        }
+        break :blk rng.intRangeLessThan(u32, 0, total_cats);
+    };
+    return switch (cat) {
+        0 => rng.intRangeAtMost(u21, 'A', 'Z'),
+        1 => rng.intRangeAtMost(u21, '0', '9'),
+        2 => switch (rng.intRangeAtMost(u8, 0, 4)) {
+            0 => '+',
+            1 => '-',
+            2 => '.',
+            3 => ',',
+            else => ':',
+        },
+        3 => switch (rng.intRangeAtMost(u8, 0, 3)) {
+            0 => '$',
+            1 => '#',
+            2 => '%',
+            else => '*',
+        },
+        4 => switch (rng.intRangeAtMost(u8, 0, 4)) {
+            0 => ' ',
+            1 => '\t',
+            2 => '\n',
+            3 => '\r',
+            else => @as(u21, 0x1F), // unit separator → S
+        },
+        5 => rng.intRangeAtMost(u21, 0x05D0, 0x05EA),
+        6 => switch (rng.intRangeAtMost(u8, 0, 2)) {
+            0 => rng.intRangeAtMost(u21, 0x0591, 0x05BD),
+            1 => @as(u21, 0x05BF),
+            else => rng.intRangeAtMost(u21, 0x05C1, 0x05C2),
+        },
+        7 => rng.intRangeAtMost(u21, 0x0627, 0x064A),
+        8 => rng.intRangeAtMost(u21, 0x0660, 0x0669),
+        9 => rng.intRangeAtMost(u21, 0x064B, 0x065F),
+        10 => rng.intRangeAtMost(u21, 0x4E00, 0x4E2F),
+        11 => switch (rng.intRangeAtMost(u8, 0, 3)) {
+            0 => @as(u21, 0x200E), // LRM
+            1 => @as(u21, 0x200F), // RLM
+            2 => @as(u21, 0x061C), // ALM
+            else => @as(u21, 0xFEFF), // BOM
+        },
+        12 => switch (rng.intRangeAtMost(u8, 0, 8)) {
+            0 => @as(u21, 0x202A), // LRE
+            1 => @as(u21, 0x202B), // RLE
+            2 => @as(u21, 0x202C), // PDF
+            3 => @as(u21, 0x202D), // LRO
+            4 => @as(u21, 0x202E), // RLO
+            5 => @as(u21, 0x2066), // LRI
+            6 => @as(u21, 0x2067), // RLI
+            7 => @as(u21, 0x2068), // FSI
+            else => @as(u21, 0x2069), // PDI
+        },
+        13 => switch (rng.intRangeAtMost(u8, 0, 2)) {
+            0 => @as(u21, 0x00A0), // NBSP
+            1 => @as(u21, 0x00AB), // «
+            else => @as(u21, 0x00BB), // »
+        },
+        14 => switch (rng.intRangeAtMost(u8, 0, 2)) {
+            0 => rng.intRangeAtMost(u21, 0xFDD0, 0xFDEF), // non-character block
+            1 => @as(u21, 0xFFFE),
+            else => @as(u21, 0xE000), // private-use start
+        },
+        else => switch (rng.intRangeAtMost(u8, 0, 3)) {
+            0 => @as(u21, 0x00B0), // ° → ET
+            1 => @as(u21, 0x00B1), // ± → ET
+            2 => @as(u21, 0x00B2), // ² → EN
+            else => @as(u21, 0x00B9), // ¹ → EN
+        },
+    };
+}
+
+/// Build a UTF-8 input from `n_scalars` calls to `sampleBidiScalar` and
+/// return both the buffer (caller owns) and the count of bytes used. Any
+/// scalar that the unicode encoder rejects (won't happen with the bag
+/// above, but guard for future expansion) is silently skipped.
+fn buildBidiInput(
+    allocator: std.mem.Allocator,
+    rng: std.Random,
+    n_scalars: usize,
+    mode: ScalarMode,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    // Each scalar is at most 4 UTF-8 bytes.
+    try buf.ensureTotalCapacity(allocator, n_scalars * 4);
+    var scratch: [4]u8 = undefined;
+    var i: usize = 0;
+    while (i < n_scalars) : (i += 1) {
+        const cp = sampleBidiScalar(rng, mode);
+        const len = std.unicode.utf8Encode(cp, &scratch) catch continue;
+        try buf.appendSlice(allocator, scratch[0..len]);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Sort a slice of u8 in-place. Helper for byte-multiset comparison.
+fn sortBytes(buf: []u8) void {
+    std.mem.sort(u8, buf, {}, std.sort.asc(u8));
+}
+
+/// T1 — random scalars through `bidi.process`. Floor invariants:
+///   - no panic, no leak (the latter caught by GPA in test mode; in the
+///     fuzz harness we simply rely on arena reset),
+///   - output is a caller-owned slice,
+///   - byte length conserved (the implementation copies whole state slices),
+///   - input UTF-8 valid → output UTF-8 valid,
+///   - `containsRtl(input)` agrees with itself (idempotent — sanity check
+///     on the cheap pre-pass that gates the bidi pipeline at root.zig:760).
+fn fuzzBidiResolveRandomCodepoints(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const n_scalars = rng.intRangeAtMost(usize, 0, 256);
+    const input = try buildBidiInput(aa, rng, n_scalars, .uniform);
+    // Forced paragraph level: null (auto), 0 (LTR), or 1 (RTL).
+    const forced: ?u8 = switch (rng.intRangeAtMost(u8, 0, 2)) {
+        0 => null,
+        1 => @as(u8, 0),
+        else => @as(u8, 1),
+    };
+
+    const out = bidi.process(aa, input, forced) catch |err| {
+        if (err == error.OutOfMemory) return;
+        return err;
+    };
+
+    if (out.len != input.len) return error.BidiByteLengthChanged;
+    if (std.unicode.utf8ValidateSlice(input) and !std.unicode.utf8ValidateSlice(out)) {
+        return error.BidiOutputInvalidUtf8;
+    }
+    // containsRtl idempotent on its own output of containsRtl-flagged input.
+    const rtl_in = bidi.containsRtl(input);
+    if (rtl_in) {
+        // A Hebrew/Arabic input must keep its strong-RTL bytes intact — the
+        // multiset of bytes is conserved (T2 covers this rigorously); here
+        // we only assert that containsRtl on the output matches.
+        if (!bidi.containsRtl(out)) return error.BidiContainsRtlLostStrongOnReorder;
+    }
+}
+
+/// T2 — reorder permutation property. Build random UTF-8, pass through
+/// `bidi.process`, sort both byte arrays, expect equality. This is the
+/// strongest property test for the L2 reorder pass: no byte may appear,
+/// disappear, or change identity — only its position may move.
+fn fuzzBidiReorderProperty(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const n_scalars = rng.intRangeAtMost(usize, 0, 192);
+    const input = try buildBidiInput(aa, rng, n_scalars, .uniform);
+
+    // Also exercise processLines on inputs containing newlines — that
+    // path adds the per-line dispatch logic. ~25% of iters.
+    const use_lines = rng.intRangeLessThan(u8, 0, 4) == 0;
+    const out = if (use_lines) blk: {
+        break :blk bidi.processLines(aa, input) catch |err| {
+            if (err == error.OutOfMemory) return;
+            return err;
+        };
+    } else blk: {
+        break :blk bidi.process(aa, input, null) catch |err| {
+            if (err == error.OutOfMemory) return;
+            return err;
+        };
+    };
+
+    if (out.len != input.len) return error.BidiPermutationLengthMismatch;
+
+    // Byte-multiset equality: sort both and compare.
+    const a = try aa.dupe(u8, input);
+    const b = try aa.dupe(u8, out);
+    sortBytes(a);
+    sortBytes(b);
+    if (!std.mem.eql(u8, a, b)) return error.BidiPermutationByteMultisetChanged;
+}
+
+/// T3 — format-character storm. Bias the input toward LRO/RLO/PDF/LRE/
+/// RLE/FSI/RLI/LRI/PDI plus LRM/RLM/ALM/BOM, alternated with bursts of
+/// strong-direction letters from both directions. Stresses the W/N rule
+/// neutral-run resolver (long ON runs from the explicit-embedding chars,
+/// since Level-1 maps them to ON), the L1 trailing-WS reset around
+/// segment separators, and the L2 reversal across alternating-direction
+/// short runs.
+fn fuzzBidiFormatCharacterStorm(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Larger sequences here — cap at 384 scalars (~1.1 KiB) to keep
+    // per-iter wall time bounded.
+    const n_scalars = rng.intRangeAtMost(usize, 16, 384);
+    const input = try buildBidiInput(aa, rng, n_scalars, .format_heavy);
+
+    const out = bidi.process(aa, input, null) catch |err| {
+        if (err == error.OutOfMemory) return;
+        return err;
+    };
+
+    if (out.len != input.len) return error.BidiStormByteLengthChanged;
+    // All sampled scalars produce valid UTF-8, so output must too.
+    if (!std.unicode.utf8ValidateSlice(out)) return error.BidiStormOutputInvalidUtf8;
+
+    // Embedding-level cap: UAX #9 spec puts the max embedding level at
+    // 125. The Level-1 resolver only ever assigns levels 0/1/2 (paragraph
+    // base 0/1, plus +1 from I1/I2 once), so a level >2 anywhere would
+    // be a bug. We can't directly read the per-char levels (private
+    // CharState), but we can re-run with a forced paragraph level and
+    // check the byte-conservation invariant still holds — a level-bump
+    // bug would surface as a length divergence on long runs.
+    const out2 = bidi.process(aa, input, 1) catch |err| {
+        if (err == error.OutOfMemory) return;
+        return err;
+    };
+    if (out2.len != input.len) return error.BidiStormForcedRtlByteLengthChanged;
 }
 
 // ============================================================================
