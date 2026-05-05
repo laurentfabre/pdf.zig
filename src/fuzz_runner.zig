@@ -1278,16 +1278,33 @@ fn fuzzXmpLevelViewTotal(rng: std.Random, allocator: std.mem.Allocator, scratch:
     _ = scratch;
     _ = seed_pdf;
 
-    // 80 % of the time: random 2-byte tag (covers the 65,536 entry
-    // tag-space densely enough to enumerate all 9 valid points and
-    // most of the 65,527 invalid ones over 100k iters).
-    // 20 % of the time: random length 0,1,3,4 to hit the len != 2 path.
-    var tag: [4]u8 = undefined;
-    const len: usize = if (rng.float(f32) < 0.8) 2 else blk: {
-        const choices = [_]usize{ 0, 1, 3, 4 };
-        break :blk choices[rng.intRangeAtMost(usize, 0, choices.len - 1)];
+    // Codex review of bbd139b [P2]: random sampling made the
+    // "total bijection" claim probabilistic — each valid 2-byte
+    // tag had only ~70% chance of being hit per 100k run. Make
+    // the coverage deterministic: every iter cycles through one
+    // of 13 pinned cases (9 valid tags + 4 invalid lengths)
+    // ~50% of the time; the other ~50% draws a random 2-byte
+    // pair to keep the 65K-pair invalid space exercised.
+    const PinnedCase = struct { len: usize, bytes: [4]u8 };
+    const pinned = [_]PinnedCase{
+        .{ .len = 2, .bytes = .{ 'a', '1', 0, 0 } }, .{ .len = 2, .bytes = .{ 'a', '2', 0, 0 } }, .{ .len = 2, .bytes = .{ 'a', '3', 0, 0 } },
+        .{ .len = 2, .bytes = .{ 'b', '1', 0, 0 } }, .{ .len = 2, .bytes = .{ 'b', '2', 0, 0 } }, .{ .len = 2, .bytes = .{ 'b', '3', 0, 0 } },
+        .{ .len = 2, .bytes = .{ 'u', '1', 0, 0 } }, .{ .len = 2, .bytes = .{ 'u', '2', 0, 0 } }, .{ .len = 2, .bytes = .{ 'u', '3', 0, 0 } },
+        .{ .len = 0, .bytes = .{ 0, 0, 0, 0 } },
+        .{ .len = 1, .bytes = .{ 'a', 0, 0, 0 } },
+        .{ .len = 3, .bytes = .{ 'a', '1', 0, 0 } },
+        .{ .len = 4, .bytes = .{ 'a', '1', 0, 0 } },
     };
-    rng.bytes(tag[0..len]);
+    var tag: [4]u8 = undefined;
+    var len: usize = undefined;
+    if (rng.boolean()) {
+        len = 2;
+        rng.bytes(tag[0..len]);
+    } else {
+        const idx = rng.intRangeAtMost(usize, 0, pinned.len - 1);
+        @memcpy(&tag, &pinned[idx].bytes);
+        len = pinned[idx].len;
+    }
 
     const result = xmp_writer.levelView(tag[0..len]);
 
