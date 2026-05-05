@@ -45,6 +45,7 @@ const markdown = @import("markdown.zig");
 const a11y_emitter = @import("a11y_emitter.zig");
 const uuid = @import("uuid.zig");
 const struct_writer = @import("struct_writer.zig");
+const mcid_resolver = @import("mcid_resolver.zig");
 
 // ============================================================================
 // Target registry
@@ -319,6 +320,30 @@ const TARGETS = [_]Target{
     .{ .name = "struct_writer_setroot_depth_boundary", .run = fuzzStructWriterSetRootDepthBoundary },
     .{ .name = "struct_writer_emit_object_count", .run = fuzzStructWriterEmitObjectCount },
     .{ .name = "struct_writer_roundtrip_via_documentbuilder", .run = fuzzStructWriterRoundtripViaDocumentBuilder },
+    // Iter-16 (audit/fuzz_loop_state.md row 10 — mcid_resolver.zig).
+    // Reuses `testpdf.generateTaggedTablePdf` which produces a single-page
+    // tagged PDF whose six TD cells carry MCIDs 0..5 with text
+    // A1/B1/C1/A2/B2/C2. The fixture is the oracle: drive random batches
+    // of MCIDs through the resolver and assert they hit the known map.
+    //
+    // Three targets:
+    //   - mcid_resolver_resolve_one_oracle: random `mcid ∈ [-2..7]`
+    //     through `resolveOne`; in-range hits MUST equal the fixture
+    //     map; -1 (BMC sentinel) MUST yield null; out-of-range MUST
+    //     yield null.
+    //   - mcid_resolver_resolve_batch_parallel: random batch (size
+    //     0..16) of mcids; assert `results.len == mcids.len`, each
+    //     non-null `results[i]` matches the oracle, and the batch
+    //     result for each `mcids[i]` agrees with `resolveOne(mcids[i])`
+    //     called separately (parallel oracle).
+    //   - mcid_resolver_parse_struct_tree_with_text: drive
+    //     `parseStructTreeWithMcidText` end-to-end. Every TD element
+    //     in the parsed tree MUST have `mcid_text != null` of length 2,
+    //     and the multiset of TD `mcid_text` values MUST equal
+    //     `{A1,B1,C1,A2,B2,C2}` exactly (six TDs, no duplicates).
+    .{ .name = "mcid_resolver_resolve_one_oracle", .run = fuzzMcidResolverResolveOneOracle },
+    .{ .name = "mcid_resolver_resolve_batch_parallel", .run = fuzzMcidResolverResolveBatchParallel },
+    .{ .name = "mcid_resolver_parse_struct_tree_with_text", .run = fuzzMcidResolverParseStructTreeWithText },
     .{ .name = "pdf_open_mutation", .run = fuzzPdfOpenMutation, .aggressive = true },
     .{ .name = "pdf_extract_mutation", .run = fuzzPdfExtractMutation, .aggressive = true },
 };
@@ -5185,6 +5210,245 @@ fn fuzzImageWriterEmitRoundtripDims(rng: std.Random, allocator: std.mem.Allocato
     };
     const got_cs = dict.getName("ColorSpace") orelse return error.ImageWriterRoundtripNoColorSpace;
     if (!std.mem.eql(u8, got_cs, expected_cs)) return error.ImageWriterRoundtripColorSpaceMismatch;
+}
+
+// ============================================================================
+// Iter-16: mcid_resolver.zig — fixture-bound MCID-to-text resolver.
+// ----------------------------------------------------------------------------
+// `testpdf.generateTaggedTablePdf` produces a single-page tagged PDF
+// whose content stream brackets six BDC/EMC pairs with MCIDs 0..5 and
+// literal-string Tj texts A1/B1/C1/A2/B2/C2. The fixture is the
+// oracle: any MCID in [0..5] MUST resolve to the corresponding cell;
+// any MCID outside [0..5] (including the BMC sentinel -1) MUST resolve
+// to null. The struct-tree walker (parseStructTreeWithMcidText) sees
+// six TD elements, each with a single direct-child MCID, so every TD
+// MUST end up with a 2-byte mcid_text equal to its cell label.
+// ============================================================================
+
+/// Fixture oracle: maps MCID 0..5 → cell text. Out-of-range MCIDs
+/// (negative, ≥ 6) are not present on page 0 and MUST resolve to null.
+const ITER16_MCID_TEXTS = [_][]const u8{ "A1", "B1", "C1", "A2", "B2", "C2" };
+
+/// Look up the expected text for `mcid` against the fixture oracle.
+/// Returns `null` for any MCID outside [0..5] OR the BMC sentinel
+/// (-1). This mirrors `mcid_resolver.resolveOne`'s contract on this
+/// specific fixture.
+fn iter16ExpectedText(mcid: i32) ?[]const u8 {
+    if (mcid < 0) return null;
+    if (mcid >= ITER16_MCID_TEXTS.len) return null;
+    return ITER16_MCID_TEXTS[@as(usize, @intCast(mcid))];
+}
+
+/// T1 — drive `mcid_resolver.resolveOne` against the tagged-table
+/// fixture. Probe `mcid ∈ [-2..7]` to cover BMC sentinel (-1),
+/// negative non-sentinel (-2 — also surfaces as null per
+/// getTextForMcid's `mcid < 0 → null` guard at structtree.zig:989),
+/// every in-range cell (0..5), and out-of-range (6..7).
+///
+/// SUT-independent invariants:
+///   - `resolveOne(mcid=-1)` MUST return null (BMC sentinel; resolver
+///     short-circuits at mcid_resolver.zig:71 before walking).
+///   - `resolveOne(mcid<0)` MUST return null (negative-MCID guard).
+///   - `resolveOne(mcid in 0..5)` MUST return non-null bytes equal to
+///     the fixture oracle (`ITER16_MCID_TEXTS[mcid]`).
+///   - `resolveOne(mcid in 6..7)` MUST return null (MCID not present
+///     on the page; extractor.getTextForMcid returns null).
+///   - The returned slice MUST be caller-owned and exactly 2 bytes
+///     long for in-range hits (TigerStyle: assert what we know).
+fn fuzzMcidResolverResolveOneOracle(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    // iter-14 P2 lesson: pdf_data is borrowed by Document.openFromMemory.
+    // Don't free it before doc.close(). Here `defer allocator.free(pdf_data)`
+    // runs AFTER the doc.close() defer below (LIFO), so the borrow is
+    // valid for the doc's lifetime.
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    // Random MCID across the discrimination boundary set:
+    //   -2: negative non-sentinel (extractor.getTextForMcid guard)
+    //   -1: BMC sentinel (resolver short-circuit at mcid_resolver.zig:71)
+    //   0..5: in-range hits → fixture oracle
+    //   6..7: out-of-range → not on page → null
+    const mcid: i32 = rng.intRangeAtMost(i32, -2, 7);
+
+    const got = try mcid_resolver.resolveOne(@ptrCast(doc), 0, mcid, allocator);
+    defer if (got) |t| allocator.free(t);
+
+    const want = iter16ExpectedText(mcid);
+
+    if (want == null) {
+        if (got != null) return error.McidResolverResolveOneUnexpectedHit;
+        return;
+    }
+    if (got == null) return error.McidResolverResolveOneMissedHit;
+
+    // In-range hit: must equal the oracle byte-for-byte.
+    if (!std.mem.eql(u8, got.?, want.?)) {
+        return error.McidResolverResolveOneTextMismatch;
+    }
+    // TigerStyle: every cell label is exactly two ASCII bytes.
+    if (got.?.len != 2) return error.McidResolverResolveOneBadLength;
+}
+
+/// T2 — drive `mcid_resolver.resolveBatch` with a random-length batch
+/// of MCIDs. Asserts the batch result is parallel-equivalent to N
+/// individual `resolveOne` calls AND parallel-equivalent to the
+/// fixture oracle. Empty input is a fast-path covered by the
+/// `mcids.len == 0 → empty` branch at mcid_resolver.zig:121.
+///
+/// SUT-independent invariants:
+///   - `results.len == mcids.len` (parallel-arity invariant).
+///   - For each i: `results[i] == null` iff `iter16ExpectedText(mcids[i]) == null`.
+///   - For each i where `results[i] != null`: bytes match the oracle.
+///   - Per-element batch result agrees with `resolveOne` called
+///     separately on the same MCID — i.e. batch is observably
+///     equivalent to a loop of resolveOne.
+///   - The fast-path: when mcids.len == 0, results.len == 0 (no
+///     extractor built, no walk).
+fn fuzzMcidResolverResolveBatchParallel(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = scratch;
+    _ = seed_pdf;
+
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    // Batch size 0..16. The 0 case probes the empty-input fast path
+    // at mcid_resolver.zig:121.
+    const n = rng.intRangeAtMost(usize, 0, 16);
+    const mcids = try allocator.alloc(i32, n);
+    defer allocator.free(mcids);
+    for (mcids) |*m| {
+        // Same probe range as T1 plus include a few definite hits to
+        // exercise the multi-MCID path on the same content stream.
+        m.* = rng.intRangeAtMost(i32, -2, 7);
+    }
+
+    const results = try mcid_resolver.resolveBatch(@ptrCast(doc), 0, mcids, allocator);
+    defer {
+        for (results) |maybe| if (maybe) |t| allocator.free(t);
+        allocator.free(results);
+    }
+
+    if (results.len != mcids.len) return error.McidResolverBatchArityMismatch;
+
+    // Empty input fast path: no further checks.
+    if (mcids.len == 0) return;
+
+    for (mcids, results) |m, got| {
+        const want = iter16ExpectedText(m);
+        if (want == null) {
+            if (got != null) return error.McidResolverBatchUnexpectedHit;
+            continue;
+        }
+        if (got == null) return error.McidResolverBatchMissedHit;
+        if (!std.mem.eql(u8, got.?, want.?)) return error.McidResolverBatchTextMismatch;
+        if (got.?.len != 2) return error.McidResolverBatchBadLength;
+    }
+
+    // Parallel oracle: a separate `resolveOne` MUST agree with batch
+    // on every element. Stronger than the fixture-oracle check alone
+    // — surfaces any divergence between the two API surfaces.
+    for (mcids, results) |m, batch_got| {
+        const one_got = try mcid_resolver.resolveOne(@ptrCast(doc), 0, m, allocator);
+        defer if (one_got) |t| allocator.free(t);
+        if ((one_got == null) != (batch_got == null)) {
+            return error.McidResolverBatchVsOneNullMismatch;
+        }
+        if (one_got != null and !std.mem.eql(u8, one_got.?, batch_got.?)) {
+            return error.McidResolverBatchVsOneTextMismatch;
+        }
+    }
+}
+
+/// T3 — drive `mcid_resolver.parseStructTreeWithMcidText` end-to-end.
+/// Walks the tagged-table fixture's struct tree, populates each TD's
+/// `mcid_text` from the content stream, and asserts the multiset of
+/// TD `mcid_text` values matches the oracle exactly.
+///
+/// This iter has no per-call randomness — the fixture is fixed —
+/// but the loop driver still re-runs at every iter, which surfaces:
+///   - any non-deterministic allocator path inside the walker;
+///   - any per-iter state leak (caught by `std.testing.allocator`-
+///     style tracking of the per-iter arena);
+///   - any reordering of `tree.elements` across runs (would break
+///     downstream callers that rely on the multiset oracle below
+///     even when ordering is unstable).
+///
+/// SUT-independent invariants:
+///   - Exactly six elements have `struct_type == "TD"` (the fixture's
+///     2×3 table layout).
+///   - Every TD has `mcid_text != null` of length 2.
+///   - The multiset of TD `mcid_text` values equals the oracle
+///     (`{A1, B1, C1, A2, B2, C2}`) — every label seen exactly once.
+///   - `freeMcidTexts` runs cleanly (no double-free, no leak — the
+///     companion `tree.deinit()` then completes the cleanup chain).
+fn fuzzMcidResolverParseStructTreeWithText(
+    rng: std.Random,
+    allocator: std.mem.Allocator,
+    scratch: []u8,
+    seed_pdf: []const u8,
+) anyerror!void {
+    _ = rng;
+    _ = scratch;
+    _ = seed_pdf;
+
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    var tree = try mcid_resolver.parseStructTreeWithMcidText(allocator, @ptrCast(doc));
+    defer {
+        mcid_resolver.freeMcidTexts(&tree, allocator);
+        tree.deinit();
+    }
+
+    // Multiset oracle: 6 TDs, one per cell label, no duplicates.
+    // Track via `seen[i]` (one bit per oracle entry) — duplicate
+    // sightings or unknown labels both fail closed.
+    var seen = [_]bool{ false, false, false, false, false, false };
+    var td_count: usize = 0;
+    for (tree.elements) |elem| {
+        if (!std.mem.eql(u8, elem.struct_type, "TD")) continue;
+        td_count += 1;
+
+        const text = elem.mcid_text orelse return error.McidResolverTreeWalkNullMcidText;
+        if (text.len != 2) return error.McidResolverTreeWalkBadLength;
+
+        // Find this label in the oracle. O(6) probe; cheap.
+        var matched: ?usize = null;
+        for (ITER16_MCID_TEXTS, 0..) |label, idx| {
+            if (std.mem.eql(u8, text, label)) {
+                matched = idx;
+                break;
+            }
+        }
+        const idx = matched orelse return error.McidResolverTreeWalkUnknownLabel;
+        if (seen[idx]) return error.McidResolverTreeWalkDuplicateLabel;
+        seen[idx] = true;
+    }
+
+    if (td_count != 6) return error.McidResolverTreeWalkBadTdCount;
+    for (seen) |s| if (!s) return error.McidResolverTreeWalkMissingLabel;
 }
 
 // ============================================================================
