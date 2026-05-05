@@ -165,6 +165,14 @@ pub fn emitElementJson(elem: *const StructElement, writer: *std.Io.Writer, depth
         try writer.writeAll(",\"resolved_role\":");
         try stream.writeJsonString(writer, role);
     }
+    // PR-22d: emit BCP-47 `/Lang` (explicit or inherited from
+    // ancestor / catalog). Only present when non-null, so the
+    // pre-22d byte-identical golden remains stable on /Lang-free
+    // fixtures.
+    if (elem.lang) |l| {
+        try writer.writeAll(",\"lang\":");
+        try stream.writeJsonString(writer, l);
+    }
 
     // Direct-child MCIDs first.
     try writer.writeAll(",\"mcid_refs\":[");
@@ -356,16 +364,70 @@ fn roleMapValueName(
     };
 }
 
-/// PR-SX1 stub. PR-22d will fill in: walk `tree`, propagate `/Lang`
-/// from `StructTreeRoot` → ancestor → leaf so every text-bearing
-/// element carries an explicit `lang`. `root_lang` is the catalog's
-/// `/Lang` (BCP-47), used as the inheritance root.
+/// PR-22d: BCP-47 sanity bound. RFC 5646 §2.1 caps the longest
+/// well-formed registered tag at 35 bytes; anything longer (or
+/// containing control bytes / non-alnum-non-hyphen) is treated as
+/// hostile/malformed and dropped to null. Bounded so a 1MB malicious
+/// `/Lang` cannot propagate through the tree.
+const MAX_LANG_LEN: usize = 35;
+
+/// PR-22d: cheap structural check on a `/Lang` value before we adopt
+/// it as an attribute. Accepts only ASCII alphanumerics + `-`, of
+/// length 1..=MAX_LANG_LEN. Empty / oversized / pathological values
+/// are rejected (caller falls back to null inheritance).
+fn isValidBcp47(s: []const u8) bool {
+    if (s.len == 0 or s.len > MAX_LANG_LEN) return false;
+    for (s) |c| {
+        const ok = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// PR-22d. Top-down depth-first walk. Each element inherits its
+/// nearest ancestor's effective `/Lang` (which transitively bottoms
+/// out at `root_lang` — the catalog's `/Lang`). An explicit
+/// element-level `/Lang` set during parsing wins and *becomes* the
+/// effective lang for its subtree.
 ///
-/// Today: no-op.
+/// No allocations: `lang` slices borrow from the parsed-PDF backing
+/// buffer (same lifetime convention as `struct_type` / `title` /
+/// `alt_text`). Depth bounded by `MAX_STRUCT_DEPTH` to keep us
+/// honest against pathological inputs; the parser already enforces
+/// the same bound when building the tree, so this is a redundant
+/// belt-and-braces check (TigerStyle pair-assertion).
 pub fn propagateLang(tree: *StructTree, root_lang: ?[]const u8) !void {
-    _ = tree;
-    _ = root_lang;
-    // PR-22d: walk tree, populate lang via inheritance.
+    const root = tree.root orelse return;
+    const effective_root = if (root_lang) |l| (if (isValidBcp47(l)) l else null) else null;
+    try propagateLangWalk(@constCast(root), effective_root, 0);
+}
+
+fn propagateLangWalk(
+    elem: *StructElement,
+    inherited: ?[]const u8,
+    depth: u32,
+) !void {
+    if (depth >= MAX_STRUCT_DEPTH) return error.StructTreeTooDeep;
+
+    // Element-level explicit `/Lang` wins; otherwise inherit.
+    if (elem.lang == null) {
+        elem.lang = inherited;
+    }
+    const effective = elem.lang;
+
+    for (elem.children) |child| {
+        switch (child) {
+            .element => |sub| {
+                // children store *const StructElement; the underlying
+                // storage is heap-owned and mutable in this pass.
+                try propagateLangWalk(@constCast(sub), effective, depth + 1);
+            },
+            .mcid => {},
+        }
+    }
 }
 
 /// PR-SX1 stub. PR-22e will fill in: scan `tree`, return
@@ -533,6 +595,22 @@ pub fn parseStructTree(
     };
     try parseRoleMap(&tree, struct_tree_dict, ResolveCtx.resolve, @ptrCast(&ctx));
 
+    // PR-22d: catalog-level /Lang seeds the inheritance walk. Borrowed
+    // slice from the parsed catalog dict — same lifetime convention as
+    // every other string on a `StructElement`.
+    const catalog_lang: ?[]const u8 = blk: {
+        const raw = catalog_dict.getString("Lang") orelse break :blk null;
+        if (!isValidBcp47(raw)) break :blk null;
+        break :blk raw;
+    };
+    propagateLang(&tree, catalog_lang) catch {
+        // The only error path is `error.StructTreeTooDeep`, which the
+        // parser already prevents. If it ever fires, deinit the tree
+        // we built so far and propagate the error to the caller.
+        tree.deinit();
+        return error.StructTreeTooDeep;
+    };
+
     return tree;
 }
 
@@ -587,6 +665,15 @@ fn parseStructElement(
             const struct_type = dict.getName("S") orelse "Unknown";
             const title = dict.getString("T");
             const alt = dict.getString("Alt");
+            // PR-22d: optional `/Lang` (BCP-47) on this element. Only
+            // adopt it when it passes the bounded sanity check; a
+            // pathological 1MB or control-byte-laden value falls back
+            // to null (so propagateLang inherits from an ancestor).
+            const lang_attr: ?[]const u8 = blk: {
+                const raw = dict.getString("Lang") orelse break :blk null;
+                if (!isValidBcp47(raw)) break :blk null;
+                break :blk raw;
+            };
             const page_ref = switch (dict.get("Pg") orelse Object{ .null = {} }) {
                 .reference => |r| r,
                 else => null,
@@ -614,6 +701,7 @@ fn parseStructElement(
                 .alt_text = alt,
                 .children = children_slice,
                 .page_ref = page_ref,
+                .lang = lang_attr,
             };
             try elements.append(allocator, elem_ptr);
             return elem_ptr;
@@ -684,6 +772,12 @@ fn parseKids(
                 const struct_type = dict.getName("S") orelse return;
                 const title = dict.getString("T");
                 const alt = dict.getString("Alt");
+                // PR-22d: per-element /Lang (see parseStructElement).
+                const lang_attr: ?[]const u8 = blk: {
+                    const raw = dict.getString("Lang") orelse break :blk null;
+                    if (!isValidBcp47(raw)) break :blk null;
+                    break :blk raw;
+                };
                 const page_ref = switch (dict.get("Pg") orelse Object{ .null = {} }) {
                     .reference => |r| r,
                     else => parent_page,
@@ -707,6 +801,7 @@ fn parseKids(
                     .alt_text = alt,
                     .children = sub_children_slice,
                     .page_ref = page_ref,
+                    .lang = lang_attr,
                 };
                 try elements.append(allocator, elem_ptr);
                 try children.append(allocator, .{ .element = elem_ptr });

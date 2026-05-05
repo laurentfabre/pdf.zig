@@ -2180,6 +2180,114 @@ pub fn generateTaggedTableNestedPdf(allocator: std.mem.Allocator) ![]u8 {
     return try pdf.toOwnedSlice();
 }
 
+/// PR-22d: minimal tagged PDF exercising `/Lang` propagation.
+///
+/// Catalog carries `/Lang (en-US)`. Tree shape:
+///   Document            (no own /Lang  → inherits "en-US")
+///   ├── P               (no own /Lang  → inherits "en-US")
+///   └── Span            (/Lang (fr-FR) → keeps  "fr-FR")
+///
+/// Both leaves bracket a single MCID on the lone page so the
+/// fixture is observable end-to-end (parse → propagateLang →
+/// emitElementJson). Object layout:
+///
+///   1. Catalog (/Lang (en-US) /StructTreeRoot 6 0 R)
+///   2. Pages
+///   3. Page (/StructParents 0)
+///   4. Page content stream — two BDC/EMC sections, MCIDs 0..1
+///   5. Font /F1 (Helvetica)
+///   6. StructTreeRoot (/K 7 0 R)
+///   7. Document element  (/S /Document /K [8 0 R 9 0 R])
+///   8. P element         (/S /P /Pg 3 0 R /K [0])
+///   9. Span element      (/S /Span /Lang (fr-FR) /Pg 3 0 R /K [1])
+pub fn generateLangPropagationPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf = std.Io.Writer.Allocating.init(allocator);
+    errdefer pdf.deinit();
+    const writer = &pdf.writer;
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.written().len;
+    try writer.writeAll(
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R " ++
+            "/StructTreeRoot 6 0 R /Lang (en-US) >>\nendobj\n",
+    );
+
+    const obj2_offset = pdf.written().len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.written().len;
+    try writer.writeAll(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] " ++
+            "/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> " ++
+            "/StructParents 0 >>\nendobj\n",
+    );
+
+    const content =
+        \\BT
+        \\/F1 12 Tf
+        \\/P <</MCID 0>> BDC
+        \\1 0 0 1 100 700 Tm
+        \\(Hi) Tj
+        \\EMC
+        \\/Span <</MCID 1>> BDC
+        \\1 0 0 1 100 680 Tm
+        \\(Bonjour) Tj
+        \\EMC
+        \\ET
+        \\
+    ;
+    const obj4_offset = pdf.written().len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.len});
+    try writer.writeAll(content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.written().len;
+    try writer.writeAll(
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica " ++
+            "/Encoding /WinAnsiEncoding >>\nendobj\n",
+    );
+
+    const obj6_offset = pdf.written().len;
+    try writer.writeAll("6 0 obj\n<< /Type /StructTreeRoot /K 7 0 R >>\nendobj\n");
+
+    const obj7_offset = pdf.written().len;
+    // Document element: no /Lang of its own. Holds two children.
+    try writer.writeAll(
+        "7 0 obj\n<< /S /Document /P 6 0 R /K [8 0 R 9 0 R] >>\nendobj\n",
+    );
+
+    const obj8_offset = pdf.written().len;
+    // P: no own /Lang → must inherit "en-US" via propagateLang.
+    try writer.writeAll(
+        "8 0 obj\n<< /S /P /P 7 0 R /Pg 3 0 R /K [0] >>\nendobj\n",
+    );
+
+    const obj9_offset = pdf.written().len;
+    // Span: explicit /Lang (fr-FR) — must NOT be overwritten by ancestor.
+    try writer.writeAll(
+        "9 0 obj\n<< /S /Span /P 7 0 R /Pg 3 0 R /Lang (fr-FR) /K [1] >>\nendobj\n",
+    );
+
+    const xref_offset = pdf.written().len;
+    try writer.writeAll("xref\n0 10\n");
+    try writer.print("{d:0>10} 65535 f \n", .{@as(u64, 0)});
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
+
+    try writer.writeAll("trailer\n<< /Size 10 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return try pdf.toOwnedSlice();
+}
+
 /// PR-2: a 2-page PDF with one ruled 3x3 table per page, BOTH placed
 /// in the vertical middle of their respective pages — neither sits
 /// near the page-boundary band that linkContinuations now requires.
