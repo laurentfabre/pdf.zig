@@ -479,57 +479,57 @@ updated: 2026-05-04
 > [!info] Why
 > Closes the scope-boundary deferrals from the v1.5 header (font embedding, images, encryption, PDF/A). See `docs/v1.6-tier2-design.md` for the call-graph plan, file-touched matrix, and parallel-merge schedule. Critical path is W11 → W7 → W10; W8 and W9 run parallel after W11.
 
-- [ ] **PR-W11 · refactor: shared resource registry (`src/pdf_resources.zig`)**
+- [x] **PR-W11 · refactor: shared resource registry (`src/pdf_resources.zig`)**
   > [!info]- Details
   > **Why.** Foundation for W7/W8/W10. Today every page inlines its own /Font dict; embedded fonts cannot duplicate per page.
   > **Files-touched envelope.** `src/pdf_resources.zig` (new ~250 LOC), `src/pdf_document.zig` (refactor: replace `fonts_used` with handle list), `src/integration_test.zig`.
   > **Acceptance gate.** `ResourceRegistry` owns fonts/images/colorspaces with object numbers + emit-callbacks; `DocumentBuilder.write()` emits one shared `/Resources` on the page-tree root with `/Parent` inheritance; all Tier-1 tests pass byte-equivalent; 1000-page stress test shrinks vs Tier-1 baseline.
   > **Codex gate.** `/Parent` inheritance correctness; handle stability across page reordering; FailingAllocator over registry growth.
 
-- [ ] **PR-W7 · feat: font embedding (TrueType subset + Type 0 CID)**
+- [x] **PR-W7 · feat: font embedding (TrueType subset + Type 0 CID)**
   > [!info]- Details
   > **Why.** Unlocks UTF-8, CJK, emoji. Today `drawText` silently drops bytes outside WinAnsi.
   > **Files-touched envelope.** `src/font_embedder.zig`, `src/truetype.zig`, `src/cmap_writer.zig` (all new), `src/encoding.zig` (split: tables → `src/encoding/tables.zig`), `src/pdf_document.zig` (≤30 lines), `src/integration_test.zig`. Reuses `agl.glyphNameToUnicode` and existing encoding tables.
   > **Acceptance gate.** `DocumentBuilder.embedFontFromMemory(bytes, name) -> FontHandle` subsets TTF/OTF, emits `/Type0`+`/CIDFontType2`+ToUnicode CMap; `drawText` accepts UTF-8; round-trip "東京 αβγ" → byte-identical extract; subset ≤30% of source.
   > **Codex gate.** TTF table-checksum recompute after subsetting; `/CIDToGIDMap` bounded by glyph count; CMap range-merging doesn't drop edge codepoints.
 
-- [ ] **PR-W8 · feat: image XObject writer (`src/image_writer.zig`)**
+- [x] **PR-W8 · feat: image XObject writer (`src/image_writer.zig`)**
   > [!info]- Details
   > **Why.** Markdown `![]()` round-trip; agent-generated charts; scanned-doc reassembly.
   > **Files-touched envelope.** `src/image_writer.zig`, `src/jpeg_meta.zig` (new), `src/pdf_document.zig` (≤20 lines), `src/markdown_to_pdf.zig` (≤40 lines), `src/integration_test.zig`. Reuses `writeStreamCompressed` for Flate.
   > **Acceptance gate.** `addImageJpeg(bytes)` parses JPEG SOF, emits `/DCTDecode` passthrough; `addImageRaw(bytes, w, h, cs, bits)` emits uncompressed or Flate; `drawImage` emits `cm` + `Do`; round-trip via `--images=base64` returns same JPEG bytes.
   > **Codex gate.** SOF marker parse handles non-baseline JPEGs (SOF0/1/2/3); /BitsPerComponent matches color depth; CMYK SOF emits `/DeviceCMYK`.
 
-- [ ] **PR-W9 · feat: encryption (RC4 + AES, V2/V4)**
+- [x] **PR-W9 · feat: encryption (RC4 + AES, V2/V4)**
   > [!info]- Details
   > **Why.** Symmetric with reader's `Document.openWithPassword` (companion landing in `parser.zig`/`root.zig`).
   > **Files-touched envelope.** `src/crypto.zig`, `src/encrypt_writer.zig` (new), `src/pdf_writer.zig` (≤30 lines hook), `src/pdf_document.zig` (≤15 lines), `src/parser.zig` + `src/root.zig` (decryption mirror, ~200 LOC), `src/integration_test.zig`. Note: no crypto primitives exist in tree today.
   > **Acceptance gate.** `encrypt(.{ user_password, owner_password, perms })`; round-trip V2/R3 (RC4-128) and V4/R4 (AES-128); `qpdf --check` passes both.
   > **Codex gate.** Constant-time password compare; per-string vs per-stream key salt; /Encrypt dict not itself encrypted.
 
-- [ ] **PR-WX1 · refactor: typed catalog setters + page tagging hooks (`pdf_document.zig`)**
+- [x] **PR-WX1 · refactor: typed catalog setters + page tagging hooks (`pdf_document.zig`)**
   > [!info]- Details
   > **Why.** Pre-stage foundation for W10a/b/c/d, mirroring W11's pattern. Adds the typed setters + `PageBuilder.beginTag`/`endTag` hooks so 3 parallel implementation PRs land against disjoint files.
   > **Files-touched envelope.** `src/pdf_document.zig` (~120 lines), `src/integration_test.zig` (~30 lines).
   > **Acceptance gate.** `markAsTagged()`, `setLang(bcp47)`, `markAsPdfA(level)` set flags only — no emission. `beginTag(type, alt) → MCID` injects BDC, `endTag()` injects EMC. Existing tests byte-equivalent.
   > **Codex gate.** MCID counter monotonic across pages; `endTag` without matching `beginTag` is a clean error not a panic.
 
-- [ ] **PR-W10a · feat: XMP /Metadata stream**
+- [x] **PR-W10a · feat: XMP /Metadata stream**
   > [!info]- Details
   > **Files-touched envelope.** `src/xmp_writer.zig` (new ~200 LOC), `src/pdf_document.zig` (≤15 lines).
   > **Acceptance gate.** XMP stream emits valid `pdfaVersion` / `pdfaConformance` markers; catalog references the /Metadata indirect object. XMP escape correctness (no unescaped `&`, `<`, `>`).
 
-- [ ] **PR-W10b · feat: /OutputIntents + embedded sRGB ICC profile**
+- [x] **PR-W10b · feat: /OutputIntents + embedded sRGB ICC profile**
   > [!info]- Details
   > **Files-touched envelope.** `src/assets/srgb.icc` (new 4 KB binary), `src/pdf_document.zig` (≤15 lines).
   > **Acceptance gate.** /OutputIntents array points to embedded ICC stream; `qpdf --check` passes (gated on PR-22a's harness landing). ICC profile is the real sRGB v2 IEC61966-2.1, not a placeholder.
 
-- [ ] **PR-W10c · feat: structure-tree writer (`src/struct_writer.zig`)**
+- [x] **PR-W10c · feat: structure-tree writer (`src/struct_writer.zig`)**
   > [!info]- Details
   > **Files-touched envelope.** `src/struct_writer.zig` (new ~300 LOC), `src/pdf_document.zig` (≤25 lines).
   > **Acceptance gate.** `StructTreeBuilder` emits /StructTreeRoot + /K arrays; round-trip via PR-21's `--struct-tree` returns matching shape. Bounded recursion on tree serialization.
 
-- [ ] **PR-W10d · feat: markdown auto-tagging (BDC/EMC injection)**
+- [x] **PR-W10d · feat: markdown auto-tagging (BDC/EMC injection)**
   > [!info]- Details
   > **Files-touched envelope.** `src/markdown_to_pdf.zig` (≤60 lines).
   > **Depends on:** PR-W10c (struct-tree numbering) + PR-W7 (font embedding for non-ASCII alt text — fallback to ASCII-only fixtures if W7 slips).
@@ -544,7 +544,7 @@ updated: 2026-05-04
 > [!info] Decomposed from the original PR-22 / PR-23 placeholders
 > Pre-stage PR-SX1 + 9 implementation PRs. See `docs/v1.6-wave3-and-v2.0-design.md` for the dispatch matrix. All eligible for `/next-pr` once their dependencies land.
 
-- [ ] **PR-SX1 · refactor: structtree.zig field stubs**
+- [x] **PR-SX1 · refactor: structtree.zig field stubs**
   > [!info]- Details
   > **Why.** Foundation for 22b/c/d/e + 23a/b. Mirrors WX1 pattern: pre-stage nullable fields + stub APIs so 6 parallel sub-PRs each fill in one slot.
   > **Files-touched envelope.** `src/structtree.zig` (~80 lines), `src/integration_test.zig` (~10 lines).
@@ -552,18 +552,18 @@ updated: 2026-05-04
 
 ### PR-22 sub-PRs (PDF/UA-1 conformance)
 
-- [ ] **PR-22a · infra: `qpdf --check` CI harness** — `audit/qpdf_check.py` + `.github/workflows/qpdf-check.yml` (new). Baseline ≥80% fixture pass.
-- [ ] **PR-22b · feat: /RoleMap parser + writer emission** — `src/structtree.zig` (≤40 lines). Resolves custom roles to standard PDF/UA types.
-- [ ] **PR-22c · fix: BMC tag-only marked content** — `src/interpreter.zig` (≤30 lines), `src/structtree.zig` (≤10 lines).
-- [ ] **PR-22d · feat: /Lang propagation** — `src/structtree.zig` (≤50 lines). Tree-walk inheritance + JSON emission.
+- [x] **PR-22a · infra: `qpdf --check` CI harness** — `audit/qpdf_check.py` + `.github/workflows/qpdf-check.yml` (new). Baseline ≥80% fixture pass.
+- [x] **PR-22b · feat: /RoleMap parser + writer emission** — `src/structtree.zig` (≤40 lines). Resolves custom roles to standard PDF/UA types.
+- [x] **PR-22c · fix: BMC tag-only marked content** — `src/interpreter.zig` (≤30 lines), `src/structtree.zig` (≤10 lines).
+- [x] **PR-22d · feat: /Lang propagation** — `src/structtree.zig` (≤50 lines). Tree-walk inheritance + JSON emission.
 - [x] **PR-22e · feat: alt-text validator (Figure/Formula/Form)** — `src/structtree.zig` (validateAltText + validateAll), `src/cli_pdfzig.zig` (`--validate-pdfua` + `kind:"validation"`), `src/stream.zig` (new RecordKind), `src/testpdf.zig` (good/bad Figure fixtures). 17 new tests. Hooks into PR-W10c writer.
 
 ### PR-23 sub-PRs (accessibility tree, linear chain)
 
-- [ ] **PR-23a · feat: MCID → text resolver** — `src/mcid_resolver.zig` (new ~150 LOC), `src/structtree.zig` (≤20 lines).
-- [ ] **PR-23b · feat: inherited-attribute flattener** — `src/attr_flattener.zig` (new ~80 LOC). Depends on 23a + 22d.
-- [ ] **PR-23c · feat: a11y_tree NDJSON emitter** — `src/a11y_emitter.zig` (new ~120 LOC), `src/stream.zig` (≤20 lines new RecordKind).
-- [ ] **PR-23d · feat: --a11y-tree CLI flag** — `src/cli_pdfzig.zig` (≤30 lines), `src/integration_test.zig` (≤40 lines).
+- [x] **PR-23a · feat: MCID → text resolver** — `src/mcid_resolver.zig` (new ~150 LOC), `src/structtree.zig` (≤20 lines).
+- [x] **PR-23b · feat: inherited-attribute flattener** — `src/attr_flattener.zig` (new ~80 LOC). Depends on 23a + 22d.
+- [x] **PR-23c · feat: a11y_tree NDJSON emitter** — `src/a11y_emitter.zig` (new ~120 LOC), `src/stream.zig` (≤20 lines new RecordKind).
+- [ ] **PR-23d · feat: --a11y-tree CLI flag** — `src/cli_pdfzig.zig` (≤30 lines), `src/integration_test.zig` (≤40 lines). _PR #74 open + CI pending as of 2026-05-05._
 
 ---
 

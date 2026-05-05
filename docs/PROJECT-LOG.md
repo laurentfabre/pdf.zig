@@ -69,6 +69,63 @@ binary_kb:: 647
 
 ---
 
+## 🔖 Checkpoint — 2026-05-05 (v1.6 closeout)
+
+> [!info]+ Resume-from-this-row state for a fresh Claude session
+> If you're loading this project cold, this is what's true on `main` right now. The 2026-05-04 checkpoint below is preserved for history.
+
+**Toolchain**: Zig 0.16.0 (default `zig` via ZVM at `~/.zvm/bin/zig`). pdf.zig is hermetically isolated from the sibling Pro/ projects' 0.15 pin.
+
+**v1.6 Tier 2 + v2.0 PR-22/23 decomposition fully shipped on `main`** in a single Robot-Mode session. ~20 sub-PRs landed; ~74 new tests added across 14 new modules + 6 modified. Test count `1751 → 4400+` (multi-runner sums; 39+ build steps green, FailingAllocator-clean, no leak warnings).
+
+**Architecture milestones reached:**
+
+- **Greenfield writer is agent-grade.** Today the writer can emit: balanced page tree (W11), TrueType-subset Type-0 CID fonts with ToUnicode CMaps (W7), JPEG passthrough + raw image XObjects (W8), RC4-128/AES-128 encryption (W9), XMP /Metadata + sRGB ICC OutputIntents (W10a/b), full PDF/UA `/StructTreeRoot` (W10c), and markdown auto-tagging via BDC/EMC injection (W10d).
+- **Reader-side a11y stack composes cleanly.** SX1 staged 4 nullable extension slots on `StructElement`; 22b/22c/22d/22e/23a all populate them in disjoint walks. `attr_flattener` (23b) flattens inherited attrs; `a11y_emitter` (23c) emits the full `kind:"a11y_tree"` NDJSON record with reading_order linearization, MCID→text resolution, and per-leaf attr inlining.
+- **Validation infra in place.** `qpdf --check` CI gate at ≥80% baseline (PR-22a); `--validate-pdfua` CLI flag emits `kind:"validation"` records with PDF/UA-1 §7.18 alt-text rule (PR-22e).
+
+**Shipped this session (in merge order):**
+
+| PR | Title | Files |
+|---|---|---|
+| #54 | PR-W11 shared resource registry | `pdf_resources.zig` (new), `pdf_document.zig` |
+| #58 | PR-W7 font embedding (TrueType + Type 0 CID) | `font_embedder.zig`, `truetype.zig`, `cmap_writer.zig`, `encoding/tables.zig` (new) |
+| #56 | PR-W8 image XObjects | `image_writer.zig`, `jpeg_meta.zig` (new) |
+| #57 | PR-W9 encryption RC4-128 + AES-128 | `crypto.zig`, `encrypt_writer.zig` (new); `parser.zig`, `pagetree.zig`, `root.zig` (decrypt hook) |
+| #55 | docs: wave-3 + v2.0 decomposition (13 sub-PRs) | `docs/v1.6-wave3-and-v2.0-design.md` |
+| #61 | PR-W8.1 deferred image integration tests | `integration_test.zig` |
+| #68 | PR-22a qpdf --check CI harness (87.5% baseline) | `audit/qpdf_check.py`, `audit/qpdf_emit_fixtures.zig`, `.github/workflows/qpdf-check.yml` |
+| #62 | PR-22b /RoleMap parser + chain resolution | `structtree.zig` |
+| #65 | PR-22c BMC tag-only marked content fix | `interpreter.zig`, `structtree.zig` |
+| #64 | PR-22d /Lang propagation | `structtree.zig` |
+| #69 | PR-22e alt-text validator + `--validate-pdfua` | `structtree.zig`, `cli_pdfzig.zig`, `stream.zig` (new RecordKind.validation) |
+| #66 | PR-23a MCID → text resolver | `mcid_resolver.zig` (new), `structtree.zig` |
+| #70 | PR-W10a XMP /Metadata stream | `xmp_writer.zig` (new), `pdf_document.zig` |
+| #63 | PR-W10b /OutputIntents + sRGB ICC | `assets/srgb.icc` (new asset), `pdf_document.zig` |
+| #67 | PR-W10c structure-tree writer | `struct_writer.zig` (new), `pdf_document.zig` |
+| #71 | PR-23b inherited-attribute flattener | `attr_flattener.zig` (new) |
+| #72 | PR-W10d markdown auto-tagging | `markdown_to_pdf.zig` (`renderTagged` entry point) |
+| #73 | PR-23c a11y_tree NDJSON emitter | `a11y_emitter.zig` (new), `stream.zig` (new RecordKind.a11y_tree) |
+| #59 | PR-SX1 structtree.zig wave-3.2 field stubs | `structtree.zig` |
+| #60 | PR-WX1 typed catalog setters + beginTag/endTag | `pdf_document.zig` |
+| #74 | PR-23d `--a11y-tree` CLI flag | `cli_pdfzig.zig`, `integration_test.zig` _(open + CI pending at checkpoint)_ |
+
+**What's next on the roadmap:**
+
+1. **Merge #74** once CI passes (the v1.6 closer).
+2. **Extensive fuzz testing pass** across all targets until clean — the explicit follow-up the user requested. Approach: run `zig build alloc-failure-test` (already passing as a baseline), then add fuzz harnesses for the new writer modules (xmp_writer, struct_writer, image_writer, font_embedder, encrypt_writer, mcid_resolver, attr_flattener, a11y_emitter) if not yet present, then `zig build fuzz` for ≥1M iters per target. Address findings until clean.
+3. **Tighten qpdf-check** (PR-22a) baseline from ≥80% to ≥95% once W10a/b's emitted PDFs are in the corpus and intentional-malformed fixtures are excluded.
+4. **Roadmap below v1.6 is empty** — needs decomposition before `/next-pr` works. Candidate next milestones: v1.7 streaming improvements, v2.0 GA validator (`validateAll` umbrella), Tier 3 writer features (incremental updates, signatures, linearization).
+
+**Caveats for fresh context:**
+
+- Wave-3.2 dispatched 9 simultaneous `zig-defensive` worktrees. Some had cross-contamination (W10a v1's stale edits leaked into 23a's worktree). Future parallel batches should revert stale uncommitted edits in worktrees before validating.
+- One subagent's `git push --force-with-lease` was flagged as a security-policy violation. Memorized policy: **subagents commit only; main session pushes**.
+- macOS-only local testing missed two Linux-CI-only failures (xmp_writer FileNotFound import, qpdf-emit-fixtures missing build step). Always run `~/.zvm/bin/zig build qpdf-check` and the equivalent Linux build before pushing if writer modules touched.
+- See `docs/v1.6-tier2-design.md` (waves 1+2) and `docs/v1.6-wave3-and-v2.0-design.md` (wave 3 + v2.0) for the call-graph plans that drove the dispatch matrix.
+
+---
+
 ## 🔖 Checkpoint — 2026-05-04
 
 > [!info]+ Resume-from-this-row state for a fresh Claude session
