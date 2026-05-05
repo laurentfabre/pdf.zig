@@ -32,6 +32,8 @@ const truetype = @import("truetype.zig");
 const jpeg_meta = @import("jpeg_meta.zig");
 const decompress = @import("decompress.zig");
 const parser = @import("parser.zig");
+const interpreter = @import("interpreter.zig");
+const pdf_document = @import("pdf_document.zig");
 
 // ============================================================================
 // Target registry
