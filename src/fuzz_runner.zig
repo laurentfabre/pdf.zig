@@ -1515,9 +1515,19 @@ fn biasPdfishToken(rng: std.Random, buf: []u8) void {
     };
     const tok = tokens[choice];
     if (tok.len > buf.len) return;
-    const max_off = buf.len - tok.len;
-    const off = if (max_off == 0) 0 else rng.intRangeAtMost(usize, 0, max_off);
-    @memcpy(buf[off..][0..tok.len], tok);
+    // Codex review of 77b8bf5 [P2]: `parseObject` starts at `pos == 0` and
+    // only skips whitespace + comments before dispatching, so a biased
+    // token written at a non-zero offset is never reached. Place the
+    // first token at offset 0 deterministically; if there's room, plant
+    // a *second* token at a random later offset to keep the
+    // partial-overwrite + adjacent-noise coverage the original placement
+    // was reaching for.
+    @memcpy(buf[0..tok.len], tok);
+    if (buf.len > 2 * tok.len and rng.boolean()) {
+        const max_off = buf.len - 2 * tok.len;
+        const off = tok.len + rng.intRangeAtMost(usize, 0, max_off);
+        @memcpy(buf[off..][0..tok.len], tok);
+    }
 }
 
 /// Recursive structural validator. Walks `obj` and asserts:
