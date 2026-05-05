@@ -3008,3 +3008,122 @@ test "PR-22e: ActualText satisfies the alt requirement when /Alt is absent" {
     };
     try zpdf.structtree.validateAltText(&tree);
 }
+
+// PR-23d helper: stand up tmpDir + write `pdf_data` to `name.pdf`,
+// run `extract` with `extra_args` merged onto the base ExtractArgs,
+// and return the captured NDJSON. Caller frees the returned slice.
+fn runA11yExtract(
+    allocator: std.mem.Allocator,
+    pdf_data: []const u8,
+    args: cli.ExtractArgs,
+    tmp: *std.testing.TmpDir,
+    io: std.Io,
+) ![]u8 {
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.pdf", .data = pdf_data });
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    const tmp_path = try std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_path);
+    const in_path = try std.fs.path.join(allocator, &.{ tmp_path, "in.pdf" });
+    defer allocator.free(in_path);
+    const out_path = try std.fs.path.join(allocator, &.{ tmp_path, "out.ndjson" });
+    defer allocator.free(out_path);
+
+    var run_args = args;
+    run_args.input = in_path;
+    run_args.output_path = out_path;
+    run_args.output_mode = .ndjson;
+    const ec = try cli.runExtract(allocator, io, run_args);
+    try std.testing.expectEqual(cli.ExitCode.ok, ec);
+
+    return tmp.dir.readFileAlloc(io, "out.ndjson", allocator, .limited(256 * 1024));
+}
+
+test "PR-23d CLI: --a11y-tree on tagged fixture emits a11y_tree record with reading_order" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const out_data = try runA11yExtract(allocator, pdf_data, .{ .input = "", .a11y_tree = true }, &tmp, io);
+    defer allocator.free(out_data);
+
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"kind\":\"a11y_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"reading_order\":[") != null);
+    // The tagged-table fixture has six MCID leaves (A1..C2) — the
+    // reading_order array must contain six entries, identifiable by
+    // their per-cell `"text"` strings.
+    inline for (.{ "\"A1\"", "\"B1\"", "\"C1\"", "\"A2\"", "\"B2\"", "\"C2\"" }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, out_data, needle) != null);
+    }
+
+    // Locate the a11y_tree record line and assert it parses as JSON.
+    var lines = std.mem.splitScalar(u8, out_data, '\n');
+    var found: bool = false;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"kind\":\"a11y_tree\"") == null) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expect(root.get("root") != null);
+        const ro = root.get("reading_order").?.array;
+        try std.testing.expectEqual(@as(usize, 6), ro.items.len);
+        found = true;
+        break;
+    }
+    try std.testing.expect(found);
+}
+
+test "PR-23d CLI: --a11y-tree on untagged input emits null root + empty reading_order" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // generateMinimalPdf has no /StructTreeRoot.
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "Hello");
+    defer allocator.free(pdf_data);
+
+    const out_data = try runA11yExtract(allocator, pdf_data, .{ .input = "", .a11y_tree = true }, &tmp, io);
+    defer allocator.free(out_data);
+
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"kind\":\"a11y_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"root\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_data, "\"reading_order\":[]") != null);
+}
+
+test "PR-23d CLI: --a11y-tree combined with --struct-tree emits both records" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pdf_data = try testpdf.generateTaggedTablePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const out_data = try runA11yExtract(
+        allocator,
+        pdf_data,
+        .{ .input = "", .struct_tree = true, .a11y_tree = true },
+        &tmp,
+        io,
+    );
+    defer allocator.free(out_data);
+
+    const st_idx = std.mem.indexOf(u8, out_data, "\"kind\":\"struct_tree\"") orelse return error.MissingStructTree;
+    const at_idx = std.mem.indexOf(u8, out_data, "\"kind\":\"a11y_tree\"") orelse return error.MissingA11yTree;
+    // No interleaving: each record lives on its own line; the
+    // struct_tree line must end before the a11y_tree line begins.
+    try std.testing.expect(st_idx < at_idx);
+    const between = out_data[st_idx..at_idx];
+    try std.testing.expect(std.mem.indexOfScalar(u8, between, '\n') != null);
+}
