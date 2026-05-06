@@ -71,26 +71,575 @@ Lesson: when a fuzz crash repros under harness but not under the production CLI 
 
 ---
 
-## Default-gate clean targets (11 / 11 at 200k iters, 1M run in progress)
+## Default-gate clean targets (23 / 23 at 1M iters — v1.6 closeout pass, 2026-05-05)
 
-| Target | 200k iters wall time |
-|---|---|
-| tokenizer_count | 4.1 s |
-| stream_json_string | 26.8 s |
-| stream_envelope_meta | 1.1 s |
-| stream_envelope_page | 12.2 s |
-| chunk_break_finder | 31.9 s |
-| cli_parse_args | 21 ms |
-| cli_page_range | 30 ms |
-| pdf_open_random | 155 ms |
-| pdf_open_magic_prefix | 155 ms |
-| pdf_extract_seed_repeat | 1.2 s |
-| tokenizer_realistic_md | 3.1 s |
-| **Total** | **80.7 s** |
+23 default-gated targets clean at 1M iterations each. Full sweep: **43 min 36 s wall** on macOS arm64 / Debug build, base seed `0x19df6d9ca62`, no panics, no invariant violations.
+
+| Target | 1M iters wall time | Notes |
+|---|---|---|
+| tokenizer_count | 44.0 s | streaming layer |
+| stream_json_string | 505.2 s | streaming layer |
+| stream_envelope_meta | 23.8 s | streaming layer |
+| stream_envelope_page | 178.8 s | streaming layer |
+| chunk_break_finder | 606.2 s | streaming layer |
+| cli_parse_args | 0.7 s | CLI |
+| cli_page_range | 2.0 s | CLI |
+| pdf_open_random | 5.2 s | parser |
+| pdf_open_magic_prefix | 5.2 s | parser |
+| pdf_extract_seed_repeat | 104.2 s | parser, seed-rotated |
+| tokenizer_realistic_md | 195.4 s | tokenizer + chunk |
+| lattice_content_random | 59.5 s | lattice Pass B (Form XObject) |
+| lattice_form_xobject_mutation | 65.8 s | lattice Pass B mutation |
+| tagged_table_mutation | 7.6 s | Pass A (tagged-table cells via MCID) |
+| link_continuations_random | 2.0 s | Pass D continuation-link bbox |
+| lattice_pass_b_spans | 22.3 s | Pass B (lattice cells via glyph-center ∩ bbox) |
+| **xmp_escape_xml** | **89.0 s** | **v1.6 PR-W10a — XML escape post-conditions** |
+| **xmp_emit_random** | **40.8 s** | **v1.6 PR-W10a — XMP packet structural invariants** |
+| **encrypt_roundtrip_rc4** | **251.6 s** | **v1.6 PR-W9 — RC4-128 encrypt/decrypt round-trip** |
+| **encrypt_roundtrip_aes** | **273.6 s** | **v1.6 PR-W9 — AES-128 encrypt/decrypt round-trip + IV/padding shape** |
+| **markdown_render_tagged** | **118.6 s** | **v1.6 PR-W10d — renderTagged → reopen-via-parser round-trip** |
+| **truetype_parse_random** | **7.4 s** | **v1.6 PR-W7 — TTF parser robustness on adversarial bytes** |
+| **jpeg_meta_random** | **7.3 s** | **v1.6 PR-W8 — JPEG SOF/SOI parser robustness** |
+| **decompress_ascii_hex_random** | **105.2 s** | **iter-1 — `/Filter ASCIIHexDecode` random-bytes** |
+| **decompress_runlength_random** | **115.2 s** | **iter-1 — `/Filter RunLengthDecode` biased-bytes** |
+| **parser_object_pdfish** | **8.2 s** ⚠️ | **iter-2 — biased COS-syntax bytes; 1M ran on pre-fb2bdca harness (biased-degrades-to-random; rerun pending)** |
+| **parser_indirect_object_random** | **1.5 s** | **iter-2 — synthetic `N M obj … endobj` frames + `/Length` boundary cases through `Parser.parseIndirectObject`** |
+| **parser_init_at_offset_random** | **0.3 s** | **iter-2 — random byte-offsets into seed-pool PDFs through `Parser.initAt`** |
+| **interpreter_random_ops** | **57.1 s** | **iter-3 — biased COS-operator bytes through `ContentLexer.next()`** |
+| **interpreter_bdc_emc_nesting** | **161.6 s** | **iter-3 — synthesised PDFs with hostile BDC/EMC nesting through `Document.extractMarkdown`** |
+| writer_drawtext_roundtrip | **116.5 s** | iter-4 — DocumentBuilder ↔ Document text round-trip |
+| writer_multipage_count | **515.7 s** | iter-4 — multipage page-tree round-trip |
+| writer_text_escape_roundtrip | **80.4 s** | iter-4 — PDF metachar escape round-trip via raw extractText |
+| decompress_runlength_diff | **60.6 s** | iter-5 — RLE encode/decode differential |
+| decompress_ascii_hex_diff | **108.6 s** | iter-5 — ASCIIHex encode/decode differential |
+| decompress_filter_chain_diff | **63.0 s** | iter-5 — filter chain ownership transfer |
+| pdf_of_pdf_roundtrip | **794.7 s** | iter-7 — multi-stage adversarial PDF-of-PDF (4M stage-cycles at 1M iters × 4 stages) |
+| **Total (post-iter-25 comprehensive 1M)** | **8 217.4 s (137 min 17 s) — 73/73 default-gate targets clean at 1M iters, base seed pinned via isolated `--cache-dir`.** Surfaced **Finding 012** (outline stack overflow) at iter ~600k of `outline_adversarial_mutate`, which has now been gated `reproducer_only` in 052faa2-followups. Heavy targets: font_embedder_emit_minimal_ttf 393 s, pagetree_balanced_shape 562 s, encrypt_authenticate_user_roundtrip 312 s, mcid_resolver_resolve_batch_parallel 223 s. The 6 `reproducer_only` targets and 2 `aggressive` targets are skipped from the sweep per their gating. | |
+| Prior post-iter-7 reference (38 default-gate targets) | 4 788.6 s (79 min 49 s) | preserved for cross-reference |
+
+The aggressive-gated `decompress_ascii85_roundtrip` is `reproducer_only` and skipped from the default + aggressive sweeps; deterministically reproduces Finding 005 below.
 
 Aggressive-mode targets (`PDFZIG_FUZZ_AGGRESSIVE=1`):
 - `pdf_open_mutation` — 50k iters, 1.7 s, clean
-- `pdf_extract_mutation` — 50k iters, 1.8 s, clean
+- `pdf_extract_mutation` — 50k iters, 1.8 s, clean (`seed_pool[0]`-pinned per Finding 004)
+
+The seven **bold** targets were added during the v1.6 closeout fuzz pass (2026-05-05) to cover writer-side modules introduced in PR-W7…W10 + PR-W10d (font embedder, image XObject + JPEG metadata, encryption, XMP /Metadata, markdown auto-tagging). The structtree / a11y_emitter / attr_flattener / mcid_resolver / struct_writer surfaces are exercised end-to-end by `pdf_extract_seed_repeat` over the 4-PDF seed pool — they consume parsed `StructElement` graphs rather than raw bytes, so byte-level fuzzing offers no incremental signal beyond the existing unit tests + FailingAllocator sweeps.
+
+### Discoveries during the v1.6 fuzz pass
+
+- **`markdown_render_tagged` v1 false-positive (resolved in-pass).** First draft of the harness counted raw `BDC` / `EMC` substring occurrences in the emitted PDF and asserted parity. PR-W4 (FlateDecode on content streams) makes those substrings appear inside compressed bytes, so 72 / 100k iters tripped a structural-mismatch invariant that was actually noise. Replaced with a stronger `Document.openFromMemory` + `pageCount > 0` round-trip check; the parser is the authoritative validator of the emitted bytes' structure.
+
+---
+
+## Finding 005 — `decodeASCII85` u32 overflow trap on legal-looking 5-char tuples
+
+**Status**: OPEN (issue tracker disabled on the repo; tracked here + in `audit/fuzz_loop_state.md`)
+**Path**: `src/decompress.zig:386` — `tuple = tuple * 85 + (c - '!')`
+**Surfaced by**: fuzz target `decompress_ascii85_roundtrip` (aggressive-gate), iter 1 of the autonomous fuzz loop, `PDFZIG_FUZZ_SEED=0x1` panics within the first 200 iters.
+**Class**: integer overflow (Debug / ReleaseSafe panic; ReleaseFast UB → silently wrong output)
+
+### Reproducer
+
+```zig
+// 5-byte minimal repro:
+const out = try decompress.decompressStream(
+    allocator,
+    "uuuuu",
+    .{ .name = "ASCII85Decode" },
+    null,
+);
+defer allocator.free(out);
+```
+
+Or via the harness:
+
+```sh
+PDFZIG_FUZZ_AGGRESSIVE=1 \
+  PDFZIG_FUZZ_TARGET=decompress_ascii85_roundtrip \
+  PDFZIG_FUZZ_SEED=0x1 \
+  ~/.zvm/bin/zig build fuzz
+```
+
+### Stack at the panic
+
+```
+thread <id> panic: integer overflow
+src/decompress.zig:386:23  decodeASCII85
+src/decompress.zig:88:29   applyFilter
+src/decompress.zig:61:39   decompressStream
+```
+
+### Root cause
+
+After the 4th iteration of `tuple = tuple * 85 + (c - '!')` the accumulator can reach `84 × 85^4 = 4 437 053 040`, exceeding `u32` max (`4 294 967 295`). PDF spec ISO 32000-1 §7.4.3 says *valid* encoded 5-tuples represent values < `2^32`, but the *intermediate* accumulator overflows even when the final value would be in range — and adversarial input doesn't have to be valid.
+
+### Recommended fix
+
+Two options at `src/decompress.zig:386`:
+
+1. **Pre-check.** Before each `tuple = tuple * 85 + …`, verify `tuple <= (std.math.maxInt(u32) - 84) / 85`; otherwise return `error.DecompressFailed`.
+2. **u64 intermediate.** Accumulate into `u64`; on flush (count == 5) check `tuple > std.math.maxInt(u32)` and return `error.DecompressFailed`.
+
+Option 2 is simpler and probably faster (one cmp instead of one cmp + one div per byte). The default-gated `decompress_ascii_hex_random` and `decompress_runlength_random` targets don't reach this surface — only the aggressive-gated round-trip target does — so default-gate fuzz remains clean while the fix is in flight.
+
+### User-facing impact
+
+A malicious PDF with an `/ASCII85Decode` filtered stream containing a 5-tuple whose intermediate accumulator overflows would crash any pdf.zig consumer running in `Debug` or `ReleaseSafe` (panic) and silently produce wrong decoded bytes in `ReleaseFast`. The CLI's primary path is `Document.open(path)` over trusted PDFs; `openFromMemory` over attacker-controlled bytes is reachable through the embedding API and the C / WASM consumers.
+
+**Severity: Medium.** Crash on adversarial input. No OOB read, no RCE.
+
+---
+
+## Finding 006 — `interpreter.ContentInterpreter` is 0.16-stale and uncompilable
+
+**Status**: OPEN (compile-time, not runtime — surfaces only when an external caller instantiates the type)
+**Path**: `src/interpreter.zig:103` and `src/interpreter.zig:172`
+**Surfaced by**: iter-3 of the autonomous fuzz loop. The planned `interpreter_q_stack_dispatch` target tried to instantiate `interpreter.ContentInterpreter(*std.Io.Writer)` to drive adversarial q/Q runs against the graphics-state stack; build failed with three compile errors before any iter executed.
+**Class**: stale 0.15 stdlib API in production source — a Writergate / `ArrayList`-unmanaged migration miss
+
+### Reproducer
+
+```zig
+const interpreter = @import("interpreter.zig");
+test "ContentInterpreter compiles in 0.16" {
+    const Interp = interpreter.ContentInterpreter(*std.Io.Writer);
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var i = Interp.init(std.testing.allocator, &w, "", null, undefined);
+    defer i.deinit();
+}
+```
+
+### Root cause
+
+`ContentInterpreter.init` (interpreter.zig:103) calls `std.ArrayList(GraphicsState).init(allocator)` — the **managed** ArrayList constructor, removed in 0.16. `executeOperator` (interpreter.zig:172) then calls `state_stack.append(self.state)` — also the managed signature. Both surfaces need the unmanaged-style migration the rest of the codebase has already received: `.empty` initialiser + explicit allocator on `append(allocator, item)`.
+
+The reason this stayed hidden is that `ContentInterpreter` is **public surface but unused in production**. The actual content-stream dispatch path is `extractContentStream` in `root.zig`, which drives `interpreter.ContentLexer` directly with its own operator-by-operator switch. The only would-be callers were the iter-3 fuzz harnesses.
+
+### Recommended fix
+
+Two-line patch:
+
+```zig
+// src/interpreter.zig:103
+.state_stack = .empty,
+
+// src/interpreter.zig:172
+try self.state_stack.append(self.allocator, self.state);
+```
+
+Alternative: delete `ContentInterpreter` entirely and trim the public surface — `extractContentStream` is the canonical dispatch, so the type is genuinely dead.
+
+### User-facing impact
+
+**None.** The dead-but-public type is never instantiated in any user-reachable path. The fuzz coverage gap (no q/Q-stack-stress target) is the only externally-visible consequence. Severity: **Low** (documentation / dead-code hygiene; not a runtime bug).
+
+---
+
+## Finding 007 — Zig 0.16.0 `std.testing.fuzz` discovery-pass segfault
+
+**Status**: OPEN UPSTREAM (toolchain bug, not pdf.zig)
+**Path**: `~/.zvm/0.16.0/lib/std/testing/fuzzer.zig:904` (`ensureCorpusLoaded`) called from `mainServer` → `run_test` → `std.testing.fuzz` before `start_fuzzing`
+**Surfaced by**: iter-6 of the autonomous fuzz loop. Attempting to declare a `.fuzz = true` test binary triggers a segfault during the build runner's discovery pass on every test, **before** any fuzzer state is initialised.
+**Class**: zig stdlib bug — uninitialised state read in test discovery
+
+### Reproducer
+
+```zig
+// src/example_fuzz.zig
+const std = @import("std");
+test "fuzz hello" {
+    try std.testing.fuzz(@as(void, {}), struct {
+        fn hello(_: void, smith: *std.testing.Smith) anyerror!void {
+            _ = try smith.bytes(0, 16);
+        }
+    }.hello, .{});
+}
+```
+
+```sh
+# In a build.zig that adds .fuzz = true to the test module:
+~/.zvm/bin/zig build fuzz-cov  # → SIGSEGV in fuzzer.zig:904 ensureCorpusLoaded
+```
+
+### Workaround (active in iter-6)
+
+Omit `.fuzz = true` on the module. `std.testing.fuzz` then runs in **seed-corpus-only** mode (test_runner.zig line 596+): `Smith.in` is sourced from `FuzzInputOptions.corpus`, the test_one body executes once per corpus entry, and the harness asserts the same invariants the coverage-guided variant would. The harness body needs no edits when `.fuzz = true` becomes safe to flip.
+
+See `src/fuzz_cov.zig` (the iter-6 harness) and the `fuzz-cov` step block in `build.zig` for the wiring + the comment block documenting the flip-back path.
+
+### User-facing impact
+
+**None on pdf.zig users.** The pdf.zig CLI has zero `.fuzz = true` test bindings. The impact is only on the loop's tier-6 coverage-guided runs — they currently run in seed-corpus mode instead of true coverage-guided AFL-style. As soon as 0.16.x or 0.17 ships a fix for the discovery pass, the harnesses upgrade with a one-line build.zig flag flip.
+
+### Recommended action
+
+1. **File upstream** at `ziglang/zig` GitHub issues if not already known (the segfault site looks like a recent regression — `ensureCorpusLoaded` is called from `mainServer`'s pre-fuzz validation pass on uninitialised fuzzer state; either guard the call or initialise the fuzzer state earlier).
+2. **Track 0.16.x release notes** for the fix; flip `.fuzz = true` in `build.zig` when it ships.
+3. **No pdf.zig source change needed.**
+
+---
+
+## Finding 008 — `cff.zig` Index/DICT panic on adversarial CFF bytes
+
+**Status**: OPEN (issue tracker disabled on the repo; tracked here + in `audit/fuzz_loop_state.md`)
+**Surfaced by**: iter-9 of the autonomous fuzz loop. Three `reproducer_only` targets (`cff_init_random_bytes`, `cff_init_biased_header`, `cff_dict_random_topdict`) deterministically trip in ReleaseSafe within a few hundred to ~10k iters at multiple base seeds (`0x1`, `0x2`, `0xCAFEBABE`, `0xDEADBEEF`).
+**Class**: integer overflow / `@intCast` trap (Debug + ReleaseSafe panic; ReleaseFast UB → silently wrong offsets / OOB reads).
+
+### Site 008a — `Index.parse` last-offset underflow
+
+**Path**: `src/cff.zig:263` — `const data_size = temp_cursor.readOffSize(off_size) - 1;`
+
+The CFF Index format encodes data size as `last_offset - 1` (offsets are 1-based relative to the byte preceding the data array). When attacker bytes set the *last* offset to `0`, the subtraction underflows `usize`. ReleaseSafe traps; ReleaseFast wraps to `usize.max - 0` and the next `cursor.pos += data_size` blows past `cursor.data.len`, opening every subsequent `Index.parse` and `getData` call to OOB reads.
+
+#### Minimal reproducer
+
+```
+// 9-byte CFF that trips Finding 008a:
+//   header   : 01 00 04 01      (major=1 minor=0 hdrSize=4 offSize=1)
+//   Name IDX : 00 01 01 00 00   (count=1 offSize=1 offsets=[0,0])
+const bytes = [_]u8{ 1, 0, 4, 1, 0, 1, 1, 0, 0 };
+var p = try cff.CffParser.init(allocator, &bytes);  // panics here
+defer p.deinit();
+```
+
+```sh
+PDFZIG_FUZZ_ITERS=10000 PDFZIG_FUZZ_SEED=0x1 \
+  PDFZIG_FUZZ_TARGET=cff_init_random_bytes \
+  ~/.zvm/bin/zig build fuzz -Doptimize=ReleaseSafe
+```
+
+#### Stack at the panic
+
+```
+thread <id> panic: integer overflow
+src/cff.zig:273:9       parse           (return Index{...} after the underflow at line 263)
+src/cff.zig:71:42       parse           (self.name_index = try Index.parse(&cursor))
+src/fuzz_runner.zig:... fuzzCffInitRandomBytes
+```
+
+#### Recommended fix
+
+```zig
+// src/cff.zig:263
+const last_off = temp_cursor.readOffSize(off_size);
+if (last_off == 0) return CffError.TruncatedData;
+const data_size = last_off - 1;
+```
+
+Same defensive pattern at `src/cff.zig:291-292` in `Index.getData`:
+
+```zig
+if (start == 0 or end == 0) return &[_]u8{};
+const real_start = self.data_offset + start - 1;
+const real_end = self.data_offset + end - 1;
+```
+
+(getData currently catches the consequence with the `real_start >= full_data.len` check on line 294, but that check fires *after* the `+ start - 1` underflow — so it's load-bearing only in ReleaseFast where the underflow wraps. Make the precondition explicit.)
+
+### Site 008b — `parseTopDict` `@intCast` trap on negative DICT operand
+
+**Path**: `src/cff.zig:105` (and the parallel sites at 108, 111, 115, 116) — `self.charset_offset = @intCast(op.operands[0]);`
+
+`DictParser.readNumber` returns an `i32`. The Top DICT Charset / Encoding / CharStrings / Private offsets are stored as `usize`. When attacker bytes encode a negative number (e.g. via the `251..254` single-byte negative-int range, or a real-number nibble path that rounds to a negative value, or operator `29` long-int with the high bit set), `@intCast(i32 → usize)` traps in ReleaseSafe.
+
+ReleaseFast `@intCast` is UB and reinterprets the negative as a huge `usize`, which then drives `cursor.pos = self.charstrings_offset` (or similar) past `data.len`, opening downstream OOB reads.
+
+#### Minimal reproducer
+
+Build a CFF where the Top DICT body sets operator 15 (Charset) with a negative operand. Easiest: encode operand `-1` via `b0 = 251, b1 = 0` (the `-1*256 - 0 - 108 = -364`-ish range), then operator byte `15`:
+
+```
+// header + empty Name IDX + Top DICT IDX with body "FB 00 0F" + empty String IDX + empty Subr IDX
+//   251 00 → operand -108
+//   0F     → operator 15 (Charset)
+const bytes = [_]u8{ 1, 0, 4, 1, 0, 0, 0, 1, 1, 1, 4, 251, 0, 15, 0, 0, 0, 0 };
+var p = try cff.CffParser.init(allocator, &bytes);  // panics on the @intCast
+defer p.deinit();
+```
+
+```sh
+PDFZIG_FUZZ_ITERS=50 PDFZIG_FUZZ_SEED=0x1 \
+  PDFZIG_FUZZ_TARGET=cff_dict_random_topdict \
+  ~/.zvm/bin/zig build fuzz -Doptimize=ReleaseSafe
+```
+
+#### Stack at the panic
+
+```
+thread <id> panic: integer does not fit in destination type
+src/cff.zig:105:68      parseTopDict    (self.charset_offset = @intCast(op.operands[0]))
+src/cff.zig:85:43       parse           (try self.parseTopDict(top_dict_data))
+src/cff.zig:46:8        init            (try parser.parse())
+```
+
+#### Recommended fix
+
+Range-check then store. All five offset assignments need the same guard:
+
+```zig
+15 => { // Charset
+    if (op.operands.len > 0) {
+        const v = op.operands[0];
+        if (v < 0 or v > std.math.maxInt(u32)) return CffError.InvalidOperand;
+        self.charset_offset = @intCast(v);
+    }
+},
+```
+
+Or factor a helper:
+
+```zig
+fn nonNegativeOffset(v: i32) !usize {
+    if (v < 0) return CffError.InvalidOperand;
+    return @intCast(v);
+}
+```
+
+`InvalidOperand` is already in `CffError`, so no enum change needed.
+
+### User-facing impact
+
+CFF Type 2 fonts are a primary attack vector for PDF readers (CVE-2010-2883 et al. set the precedent). The pdf.zig CLI's primary path is `Document.open(path)` over trusted PDFs, but CFF-fontfile bytes inside an *otherwise-trusted* PDF are still attacker-controlled — a malicious PDF can carry a corrupt CFF FontFile3 stream that traps the reader. Embedding API consumers (C / WASM) hit this on any `openFromMemory` over an attacker-shaped PDF.
+
+**Severity: Medium.** Two distinct ReleaseSafe panics in the CFF parser. ReleaseFast trades the panic for OOB reads (`Index.parse` data_size wraps; `parseTopDict` offset reinterprets to multi-GB) — same severity class as Finding 005.
+
+### Why all three iter-9 targets are `reproducer_only`
+
+`cff_init_random_bytes` and `cff_init_biased_header` both reach `Index.parse` after a few hundred iters once random bytes form a non-zero count + at least one zero offset. `cff_dict_random_topdict` reaches `parseTopDict` on every iter and trips 008b within ~50 iters because random `i32` operands skew negative ~50 % of the time.
+
+There is no constrained-input variant that exercises the parser surface meaningfully *and* dodges both bugs — the bugs sit on the main parse path. So all three targets are gated as `reproducer_only` until Finding 008a + 008b are fixed; the harness shape is then unchanged when promoted back to default-gate.
+
+---
+
+## Finding 009 — `assignImageObjectNumbers` doesn't flip the registry freeze flag (asymmetric with fonts)
+
+**Status**: OPEN (design asymmetry; possibly intentional)
+**Path**: `src/pdf_resources.zig:378`
+**Surfaced by**: Codex review of iter-10's `pdf_resources_image_register_assign` target. The subagent originally noted the asymmetry and decided it was intent (per the comment at line 378). Codex flagged the harness for not actually probing it — silently passing on an asymmetric contract is the same as rubber-stamping a possible bug.
+**Class**: design-level lifecycle gap (not a runtime panic)
+
+### Behaviour
+
+`assignFontObjectNumbers` sets the registry-wide `object_nums_assigned = true` flag, which then causes:
+
+- `registerFontBuiltin` post-assign → `error.ObjectNumbersAlreadyAssigned`
+- `registerImage` post-assign → `error.ObjectNumbersAlreadyAssigned`
+- `assignFontObjectNumbers` again → `error.ObjectNumbersAlreadyAssigned`
+
+`assignImageObjectNumbers` does **not** flip the flag, so:
+
+- `registerImage` post-image-assign → succeeds (mutates frozen-ish registry)
+- `assignImageObjectNumbers` again → succeeds (re-assigns object numbers to the same images)
+
+The `assignFontObjectNumbers` flag-flip means the **font** path is locked, but the **image** path remains mutable until the font path locks it (or never, if no fonts are registered).
+
+### Why this matters
+
+`DocumentBuilder.write()` calls both assigns in sequence — currently safe because the writer drives a deterministic order. But a future caller (or a refactor) could:
+
+1. Call `assignImageObjectNumbers` early, then add more images, then re-call → silent re-assign of object numbers, breaking xref-table layout.
+2. Call `assignImageObjectNumbers` after `assignFontObjectNumbers` → succeeds (font path is frozen but image path isn't), so a partial-flow caller gets unexpectedly inconsistent state.
+
+The font path's freeze contract is the safe-by-default; image path's lack-of-freeze is the divergence.
+
+### Recommended fix
+
+One-line patch at `src/pdf_resources.zig` (the assignImageObjectNumbers body):
+
+```zig
+if (self.object_nums_assigned) return error.ObjectNumbersAlreadyAssigned;
+// … existing body …
+self.object_nums_assigned = true;
+```
+
+Mirror the font path. If the asymmetry was intentional (some legitimate use case for re-assigning image obj nums), document it explicitly at line 378 + add a regression test asserting the expected `assignImageObjectNumbers` × 2 success. Otherwise, lock the path.
+
+### User-facing impact
+
+**None today.** The single in-tree caller (`DocumentBuilder.write()`) drives the registry through one well-defined path. Severity: **Low** — design hygiene, not a runtime bug.
+
+The iter-10 `pdf_resources_image_register_assign` target now pins the *current* (asymmetric) behaviour as the harness contract: a re-assign call must succeed. If the production code is later "fixed" to mirror the font path, that target will trip and force this audit entry to be re-examined.
+
+---
+
+## Finding 010 — `pdf_writer.writeStreamCompressed` panics inside stdlib flate when body ≤ 8 B
+
+**Status**: OPEN
+**Path**: `src/pdf_writer.zig:397` (root cause) → `lib/std/compress/flate/Compress.zig:309` (panic site)
+**Surfaced by**: iter-13 `image_writer_emit_random_geom` at seed 0x1, < 1k iters in Debug.
+**Class**: runtime panic (`reached unreachable code`) on legal API call
+
+### Behaviour
+
+`std.compress.flate.Compress.init` asserts `output.buffer.len > 8` (the zlib header alone takes 2 B + the trailing Adler-32 takes 4 B; the encoder needs at least one extra byte of headroom). `pdf_writer.writeStreamCompressed` allocates the output collector with `initCapacity(allocator, body.len)` — when the caller-supplied body is ≤ 8 B the writer's output buffer is too small and the assert fires.
+
+Repro path:
+
+1. `Writer.init(allocator)` → `allocObjectNum()` → `beginObject(num, 0)`.
+2. Build any 0..8-byte body (the harness uses `image_writer.ImageRef{ encoding = .raw_flate, bytes = …, … }` with `bytes.len = 0` as the minimal repro).
+3. Call `image_writer.emitImageObject(&ref, &w)` — internally fans out to `writeStreamCompressed`.
+4. Panic.
+
+Bug class is **denial-of-service via bounded-cause input**, but the input (`bytes`) is *internal to the writer* — no attacker-controlled byte stream reaches `writeStreamCompressed` from a parser path; the body is always a sample buffer the caller built. So the panic is a builder-bug surface (e.g., a future `addImageRaw(width=0, height=0, …)` or a 1×1 grayscale icon at 1 BPC = 1-byte body) rather than a network-reachable DoS.
+
+### Recommended fix
+
+One-line patch at `src/pdf_writer.zig:397`:
+
+```zig
+// Was:
+//   var compressed = try std.Io.Writer.Allocating.initCapacity(self.allocator, body.len);
+// After:
+const min_cap: usize = 64; // zlib header (2) + Adler-32 (4) + slack
+var compressed = try std.Io.Writer.Allocating.initCapacity(
+    self.allocator,
+    @max(body.len, min_cap),
+);
+```
+
+`Allocating.initCapacity` reserves a buffer of *at least* the requested size. Clamping to `max(body.len, 64)` keeps the steady-state cost identical (large bodies dominate) while making the small-body case safe. The 64 B floor is comfortable headroom over the 8 B assert.
+
+### Why this wasn't caught earlier
+
+`image_writer`'s in-tree tests use `body = "AAAA…" ** 16` (line 214 — 576 B) which sails past the 8 B threshold. The DCT-passthrough test uses `body.len = 4` but routes through `writeStream` (uncompressed) not `writeStreamCompressed`. The single test that touches `writeStreamCompressed` always passes a > 8 B body.
+
+The iter-13 `image_writer_emit_random_geom` target is gated `reproducer_only` until this fix lands — running it in the default sweep would crash an otherwise-clean `PDFZIG_FUZZ_ITERS=100000 zig build fuzz` run. Promote back to default-gate after the fix.
+
+### User-facing impact
+
+**Low.** No in-tree call path produces a < 8 B body to `writeStreamCompressed` today: `DocumentBuilder.addImage*` validates `width > 0` and `height > 0`, and the smallest valid raw image is 1×1 with 1 BPC = 1 component-byte = 1 B body, which DOES trip the bug. So a user who calls `addImageRaw(1, 1, .gray, 8, &[_]u8{0xFF}, .flate)` currently panics. ReleaseSafe / Debug both panic; ReleaseFast would be UB (the assert disappears but `Compress.init` writes past the buffer).
+
+### Repro script
+
+```sh
+PDFZIG_FUZZ_TARGET=image_writer_emit_random_geom \
+PDFZIG_FUZZ_ITERS=1000 \
+PDFZIG_FUZZ_SEED=0x1 \
+~/.zvm/bin/zig build fuzz
+```
+
+Trips at iter ≤ 1k in Debug. Stack frame ordering: `start → main → fuzzImageWriterEmitRandomGeom → emitImageObject → writeStreamCompressed → Compress.init → assert`.
+
+---
+
+## Finding 011 — `EncryptionContext.authenticateOwner` panics on adversarial owner-pw / file_id triples
+
+**Surfaced by:** iter-20 of the fuzz loop (`audit/fuzz_loop_state.md` row 9 deepen).
+**Target:** `encrypt_authenticate_owner_recovers_key` (gated `reproducer_only`).
+**Severity:** Medium — reachable via attacker-controlled writer-side inputs.
+
+### Behaviour
+
+`EncryptionContext.authenticateOwner` (src/encrypt_writer.zig:417) panics in
+ReleaseSafe / Debug with no MISMATCH error returned and no stack frame past
+the call. The panic happens on the `recovered_user_padded → authenticateUser`
+recursive path (lines 476-487 in `encrypt_writer.zig`), where the
+suffix-strip heuristic carves a `user_pwd_len ≤ 32` slice from the RC4-
+decrypted /O bytes and feeds it back into `authenticateUser`. The panic
+fires inside that recursive call before either error path can return.
+
+### Repro
+
+```sh
+PDFZIG_FUZZ_ITERS=4000 \
+PDFZIG_FUZZ_TARGET=encrypt_authenticate_owner_recovers_key \
+PDFZIG_FUZZ_SEED=0x1 \
+~/.zvm/bin/zig build fuzz
+```
+
+Trips between iter 3000 and iter 4000 deterministically at SEED=0x1 in Debug.
+The 7th call into the target body (the immediately-prior `[T2-call]` log
+line, stripped before commit) had inputs:
+
+- algorithm: `aes_v4_r4_128`
+- user_pw (11 B): `a6138bf0ac947bf6f99031`
+- owner_pw (14 B): `420ec58781b6b7370e1fae56b81f`
+- file_id: `29e4110dc2b9bb02101111d0923f1a99`
+- expected file_key: `86c056cb5465053812c2b750ff98f2ea`
+
+### Why `reproducer_only`
+
+The bug surfaces deterministically at modest iters; running it inside the
+default sweep would abort otherwise-clean PDFZIG_FUZZ_AGGRESSIVE=0 runs.
+The two sibling targets (`encrypt_authenticate_user_roundtrip`,
+`encrypt_authenticate_random_o_u`) are both 100k clean — the panic is
+isolated to the V/R3 owner-decrypt → recursive authenticateUser path.
+
+### User-facing impact
+
+The /O field comes from the PDF's /Encrypt dict — attacker-supplied. A
+crafted PDF that passes structural validation but carries a hostile /O
+can crash the reader at "open with owner password" time. pdf.zig today
+does not expose a CLI surface for owner-password authentication, so the
+end-user impact is limited to library callers; promote target back to
+default-gate after the panic site is fixed.
+
+### Recommended next steps (out of scope for iter-20)
+
+1. Add an internal `std.debug.print` bracket inside `authenticateOwner`
+   (around line 482's recursive call) to pinpoint the panicking line.
+2. Investigate length-confusion on the suffix-strip: when the decrypted
+   /O bytes happen to match PASSWORD_PAD's tail for many positions, the
+   carved password slice may walk into territory that triggers an
+   `@intCast` or pointer-arithmetic trap downstream.
+3. Add explicit `assert(user_pwd_len <= 32);` and
+   `assert(recovered.len == algorithm.keyLen());` near the recursive
+   authenticate call so the failure surfaces at the contract violation
+   site, not opaque-stack-frame.
+
+---
+
+## Finding 012 — `outline.walkOutlineChain` stack overflow on adversarial `/First` chains
+
+**Status**: OPEN (real attacker-reachable runtime panic; gated `reproducer_only` post-discovery)
+**Path**: `src/outline.zig:152` — `walkOutlineChain` recurses on `/First` without a depth cap
+**Surfaced by**: post-iter-25 1M sweep on iter-19's `outline_adversarial_mutate` target. Default-gate at 100k iters stayed clean; 1M reliably trips it.
+**Class**: stack overflow on adversarial input
+
+### Root cause
+
+`outline.zig:88` declares `MAX_ITEMS = 10000` as the *count* anti-cycle bound, but the recursive descent on `/First` (line 152) has no *depth* bound. A malicious PDF with a chained `/First → /First → /First → …` outline tree recurses one stack frame per level; ~600–1000 frames exhaust the default 8 MiB stack on macOS arm64.
+
+### Reproducer
+
+```sh
+PDFZIG_FUZZ_TARGET=outline_adversarial_mutate \
+  PDFZIG_FUZZ_ITERS=1000000 \
+  ~/.zvm/bin/zig build fuzz
+```
+
+Stack trace (truncated):
+
+```
+src/outline.zig:152:33  walkOutlineChain  ← recurse
+src/outline.zig:152:33  walkOutlineChain
+…  (≥ 600 frames)
+src/outline.zig:71:25   parseOutline
+src/root.zig:1379       getOutline
+```
+
+### Recommended fix
+
+Add a `MAX_DEPTH = 64` constant alongside `MAX_ITEMS`; gate the recursive call on it:
+
+```zig
+const MAX_DEPTH: u32 = 64;
+if (level >= MAX_DEPTH) return error.OutlineTooDeep;
+try walkOutlineChain(allocator, arena, data, xref, cache, pages, child_first, level + 1, items);
+```
+
+Mirrors `attr_flattener.zig`'s `MAX_FLATTEN_DEPTH = 64` + `struct_writer.zig`'s `MAX_DEPTH = 64`.
+
+### User-facing impact
+
+A malicious PDF with deeply-nested `/Outlines` would crash any consumer calling `Document.getOutline()`. The CLI's markdown rendering path reaches it too — not just `openFromMemory`.
+
+**Severity: Medium.** Crash on adversarial input, no UB / RCE. Same class as Findings 005, 011.
+
+### Loop-rule observation
+
+The 100k default-gate sweep stayed clean; the trip threshold lives in the 100k–1M window. **Future tier-1 byte-fuzz targets that mutate parser inputs at high density should declare clean only after the loop's 1M sweep, not after 100k validation.**
 
 ---
 

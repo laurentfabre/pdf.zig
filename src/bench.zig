@@ -1,7 +1,12 @@
 //! ZPDF Benchmark Suite
 //!
-//! Measures extraction performance against MuPDF baseline.
+//! Measures extraction performance on a target PDF.
 //! Run with: zig build bench -- path/to/test.pdf
+//!
+//! The MuPDF cross-comparison was dropped during the Zig 0.16 migration —
+//! `std.process.Child` was rewritten and the previous `spawnAndWait` flow
+//! is gone. The CI bench loop only uses the ZPDF self-bench numbers, so
+//! the mutool branch is no longer load-bearing.
 
 const std = @import("std");
 const zpdf = @import("root.zig");
@@ -9,35 +14,25 @@ const zpdf = @import("root.zig");
 const WARMUP_RUNS = 2;
 const BENCH_RUNS = 5;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    const args = if (argv.len > 1) argv[1..] else &[_][:0]const u8{};
 
-    if (args.len < 2) {
+    if (args.len < 1) {
         std.debug.print(
             \\ZPDF Benchmark Suite
             \\
-            \\Usage: zig build bench -- <pdf_file> [options]
-            \\
-            \\Options:
-            \\  --no-mutool     Skip MuPDF comparison
-            \\  --threads N     Test parallel extraction with N threads
-            \\  --verbose       Show per-page timings
+            \\Usage: zig build bench -- <pdf_file>
             \\
         , .{});
         return;
     }
 
-    const pdf_path = args[1];
-    var skip_mutool = false;
-
-    for (args[2..]) |arg| {
-        if (std.mem.eql(u8, arg, "--no-mutool")) skip_mutool = true;
-    }
+    const pdf_path = args[0];
 
     std.debug.print(
         \\╔══════════════════════════════════════════════════════════════╗
@@ -48,26 +43,32 @@ pub fn main() !void {
         \\
     , .{pdf_path});
 
-    // Get file size
-    const file = std.fs.cwd().openFile(pdf_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(init.io, pdf_path, .{}) catch |err| {
         std.debug.print("Error opening file: {}\n", .{err});
         return;
     };
-    const file_size = (try file.stat()).size;
-    file.close();
+    const file_size = (try file.stat(init.io)).size;
+    file.close(init.io);
 
     std.debug.print("Size: {d:.2} MB\n\n", .{@as(f64, @floatFromInt(file_size)) / (1024 * 1024)});
 
-    // Benchmark ZPDF
     std.debug.print("── ZPDF Performance ───────────────────────────────────────────\n", .{});
+
+    // Warm-up runs (untimed) so the OS page cache + JIT decisions stabilise.
+    for (0..WARMUP_RUNS) |_| {
+        const doc = zpdf.Document.open(allocator, init.io, pdf_path) catch return;
+        var counter = CharCounter{};
+        for (0..doc.pages.items.len) |pn| doc.extractText(pn, &counter) catch continue;
+        doc.close();
+    }
 
     var times: [BENCH_RUNS]i128 = undefined;
     var page_count: usize = 0;
 
     for (&times) |*t| {
-        const start = std.time.nanoTimestamp();
+        const start_ns = std.Io.Timestamp.now(init.io, .real).nanoseconds;
 
-        const doc = zpdf.Document.open(allocator, pdf_path) catch |err| {
+        const doc = zpdf.Document.open(allocator, init.io, pdf_path) catch |err| {
             std.debug.print("ZPDF error: {}\n", .{err});
             return;
         };
@@ -80,8 +81,8 @@ pub fn main() !void {
 
         doc.close();
 
-        const end = std.time.nanoTimestamp();
-        t.* = end - start;
+        const end_ns = std.Io.Timestamp.now(init.io, .real).nanoseconds;
+        t.* = end_ns - start_ns;
     }
 
     const stats = calcStats(&times);
@@ -90,18 +91,6 @@ pub fn main() !void {
     std.debug.print("Throughput:{d:>8.2} MB/s\n", .{
         @as(f64, @floatFromInt(file_size)) / (stats.mean / 1e9) / (1024 * 1024),
     });
-
-    // MuPDF comparison
-    if (!skip_mutool) {
-        std.debug.print("\n── MuPDF Comparison ───────────────────────────────────────────\n", .{});
-
-        if (benchMutool(allocator, pdf_path)) |mutool_ns| {
-            std.debug.print("MuPDF:     {d:>8.2} ms\n", .{mutool_ns / 1e6});
-            std.debug.print("Speedup:   {d:>8.2}x\n", .{mutool_ns / stats.mean});
-        } else |_| {
-            std.debug.print("(mutool not found)\n", .{});
-        }
-    }
 }
 
 const Stats = struct { mean: f64, stddev: f64 };
@@ -110,13 +99,11 @@ fn calcStats(times: []const i128) Stats {
     var sum: f64 = 0;
     for (times) |t| sum += @floatFromInt(t);
     const mean = sum / @as(f64, @floatFromInt(times.len));
-
     var variance: f64 = 0;
     for (times) |t| {
         const diff = @as(f64, @floatFromInt(t)) - mean;
         variance += diff * diff;
     }
-
     return .{ .mean = mean, .stddev = @sqrt(variance / @as(f64, @floatFromInt(times.len))) };
 }
 
@@ -129,15 +116,3 @@ const CharCounter = struct {
         self.count += 1;
     }
 };
-
-fn benchMutool(allocator: std.mem.Allocator, pdf_path: []const u8) !f64 {
-    const start = std.time.nanoTimestamp();
-
-    var child = std.process.Child.init(&.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path }, allocator);
-    child.stderr_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-
-    _ = try child.spawnAndWait();
-
-    return @floatFromInt(std.time.nanoTimestamp() - start);
-}
